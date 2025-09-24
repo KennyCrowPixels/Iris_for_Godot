@@ -1,0 +1,438 @@
+.logo.vite:hover {
+  filter: drop-shadow(0 0 2em #747bff);
+}
+
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafb);
+}
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+
+  color: #0f0f0f;
+  background-color: #f6f6f6;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: #232323;
+  overflow: hidden; /* Prevent double scrollbars */
+}
+
+#root {
+  height: 100vh;
+  background: #232323;
+}
+
+.container {
+  margin: 0;
+  padding-top: 10vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: 0.75s;
+}
+
+.logo.tauri:hover {
+  filter: drop-shadow(0 0 2em #24c8db);
+}
+
+.row {
+  display: flex;
+  justify-content: center;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+
+a:hover {
+  color: #535bf2;
+}
+
+h1 {
+  text-align: center;
+}
+
+input,
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  color: #0f0f0f;
+  background-color: #ffffff;
+  transition: border-color 0.25s;
+  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #396cd8;
+}
+button:active {
+  border-color: #396cd8;
+  background-color: #e8e8e8;
+}
+
+input,
+button {
+  outline: none;
+}
+
+#greet-input {
+  margin-right: 5px;
+}
+
+.chat-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: #232323;
+  margin-top: 36px; /* Same as .taskbar height */
+}
+
+.chat-header {
+  padding: 16px 0 8px 16px;
+  border-bottom: 1px solid #2d2d2d;
+  color: #e0e0e0;
+  background: #232323;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+
+.chat-header h2 {
+  margin-bottom: 18px; /* was 0, now more space below the heading */
+  padding-bottom: 0;
+}
+
+.chat-history {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+  background: #232323;
+  min-height: 0;
+}
+
+/* Scrollbar styling for chat history and textarea */
+.chat-history,
+.chat-input {
+  scrollbar-width: thin;
+  scrollbar-color: #b0b0b0 #232323;
+}
+
+/* For Webkit browsers */
+.chat-history::-webkit-scrollbar,
+.chat-input::-webkit-scrollbar {
+  width: 8px;
+  background: #232323;
+}
+
+.chat-history::-webkit-scrollbar-thumb,
+.chat-input::-webkit-scrollbar-thumb {
+  background: #b0b0b0;
+  border-radius: 4px;
+}
+
+.bubble {
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  background: #2d2d2d;
+  color: #e0e0e0;
+  font-size: 1rem;
+  word-break: break-word;
+  box-shadow: none;
+}
+
+.bubble strong {
+  color: #b0b0b0;
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.bubble.llm strong {
+  color: #b0b0b0;
+}
+
+.thinking-indicator {
+  color: #b0b0b0;
+  font-weight: 500;
+  margin: 8px 0 0 16px;
+  font-size: 1rem;
+}
+
+.chat-input-row {
+  display: flex;
+  width: 100%;
+  padding: 12px;
+  box-sizing: border-box;
+  gap: 8px;
+  background: #232323;
+  border-top: 1px solid #2d2d2d;
+  flex-shrink: 0;
+  align-items: center; /* Center children vertically */
+  margin-bottom: 32px; /* Increase this value to bring the input further up */
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  font-size: 1rem;
+  padding: 2px 10px;      /* Reduce vertical padding */
+  border-radius: 6px;
+  border: 1px solid #444;
+  background: #181818;
+  color: #e0e0e0;
+  outline: none;
+  min-height: 20px;       /* Slightly less than before */
+  max-height: 192px;      /* 8 lines x 24px, keep as is */
+  overflow-y: auto;
+  resize: none;
+  line-height: 20px;      /* Match min-height for 1 line */
+  font-family: 'Segoe UI', Arial, sans-serif;
+}
+
+.send-btn {
+  flex: 0 0 auto;
+  padding: 0 18px;
+  font-size: 1rem;
+  border-radius: 6px;
+  border: none;
+  background: #444;
+  color: #e0e0e0;
+  cursor: pointer;
+  transition: background 0.2s;
+  height: 40px;
+  /* Remove align-self */
+  margin-bottom: 0;
+}
+
+.send-btn:disabled {
+  background: #333;
+  cursor: not-allowed;
+}
+
+.taskbar {
+  display: flex;
+  align-items: center;
+  background: #181818;
+  color: #e0e0e0;
+  height: 36px;
+  border-bottom: 1px solid #232323;
+  padding: 0 12px;
+  position: fixed;      /* <-- Make it fixed at the top */
+  top: 0;               /* <-- Stick to the top */
+  left: 0;
+  right: 0;
+  z-index: 100;
+}
+
+.menu {
+  position: relative;
+  margin-right: 24px;
+}
+
+.menu-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 1rem;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.dropdown {
+  display: block;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: #232323;
+  border: 1px solid #333;
+  min-width: 120px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  z-index: 200;
+}
+
+.dropdown-item {
+  padding: 8px 16px;
+  cursor: pointer;
+  color: #e0e0e0;
+}
+
+.dropdown-item:hover {
+  background: #333;
+}
+
+.tab-bar {
+  display: flex;
+  gap: 0;
+  background: #232323;
+  padding: 8px 0 8px 8px;
+  border-bottom: 1px solid #2d2d2d;
+  position: sticky;
+  top: 36px;
+  z-index: 20;
+  overflow: visible !important;
+}
+
+.tab-wrapper {
+  display: flex;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+  /* Make sure pointer events are not blocked */
+  pointer-events: auto;
+}
+
+.tab, .tab-wrapper {
+  cursor: default !important;
+}
+
+.tab {
+  background: #222;
+  color: #eee;
+  border: none;
+  border-radius: 6px 6px 0 0;
+  padding: 5px 26px 5px 14px; /* Increase right padding from 14px to 26px */
+  font-size: 0.95rem;
+  cursor: grab;
+  margin-right: 0;
+  position: relative;
+  z-index: 1;
+}
+
+.tab:active {
+  cursor: grabbing;
+}
+
+.tab.active {
+  background: #181818;
+  color: #fff;
+  font-weight: bold;
+  border-bottom: 2px solid #3a7afe;
+}
+
+.tab-close {
+  position: absolute;
+  right: 6px;           /* space from the right edge */
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: #aaa;
+  font-size: 1.1rem;
+  cursor: pointer;
+  z-index: 2;
+  padding: 0 2px;
+  transition: color 0.2s, opacity 0.2s;
+  opacity: 0;
+  pointer-events: none;
+  margin-left: 6px; /* Add margin-left to create space between tab and close button */
+}
+
+.tab-close:hover {
+  color: #ff5555;
+}
+
+.tab-wrapper.active .tab-close,
+.tab-wrapper:hover .tab-close {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.settings-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0 0 0;
+}
+
+.settings-subtab-bar {
+  display: flex;
+  gap: 28px;
+  justify-content: flex-start; /* Align to the left */
+  margin-top: 0;
+  margin-bottom: 0;
+  position: relative;
+  top: -2px;
+  padding-left: 40px; /* Optional: add some left padding for aesthetics */
+}
+
+.settings-subtab {
+  background: #232323;
+  color: #eee;
+  border: 1.5px solid #333;
+  border-bottom: 2px solid transparent;
+  font-size: 1rem;
+  padding: 7px 22px;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  transition: 
+    border-color 0.2s, 
+    color 0.2s, 
+    background 0.2s, 
+    box-shadow 0.2s;
+  box-shadow: 0 2px 6px 0 rgba(0,0,0,0.08);
+}
+
+.settings-subtab:hover {
+  background: #282828;
+  color: #3a7afe;
+  border-color: #3a7afe;
+}
+
+.settings-subtab.active {
+  color: #3a7afe;
+  border-bottom: 2px solid #3a7afe;
+  background: #181818;
+  font-weight: bold;
+  border-color: #3a7afe #3a7afe #181818 #3a7afe;
+  z-index: 1;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f6f6f6;
+    background-color: #2f2f2f;
+  }
+
+  a:hover {
+    color: #24c8db;
+  }
+
+  input,
+  button {
+    color: #ffffff;
+    background-color: #0f0f0f98;
+  }
+  button:active {
+    background-color: #0f0f0f69;
+  }
+}

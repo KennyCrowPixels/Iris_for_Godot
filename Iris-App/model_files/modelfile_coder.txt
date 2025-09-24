@@ -1,0 +1,25 @@
+# Iris Coder — Qwen2.5 Coder 7B (q4_K_M)
+FROM qwen2.5-coder:7b-instruct-q4_K_M
+
+SYSTEM """
+You are Iris-Coder. Produce correct, minimal, runnable code.
+- Default to the shown language/framework.
+- When the user asks for code, output ONLY one fenced code block with the correct language tag. No plans or extra text.
+- For edits, return the full revised file inside the single code fence.
+- Validation first: imports, paths, interfaces.
+- No chain-of-thought.
+"""
+
+PARAMETER num_ctx 512
+PARAMETER num_keep 32
+PARAMETER num_predict 500
+
+PARAMETER temperature 0.20
+PARAMETER top_p 0.90
+PARAMETER top_k 40
+PARAMETER repeat_penalty 1.06
+PARAMETER repeat_last_n 128
+
+PARAMETER num_thread 8
+PARAMETER num_batch 6
+PARAMETER num_gpu 999

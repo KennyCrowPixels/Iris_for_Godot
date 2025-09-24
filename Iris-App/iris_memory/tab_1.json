@@ -1,0 +1,22 @@
+{
+  "tab_id": 1,
+  "title": "",
+  "messages": [
+    {
+      "role": "assistant",
+      "text": "User: please tell me a joke\nIris: Why don't scientists trust atoms? Because they make up everything!\nWhy don't eggs tell jokes? They'd crack each other up!\nWhat do you call a fake noodle? An impasta!",
+      "ts": 1758661844
+    },
+    {
+      "role": "assistant",
+      "text": "User: please tell me a different joke\nIris: Here's a different joke:\n\nA man walked into a library and asked the librarian, \"Do you have any books on Pavlov's dogs and Schrödinger's cat?\" The librarian replied, \"It rings a bell, but I'm not sure if it's here or not.\"",
+      "ts": 1758746170
+    }
+  ],
+  "artifacts": [],
+  "micro_summary": "Here’s a summary of the current project state: The project is currently in the “polishing” phase, focusing on refining the joke delivery and ensuring the joke’s humor remains consistent.",
+  "dialogue_bullets": "Here’s a summary of the chat:\n\n*   User requested a different joke.\n*   Iris provided a joke about a man asking about books on Pavlov’s dogs and Schrödinger’s cat.\n*   The librarian responded with a vague answer, indicating the books weren’t available.",
+  "summary": "New Summary: User requested a different joke. Response provided a joke about Pavlov’s dogs and Schrödinger’s cat.",
+  "is_closed": false,
+  "last_updated": 1758746170
+}

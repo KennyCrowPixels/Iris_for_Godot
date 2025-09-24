@@ -11,11 +11,13 @@
   ],
   "activationEvents": [
     "onCommand:iris.openChat",
+    "onCommand:iris.openChatTerminal",
     "onCommand:iris.toggleOnline"],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       { "command": "iris.openChat", "title": "Iris: Open Chat" },
+      { "command": "iris.openChatTerminal", "title": "Iris: Open Chat Terminal" },
       { "command": "iris.toggleOnline", "title": "Iris: Toggle Online Assistance" }
     ],
     "configuration": {

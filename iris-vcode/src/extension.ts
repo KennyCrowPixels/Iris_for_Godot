@@ -1,22 +1,22 @@
+
 import * as vscode from 'vscode';
 import { ChatPanel } from './webviews/ChatPanel';
+import { IrisChatTerminal } from './webviews/IrisChatTerminal';
+import * as https from 'https';
+import * as http from 'http';
 
 export function activate(context: vscode.ExtensionContext) {
 
-  const openChat = vscode.commands.registerCommand('iris.openChat', () => {
-    ChatPanel.open(context.extensionUri);
 
-    const panel = (ChatPanel as any).current?.panel as vscode.WebviewPanel | undefined;
-    panel?.webview.onDidReceiveMessage(async (msg) => {
-      if (msg?.type === 'chat') {
-        const q = String(msg.text || '');
-        if (q.startsWith('/help')) {
-          panel.webview.postMessage({ type: 'reply', text: 'Commands: /help, /docs <q>, /explain <text>' });
-        } else {
-          panel.webview.postMessage({ type: 'reply', text: 'Echo: ' + q });
-        }
-      }
-    });
+  // New always-open Iris chat terminal
+  const openIrisChatTerminal = vscode.commands.registerCommand('iris.openChatTerminal', () => {
+    IrisChatTerminal.open(context.extensionUri);
+  });
+
+  // Keep the old chat for now, but recommend the new one
+  const openChat = vscode.commands.registerCommand('iris.openChat', () => {
+    vscode.window.showInformationMessage('Try the new Iris Chat Terminal for a better experience!');
+    ChatPanel.open(context.extensionUri);
   });
 
   const toggleOnline = vscode.commands.registerCommand('iris.toggleOnline', async () => {
@@ -27,7 +27,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showInformationMessage(`Iris online assistance: ${!current ? 'ON' : 'OFF'}`);
   });
 
-  context.subscriptions.push(openChat, toggleOnline);
+  context.subscriptions.push(openChat, openIrisChatTerminal, toggleOnline);
 }
 
 export function deactivate() {}

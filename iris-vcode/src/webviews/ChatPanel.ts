@@ -38,18 +38,49 @@ content="default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; sc
     const log = document.getElementById('log');
     const f = document.getElementById('f');
     const q = document.getElementById('q');
+    let ellipsisInterval = null;
     f.addEventListener('submit', (e) => {
       e.preventDefault();
       const t = q.value.trim();
       if (!t) return;
       log.innerHTML += '<div><b>You:</b> ' + t + '</div>';
-      vscode.postMessage({ type: 'chat', text: t });
+      // Add animated ellipsis
+      const ellipsisId = 'iris-ellipsis-' + Date.now();
+      log.innerHTML += '<div id="' + ellipsisId + '"><b>Iris:</b> <span class="iris-ellipsis">...</span></div>';
+      log.scrollTop = log.scrollHeight;
+      let dots = 0;
+      ellipsisInterval = setInterval(() => {
+        dots = (dots + 1) % 4;
+        const el = document.getElementById(ellipsisId)?.querySelector('.iris-ellipsis');
+        if (el) el.textContent = '.'.repeat(dots || 1);
+      }, 400);
+      window.currentIrisEllipsisId = ellipsisId;
+      vscode.postMessage({ type: 'chat', text: t, ellipsisId });
       q.value = '';
     });
     window.addEventListener('message', (e) => {
-      if (e.data?.type === 'reply') {
+      if (e.data?.type === 'stream') {
+        // Update ellipsis div with full text for smooth character-by-character updates
+        const ellipsisId = window.currentIrisEllipsisId;
+        const ellipsisDiv = document.getElementById(ellipsisId);
+        if (ellipsisDiv) {
+          const span = ellipsisDiv.querySelector('.iris-ellipsis');
+          if (span) {
+            const newText = e.data.text || '';
+            if (span.textContent !== newText) {
+              span.textContent = newText;
+            }
+          }
+        }
+      } else if (e.data?.type === 'reply') {
+        // Remove ellipsis if present and add final text
+        const ellipsisId = window.currentIrisEllipsisId;
+        const ellipsisDiv = document.getElementById(ellipsisId);
+        if (ellipsisDiv) ellipsisDiv.remove();
+        if (ellipsisInterval) { clearInterval(ellipsisInterval); ellipsisInterval = null; }
         log.innerHTML += '<div><b>Iris:</b> ' + e.data.text + '</div>';
         log.scrollTop = log.scrollHeight;
+        window.currentIrisEllipsisId = null;
       }
     });
   </script>

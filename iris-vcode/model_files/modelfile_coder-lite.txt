@@ -1,0 +1,14 @@
+FROM qwen2.5-coder:7b-instruct-q4_K_M
+
+# Smaller context = less RAM/VRAM
+PARAMETER num_ctx 768
+
+# Cap CPU usage hard (fewer threads + smaller batches)
+PARAMETER num_thread 4
+PARAMETER num_batch 8
+
+# Offload a bit more to GPU (tweak if VRAM complains)
+PARAMETER num_gpu 12
+
+# Keep generations short unless asked (cuts sustained CPU burn)
+PARAMETER num_predict 256

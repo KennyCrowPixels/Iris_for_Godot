@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+
+    "moduleResolution": "bundler",   // works best with Vite 5
+    "types": ["node"],               // fixes Buffer, process, etc.
+    "esModuleInterop": true,         // allows default-import React / react-dom
+    "skipLibCheck": true,
+
+    "strict": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["src", "vite-env.d.ts"]
+}
