@@ -1,15 +1,63 @@
 import { useState, useRef, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
 import ReactMarkdown from 'react-markdown';
+import "./App.css";
 
-const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
-const ENSURE_CMD = "ensure_model";
-const KEEP_ALIVE = "600s";
+import {
+  OLLAMA_URL,
+  ensureOllamaServer,
+  ensureModel,
+  fetchJson,
+  // waitForTauri,
+} from "./lib/ollama";
+import {
+  createTabMemory,
+  updateTabMemory,
+  restoreFullTabMemory,
+  listOpenTabs,
+} from "./state/memory";
+import {
+  updateMessagesAppendUser,
+  insertLLMBubble,
+  patchLastLLMBubble,
+  extractArtifacts,
+} from "./state/tabs";
+import useOllamaStream from "./hooks/useOllamaStream";
+import { summarizeExchange } from "./lib/summarize";
+
+declare global {
+  interface Window { __TAURI__?: any }
+}
+
 const SUMMARY_MODEL = "iris-summarizer:latest";
 
 type ModelStatus = "checking" | "ready" | "loading" | "error";
 type Message = { role: "user" | "llm"; text: string };
+
+function normalizeMessages(raw: any[] | undefined): Message[] {
+  const out: Message[] = [];
+  for (const m of raw || []) {
+    const role = (m.role || "").toLowerCase();
+    const text = String(m.text ?? "");
+    if (role === "user" || role === "llm") {
+      out.push({ role, text });
+      continue;
+    }
+    // Legacy transcript that merges both speakers into one block:
+    const re = /^User:\s*([\s\S]*?)\nIris:\s*([\s\S]*)$/i;
+    const match = text.match(re);
+    if (match) {
+      const u = match[1].trim();
+      const a = match[2].trim();
+      if (u) out.push({ role: "user", text: u });
+      if (a) out.push({ role: "llm", text: a });
+    } else {
+      // Fallback: treat as LLM message to keep render safe
+      out.push({ role: "llm", text });
+    }
+  }
+  return out;
+}
+
 type Tab = {
   id: number;
   title: string;
@@ -17,12 +65,12 @@ type Tab = {
   messages?: Message[];
 };
 type TestModelResult = { ok: boolean; error: string | null; response?: string };
-type Artifact = { lang: string; filename?: string; content: string };
+type Artifact = { lang: string; filename?: string; content: string; ts?: number };
 type Snapshot = {
   title: string;
   messages: { role: "user" | "llm"; text: string }[];
-  microSummary: string;      // camelCase for frontend
-  dialogueBullets: string;   // camelCase for frontend
+  microSummary: string;
+  dialogueBullets: string;
   summary: string;
   artifacts: Artifact[];
   last_updated?: number;
@@ -35,67 +83,9 @@ function isCoderIntent(text: string): boolean {
   return fences || codeyWords || fileNames;
 }
 
-function extractArtifacts(s: string): Artifact[] {
-  const out: Artifact[] = [];
-  const re = /```(\w+)?\s*\n([\s\S]*?)```/g;
-  let m;
-  while ((m = re.exec(s))) {
-    const lang = (m[1] || "").toLowerCase();
-    const content = m[2].trim();
-    out.push({ lang, content });
-  }
-  return out;
-}
-
 function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
-  useEffect(() => {
-    setModelStatus("checking");
-    Promise.all([
-      invoke<string>("ensure_model", { name: "iris-coder:latest" })
-        .then(() => setCoderReady(true))
-        .catch(e => { setCoderReady(false); console.error("ensure_model", e); }),
-      invoke<string[]>("get_universal_prompts")
-        .then(setUniversalPrompts)
-        .catch(e => { console.error("get_universal_prompts", e); }),
-      invoke<Snapshot[]>("list_open_tabs")
-        .then(async (snaps) => {
-          if (snaps && snaps.length > 0) {
-            // Cap to 8
-            const capped = snaps.slice(-8);
-            let nextId = 1;
-            const newTabs: Tab[] = capped.map((snap, i) => ({
-              id: nextId++,
-              title: snap.title && snap.title.trim() ? snap.title : `Tab #${nextId - 1}`,
-              type: "chat",
-              messages: snap.messages
-            }));
-            setTabs(newTabs);
-            setActiveTab(newTabs[newTabs.length - 1].id);
-            // Recreate tab memory for each
-            for (let i = 0; i < newTabs.length; ++i) {
-              const tab = newTabs[i];
-              const snap = capped[i];
-              await invoke("restore_full_tab_memory", {
-                tabId: tab.id,
-                title: snap.title,
-                messages: snap.messages,
-                artifacts: snap.artifacts,
-                microSummary: snap.microSummary,
-                dialogueBullets: snap.dialogueBullets,
-                summary: snap.summary,
-                lastUpdated: snap.last_updated ?? ((Date.now()/1000)|0),
-              });
-            }
-          }
-        })
-        .catch(e => { console.error("list_open_tabs", e); })
-    ])
-      .then(() => setModelStatus("ready"))
-      .catch(() => setModelStatus("error"));
-  }, []);
-
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
   const [ellipsis, setEllipsis] = useState(".");
@@ -115,6 +105,52 @@ function App() {
   const [useCoder, setUseCoder] = useState(false);
 
   const currentTab = tabs.find(t => t.id === activeTab);
+
+  useEffect(() => {
+    setModelStatus("checking");
+    // waitForTauri().then(() => {
+      Promise.all([
+        ensureModel("iris-coder:latest")
+          .then(() => setCoderReady(true))
+          .catch(e => { setCoderReady(false); console.error("ensure_model", e); }),
+        // universal prompts and open tabs
+        listOpenTabs()
+          .then(async (snaps) => {
+            if (!Array.isArray(snaps) || snaps.length === 0) return;
+            const capped = snaps.slice(-8);
+            let nextId = 1;
+            const newTabs: Tab[] = capped.map((snap, i) => ({
+              id: nextId++,
+              title: snap.title && snap.title.trim() ? snap.title : `Tab #${nextId - 1}`,
+              type: "chat",
+              messages: normalizeMessages(snap.messages)
+            }));
+            setTabs(newTabs);
+            setActiveTab(newTabs[newTabs.length - 1].id);
+            for (let i = 0; i < newTabs.length; ++i) {
+              const tab = newTabs[i];
+              const snap = capped[i];
+              await restoreFullTabMemory({
+                tabId: tab.id,
+                title: snap.title,
+                messages: snap.messages,
+                artifacts: snap.artifacts,
+                microSummary: snap.microSummary,
+                dialogueBullets: snap.dialogueBullets,
+                summary: snap.summary,
+                lastUpdated: snap.last_updated ?? ((Date.now()/1000)|0),
+              });
+            }
+          })
+          .catch(e => { console.error("list_open_tabs", e); })
+      ])
+        .then(() => setModelStatus("ready"))
+        .catch(() => setModelStatus("error"));
+    // }).catch(e => {
+    //   setModelStatus("error");
+    //   console.error("Tauri never became ready", e);
+    // });
+  }, []);
 
   useEffect(() => {
     if (historyRef.current) {
@@ -137,29 +173,31 @@ function App() {
         const chatTabs = tabs.filter(tab => tab.type === "chat");
         if (chatTabs.length >= 8) return;
         try {
-          const snap = await invoke<Snapshot>("restore_last_closed_tab");
-          if (!snap || !snap.messages) return;
-          // When restoring a tab
-          const usedIds = tabs.map(t => t.id);
-          let newId = 1;
-          while (usedIds.includes(newId)) newId++;
-          const newTab: Tab = {
-            id: newId,
-            title: snap.title || `Tab #${newId}`,
-            type: "chat",
-            messages: snap.messages
-          };
-          setTabs(prev => [...prev, newTab]);
-          setActiveTab(newId);
-          await invoke("create_tab_memory", { tabId: newId });
-          await invoke("update_tab_memory", {
-            tabId: newId,
-            summary: snap.summary,
-            microSummary: snap.microSummary,
-            dialogueBullets: snap.dialogueBullets,
-            newMessage: snap.messages.map(m => `${m.role === "user" ? "User" : "Iris"}: ${m.text}`).join("\n"),
-            artifacts: snap.artifacts
-          });
+          // You may want to modularize this as well
+          if (window.__TAURI__?.invoke) {
+            const snap = await window.__TAURI__?.invoke("restore_last_closed_tab") as Snapshot;
+            if (!snap || !snap.messages) return;
+            const usedIds = tabs.map(t => t.id);
+            let newId = 1;
+            while (usedIds.includes(newId)) newId++;
+            const newTab: Tab = {
+              id: newId,
+              title: snap.title || `Tab #${newId}`,
+              type: "chat",
+              messages: snap.messages
+            };
+            setTabs(prev => [...prev, newTab]);
+            setActiveTab(newId);
+            await createTabMemory(newId);
+            await updateTabMemory({
+              tabId: newId,
+              summary: snap.summary,
+              microSummary: snap.microSummary,
+              dialogueBullets: snap.dialogueBullets,
+              newMessage: snap.messages.map((m: {role: "user" | "llm"; text: string}) => `${m.role === "user" ? "User" : "Iris"}: ${m.text}`).join("\n"),
+              artifacts: snap.artifacts
+            });
+          }
         } catch {}
       }
     };
@@ -179,9 +217,10 @@ function App() {
   }
 
   const [thinkingModel, setThinkingModel] = useState<string | null>(null);
-  const [universalPrompts, setUniversalPrompts] = useState<string[]>([]);
   const [irisStatus, setIrisStatus] = useState<"idle" | "thinking" | "summarizing" | "responding" | "coding">("idle");
   const [respondingTab, setRespondingTab] = useState<number | null>(null);
+
+  const { stream } = useOllamaStream();
 
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
@@ -207,11 +246,10 @@ function App() {
       recentArtifacts: []
     };
 
-    // --- Model selection logic and per-model options ---
     const coderish = useCoder || isCoderIntent(text);
-    await invoke("ensure_ollama_server").catch(()=>{});
+    await ensureOllamaServer();
     const primaryModel = coderish ? "iris-coder:latest" : "iris-organizer:latest";
-    await invoke<string>("ensure_model", { name: primaryModel });
+    await ensureModel(primaryModel);
 
     // 3) Flip UI to “thinking” and block Send
     setThinking(true);
@@ -219,26 +257,29 @@ function App() {
     setIrisStatus("thinking");
     setIsGenerating(true);
 
-    updateTabMessages(activeTab, msgs => [...msgs, { role: "user", text }]);
+    updateTabMessages(activeTab, msgs => updateMessagesAppendUser(msgs, text));
 
     try {
+      // get_compiled_context is still a tauri invoke, not modularized yet
       try {
-        const result = await invoke<typeof compiled>("get_compiled_context", { tabId: activeTab, tokenBudget: 1200 });
-        if (result && typeof result === "object") {
-          compiled = {
-            microSummary: result.microSummary ?? "",
-            dialogueBullets: result.dialogueBullets ?? "",
-            recentTranscript: result.recentTranscript ?? "",
-            recentArtifacts: result.recentArtifacts ?? []
-          };
+        if (window.__TAURI__?.invoke) {
+
+          const result = await window.__TAURI__?.invoke("get_compiled_context", { tabId: activeTab, tokenBudget: 1200 }) as typeof compiled;
+          if (result && typeof result === "object") {
+            compiled = {
+              microSummary: result.microSummary ?? "",
+              dialogueBullets: result.dialogueBullets ?? "",
+              recentTranscript: result.recentTranscript ?? "",
+              recentArtifacts: result.recentArtifacts ?? []
+            };
+          }
         }
       } catch (e) {
         console.error("get_compiled_context failed", e);
       }
 
-      const { microSummary, dialogueBullets, recentTranscript, recentArtifacts } = compiled;
+      const { microSummary, dialogueBullets: compiledDialogueBullets, recentTranscript, recentArtifacts } = compiled;
 
-      // --- Model selection logic and per-model options ---
       const organizerOpts = {
         num_ctx: 768, num_keep: 24, num_predict: 896,
         temperature: 0.25, top_p: 0.9, top_k: 40,
@@ -275,7 +316,7 @@ Context:
 ${microSummary}
 
 Recent chat (compressed):
-${dialogueBullets}
+${compiledDialogueBullets}
 
 Task:
 ${text}
@@ -294,7 +335,7 @@ Rules:
 ${microSummary}
 
 Recent chat (compressed):
-${dialogueBullets}
+${compiledDialogueBullets}
 
 ${recentTranscript ? `Transcript:\n${recentTranscript}\n` : ""}
 The user asks: ${text}
@@ -304,199 +345,30 @@ Respond only inside <final>...</final>.
 <final>`;
       }
 
-      abortController.current = new AbortController();
-      // const llmMsg: Message = { role: "llm", text: "" };
-      // updateTabMessages(activeTab, msgs => [...msgs, llmMsg]);
-
-      // --- Buffered streaming for smooth UI ---
       let fullText = "";
-      let buffer = "";
-      let lastFlush = 0;
-      let done = false;
-      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-      let streamTimeout: NodeJS.Timeout | null = null;
-      const fetchOptions = {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          prompt,
-          stream: true,
-          keep_alive: "90s",
-          ...(model === "iris-coder:latest" ? {} : { options })
-        }),
-        signal: controller.signal
-      };
+      let streamedText = "";
 
-      function flush() {
-        if (!buffer) return;
-        fullText += buffer;
-        buffer = "";
-        updateTabMessages(activeTab, msgs => {
-          const copy = [...msgs];
-          for (let i = copy.length - 1; i >= 0; --i) {
-            if (copy[i].role === "llm") {
-              copy[i] = { ...copy[i], text: fullText };
-              break;
-            }
-          }
-          return copy;
-        });
-      }
-
-      const doStream = async (batchOverride?: number) => {
-        let llmInserted = false;
-        let acc="";
-        if (batchOverride && model !== "iris-coder:latest") {
-          fetchOptions.body = JSON.stringify({
-            model,
-            prompt,
-            stream: true,
-            keep_alive: "90s",
-            options: { ...options, num_batch: batchOverride }
-          });
-        }
-        // Abort if headers don't arrive in time
-        // const prefetchAbort = setTimeout(() => {
-        //   if (abortController.current) abortController.current.abort();
-        // }, 15000);
-        
-        // Debug: fetch start
-        console.info("[chat] fetch → /api/generate", { model, coderish });
-
-
-        // Use 127.0.0.1
-        const response = await fetch(OLLAMA_URL, fetchOptions);
-        if (!response.ok || !response.body) throw new Error("No response body from Ollama");
-        // clearTimeout(prefetchAbort);
-        setIrisStatus(coderish ? "coding" : "responding");
-
-        reader = response.body.getReader();
-        fullText = "";
-        buffer = "";
-        done = false;
-
-        let gotFirstChunk = false;
-        let timedOut = false;
-        let lastFlush = performance.now();
-
-        // 600s first-byte timeout
-        // streamTimeout = setTimeout(() => {
-        //   if (!gotFirstChunk && abortController.current) {
-        //     timedOut = true;
-        //     abortController.current.abort();
-        //   }
-        // }, 600000);
-
-        // 60s overall watchdog
-        // const overallWatchdog = setTimeout(() => {
-        //   if (abortController.current) abortController.current.abort();
-        // }, 60000);
-
-        const flush = () => {
-          if (!llmInserted || !buffer) return;
-          fullText += buffer;
-          updateTabMessages(activeTab, msgs => {
-            const copy = [...msgs];
-            for (let i = copy.length - 1; i >= 0; --i) {
-              if (copy[i].role === "llm") { copy[i] = { ...copy[i], text: fullText }; break; }
-            }
-            return copy;
-          });
-          buffer = "";
-        };
-
-        while (!done) {
-          const { value, done: doneReading } = await reader.read();
-          done = doneReading;
-          if (value) {
-            const chunk = new TextDecoder().decode(value);
-            acc += chunk;
-
-            // parse all complete JSON objects in acc by balancing braces
-            for (;;) {
-              let depth = 0, end = -1;
-              for (let i = 0; i < acc.length; i++) {
-                const c = acc[i];
-                if (c === '{') depth++;
-                else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
-              }
-              if (end === -1) break;
-
-              const objStr = acc.slice(0, end + 1);
-              acc = acc.slice(end + 1);
-
-              try {
-                const json = JSON.parse(objStr);
-
-                if (!gotFirstChunk) {
-                  gotFirstChunk = true;
-                  // Debug: first JSON chunk
-                  console.info("[chat] first JSON chunk");
-
-                  // if (streamTimeout) clearTimeout(streamTimeout);
-                  setIrisStatus(coderish ? "coding" : "responding");
-                }
-
-                if (json.response) {
-                  buffer += json.response;
-
-                  // Insert the LLM bubble on the first actual token
-                  if (!llmInserted && buffer.length > 0) {
-                    llmInserted = true;
-                    fullText = buffer;
-                    buffer = "";
-                                  // Debug: inserting llm bubble
-                    console.info("[chat] inserting llm bubble");
-
-                    updateTabMessages(activeTab, msgs => [...msgs, { role: "llm", text: fullText }]);
-                  }
-
-                  const now = performance.now();
-                  if (llmInserted && now - lastFlush > 50) { 
-                    // Debug: streaming flush
-                    console.info("[chat] streaming flush");
-
-                    flush(); 
-                    lastFlush = now; }
-                }
-              } catch {
-                // ignore and continue accumulating
-              }
-            }
-          }
-        }
-
-        flush();
-        // if (streamTimeout) clearTimeout(streamTimeout);
-        // clearTimeout(overallWatchdog);
-
-        // Retry with smaller batch once if we got no text (non-coder path)
-        if (!fullText && model !== "iris-coder:latest" && !timedOut) {
-          await doStream(4);
-        }
-      };
-
-      try {
-        await doStream();
-      } catch (err) {
-        // 5) Guard all early exits so status resets
-        setThinking(false);
-        setIsGenerating(false);
-        setIrisStatus("idle");
-        setRespondingTab(null);
-        setIsSummarizing(false);
-
-        const msg =
-          (err as any)?.name === "AbortError"
-            ? "[Timeout waiting for model output. If this was the first run, Ollama may still be pulling the model. Try again in 1–2 minutes.]"
-            : `[Error: ${err instanceof Error ? err.message : String(err)}]`;
-
-        updateTabMessages(activeTab, msgs => [...msgs, { role: "llm", text: msg }]);
-        return;
-      }
+      await stream({
+        model,
+        prompt,
+        options,
+        signal: controller.signal,
+        onHeaders: () => setIrisStatus(coderish ? "coding" : "responding"),
+        onFirstToken: (first) => {
+          streamedText += first;
+          updateTabMessages(activeTab, msgs => insertLLMBubble(msgs, first));
+        },
+        onTokens: (delta) => {
+          streamedText += delta;
+          updateTabMessages(activeTab, msgs => patchLastLLMBubble(msgs, delta));
+        },
+        onDone: () => {
+          // No message replacement here; streamedText already has the full reply
+        },
+      });
 
       // --- Artifact extraction and filename sniff ---
+      fullText = streamedText;
       let deliveredText = fullText.replace(/<\/?final>/gi, "").trim();
       let artifacts = extractArtifacts(deliveredText);
       const filenameMatch = deliveredText.match(/(?:here's|file|save as|edit)\s+`([^`]+)`/i);
@@ -524,7 +396,7 @@ ${microSummary}
 [User Request]
 ${text}
 `;
-            const coderRes = await fetch("http://127.0.0.1:11434/api/generate", {
+            const coderRes = await fetchJson(OLLAMA_URL, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -534,8 +406,7 @@ ${text}
                 keep_alive: "90s"
               })
             });
-            const coderJson = await coderRes.json();
-            let codeText = (coderJson?.response || "").replace(/<\/?final>/gi, "").trim();
+            let codeText = (coderRes?.response || "").replace(/<\/?final>/gi, "").trim();
             deliveredText = codeText ? codeText : "[Coder did not return any code.]";
             artifacts = extractArtifacts(deliveredText);
             const fallbackFilenameMatch = deliveredText.match(/(?:here's|file|save as|edit)\s+`([^`]+)`/i);
@@ -559,8 +430,7 @@ ${text}
 
       setIrisStatus("summarizing");
 
-      // 6) Ensure summarizer exists before Promise.all
-      await invoke<string>("ensure_model", { name: SUMMARY_MODEL }).catch(()=>{});
+      await ensureModel(SUMMARY_MODEL);
 
       // --- Summarization and memory update ---
       const microSummaryPrompt = `
@@ -586,65 +456,26 @@ If the summary needs to be updated, return the new summary. If not, return the c
 
       const dialogueBulletsPrompt = `Summarize the following chat into <=6 bullets preserving names, files, decisions:\nUser: ${text}\nIris: ${deliveredText}`;
 
-      Promise.all([
-        fetch("http://127.0.0.1:11434/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: SUMMARY_MODEL,
-            prompt: microSummaryPrompt,
-            stream: false,
-            keep_alive: "90s",
-          }),
-        }).then(res => res.json()).then(data => data.response || microSummary),
+      const { microSummary: newMicroSummary, projectSummary: newProjectSummary, dialogueBullets: newDialogueBullets } =
+        await summarizeExchange({ model: SUMMARY_MODEL, microSummaryPrompt, projectSummaryPrompt, dialogueBulletsPrompt });
 
-        fetch("http://127.0.0.1:11434/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: SUMMARY_MODEL,
-            prompt: projectSummaryPrompt,
-            stream: false,
-            keep_alive: "90s",
-          }),
-        }).then(res => res.json()).then(data => data.response || microSummary),
+      const now = Math.floor(Date.now() / 1000);
+      const artifactsWithTs = artifacts.map((a: Artifact) => ({ ...a, ts: now }));
 
-        fetch("http://127.0.0.1:11434/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: SUMMARY_MODEL,
-            prompt: dialogueBulletsPrompt,
-            stream: false,
-            keep_alive: "5m"
-          }),
-        }).then(res => res.json()).then(data => (data?.response || "").toString().trim())
-      ])
-      .then(([newMicroSummary, newProjectSummary, dialogueBullets]) => {
-        const tabStillExists = tabs.some(tab => tab.id === activeTab);
-        if (tabStillExists) {
-          const now = Math.floor(Date.now() / 1000);
-          const artifactsWithTs = artifacts.map((a: Artifact) => ({ ...a, ts: now }));
-
-          invoke("update_tab_memory", {
-            tabId: activeTab,
-            summary: newProjectSummary,
-            microSummary: newMicroSummary,
-            dialogueBullets,
-            newMessage: `User: ${text}\nIris: ${deliveredText}`,
-            artifacts: artifactsWithTs,
-          });
-        }
-      })
-      .finally(() => {
-        if (isMounted.current) {
-          setIsSummarizing(false);
-          setIrisStatus("idle");
-          setRespondingTab(null);
-        }
+      await updateTabMemory({
+        tabId: activeTab,
+        summary: newProjectSummary,
+        microSummary: newMicroSummary,
+        dialogueBullets: newDialogueBullets,
+        newMessage: `User: ${text}\nIris: ${deliveredText}`,
+        artifacts: artifactsWithTs,
       });
+
+      setIsSummarizing(false);
+      setIrisStatus("idle");
+      setRespondingTab(null);
+
     } catch (err: any) {
-      // 5) Guard all early exits so status resets
       setThinking(false);
       setIsGenerating(false);
       setIrisStatus("idle");
@@ -656,7 +487,6 @@ If the summary needs to be updated, return the new summary. If not, return the c
         { role: "llm", text: `[Error: ${err?.message || err}]` }
       ]);
     } finally {
-      // 5) Keep these resets in finally
       setThinking(false);
       setThinkingModel(null);
       setIsGenerating(false);
@@ -687,13 +517,13 @@ If the summary needs to be updated, return the new summary. If not, return the c
     if (settingsIdx === -1) {
       setTabs([...tabs, newTab]);
       setActiveTab(newId);
-      await invoke("create_tab_memory", { tabId: newId });
+      await createTabMemory(newId);
     } else {
       const newTabs = [...tabs];
       newTabs.splice(settingsIdx, 0, newTab);
       setTabs(newTabs);
       setActiveTab(newId);
-      await invoke("create_tab_memory", { tabId: newId });
+      await createTabMemory(newId);
     }
   }
 
@@ -702,7 +532,6 @@ If the summary needs to be updated, return the new summary. If not, return the c
   function handleSettings() {
     let settingsTab = tabs.find(tab => tab.type === "settings");
     if (settingsTab) {
-      // Move settings tab to end if not already
       if (tabs[tabs.length - 1].type !== "settings") {
         setTabs([
           ...tabs.filter(tab => tab.type !== "settings"),
@@ -720,15 +549,16 @@ If the summary needs to be updated, return the new summary. If not, return the c
   }
 
   async function handleClose() {
-    await invoke("close_window");
+    if (window.__TAURI__?.invoke) {
+      await window.__TAURI__?.invoke("close_window");
+    }
   }
 
   async function handleCloseTab(tabId: number) {
-    await invoke("close_tab_and_snapshot", { tabId });
+    await window.__TAURI__?.invoke("close_tab_and_snapshot", { tabId });
     setTabs(prevTabs => {
       const idx = prevTabs.findIndex(tab => tab.id === tabId);
       let newTabs = prevTabs.filter(tab => tab.id !== tabId);
-      // Move settings tab to end if it exists
       const settingsTab = newTabs.find(tab => tab.type === "settings");
       if (settingsTab && newTabs[newTabs.length - 1].type !== "settings") {
         newTabs = [
@@ -736,7 +566,6 @@ If the summary needs to be updated, return the new summary. If not, return the c
           settingsTab
         ];
       }
-      // If the closed tab was active, activate the previous tab or the first one
       if (tabId === activeTab && newTabs.length > 0) {
         const newIdx = idx > 0 ? idx - 1 : 0;
         setActiveTab(newTabs[newIdx].id);
@@ -783,6 +612,8 @@ If the summary needs to be updated, return the new summary. If not, return the c
     coding: "Iris is coding...",
     responding_elsewhere: "Iris is responding in a different chat..."
   };
+
+  const lastSentRef = useRef<string>("");
 
   return (
     <div className="chat-root">
@@ -924,6 +755,31 @@ If the summary needs to be updated, return the new summary. If not, return the c
             style={{ resize: "none" }}
             ref={inputRef}
             onInput={autoResize}
+            onPaste={(e) => {
+              const raw = e.clipboardData.getData("text");
+              if (!raw) return;
+              e.preventDefault();
+              let norm = raw.replace(/\r\n/g, "\n");
+              norm = norm.replace(/[ \t]+$/gm, "");
+              norm = norm.replace(/\n{3,}/g, "\n\n");
+              norm = norm.replace(/\n+$/, "\n");
+              const el = e.currentTarget;
+              const start = el.selectionStart ?? 0;
+              const end = el.selectionEnd ?? 0;
+              setInput(prev => {
+                const next = prev.slice(0, start) + norm + prev.slice(end);
+                queueMicrotask(() => {
+                  const pos = start + norm.length;
+                  el.selectionStart = el.selectionEnd = pos;
+                  if (inputRef.current) {
+                    inputRef.current.style.height = "auto";
+                    const single = 24, maxH = single * 8;
+                    inputRef.current.style.height = Math.min(inputRef.current.scrollHeight, maxH) + "px";
+                  }
+                });
+                return next;
+              });
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -941,12 +797,16 @@ If the summary needs to be updated, return the new summary. If not, return the c
             style={{ marginRight: 8 }}
             onClick={async ()=>{
               try {
-                const j = await invoke<TestModelResult>("test_model", {
-                  model: "iris-coder:latest",
-                  prompt: "Write a TS function add(a:number,b:number):number"
-                });
-                console.log("Test coder result:", j);
-                alert(j.ok ? "Coder ✓ responding" : `Coder ✗ not responding: ${j.error ?? "unknown error"}`);
+                if (window.__TAURI__?.invoke) {
+                  const j = await window.__TAURI__?.invoke("test_model", {
+                    model: "iris-coder:latest",
+                    prompt: "Write a TS function add(a:number,b:number):number"
+                  }) as TestModelResult;
+                  console.log("Test coder result:", j);
+                  alert(j.ok ? "Coder ✓ responding" : `Coder ✗ not responding: ${j.error ?? "unknown error"}`);
+                } else {
+                  alert("Coder ✗ not responding: Tauri not available");
+                }
               } catch (e:any) {
                 alert("Coder ✗ not responding: " + e?.message);
               }

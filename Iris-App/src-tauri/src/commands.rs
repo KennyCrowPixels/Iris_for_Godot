@@ -509,4 +509,1248 @@ pub fn restore_full_tab_memory(
     save_tab(&app, &mem)
 }
 
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
 
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+fn is_standard_role(s: &str) -> bool {
+  matches!(s, "user" | "llm")
+}
+
+fn split_legacy_block(txt: &str) -> Option<(String, String)> {
+  let lower = txt.to_lowercase();
+  if let Some(i) = lower.find("user:") {
+    if let Some(j) = lower[i..].find("\niris:") {
+      let u = txt[i + 5 .. i + j].trim().to_string();
+      let a = txt[i + j + 7 ..].trim().to_string();
+      return Some((u, a));
+    }
+  }
+  None
+}
+
+fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+  let mut changed = false;
+  let mut out: Vec<ChatMessage> = Vec::new();
+  for m in msgs.into_iter() {
+    let role_l = m.role.to_lowercase();
+    if is_standard_role(&role_l) {
+      out.push(ChatMessage { role: role_l, text: m.text });
+    } else if let Some((u, a)) = split_legacy_block(&m.text) {
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      changed = true;
+    } else {
+      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      if role_l != "llm" { changed = true; }
+    }
+  }
+  (out, changed)
+}
+
+// new code starts here
+#[tauri::command]
+pub fn save_snapshot(path: &str, snap: &Snapshot) -> Result<(), String> {
+  let s = serde_json::to_string_pretty(snap).map_err(|e| e.to_string())?;
+  atomic_write_json(&PathBuf::from(path), &s)
+}
+
+#[tauri::command]
+pub fn load_snapshot(path: &str) -> Result<Snapshot, String> {
+  let s = fs::read_to_string(path).map_err(|e| e.to_string())?;
+  let mut snap: Snapshot = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+  snap.messages.retain(|m| m.role != "system");
+  Ok(snap)
+}
+
+#[tauri::command]
+pub fn update_snapshot_memory(
+  app: tauri::AppHandle,
+  snapshot_path: String,
+  summary: String,
+  micro_summary: Option<String>,
+  microSummary: Option<String>,
+  dialogue_bullets: Option<String>,
+  dialogueBullets: Option<String>,
+  new_message: Option<String>,
+  newMessage: Option<String>,
+  artifacts: Vec<Artifact>,
+) -> Result<(), String> {
+  let mut snap = load_snapshot(&snapshot_path)?;
+  let (norm, changed) = normalize_messages(snap.messages);
+  if changed {
+    snap.messages = norm.clone();
+    let _ = save_snapshot(&snapshot_path, &snap);
+  }
+  // use norm for frontend
+
+  let micro_summary = microSummary.or(micro_summary)
+      .ok_or("missing micro_summary/microSummary")?;
+  let dialogue_bullets = dialogueBullets.or(dialogue_bullets)
+      .ok_or("missing dialogue_bullets/dialogueBullets")?;
+  let new_message = newMessage.or(new_message)
+      .ok_or("missing new_message/newMessage")?;
+
+  snap.summary = summary;
+  snap.micro_summary = micro_summary;
+  snap.dialogue_bullets = dialogue_bullets;
+  snap.messages.push(Msg { role: "assistant".into(), text: new_message, ts: now_ts() });
+  let ts = now_ts();
+  let mut arts = artifacts;
+  for a in arts.iter_mut() { a.ts = ts; }
+  snap.artifacts.extend(arts);
+  snap.last_updated = now_ts();
+  save_snapshot(&snapshot_path, &snap)
+}
+// new code ends here

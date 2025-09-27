@@ -11,12 +11,39 @@
       "role": "assistant",
       "text": "User: please tell me a different joke\nIris: Here's a different joke:\n\nA man walked into a library and asked the librarian, \"Do you have any books on Pavlov's dogs and Schrödinger's cat?\" The librarian replied, \"It rings a bell, but I'm not sure if it's here or not.\"",
       "ts": 1758746170
+    },
+    {
+      "role": "assistant",
+      "text": "User: please tell me another, different joke. That last one was funny\nIris: ",
+      "ts": 1758910404
+    },
+    {
+      "role": "assistant",
+      "text": "User: please tell me another, different joke. That last one was funny\nIris: ",
+      "ts": 1758910435
+    },
+    {
+      "role": "assistant",
+      "text": "User: write a basic 3d player movement script in GDSCript please\nIris: ```gdscript\nextends Spatial\n\nvar speed = 5.0\n\nfunc _process(delta):\n    var direction = Vector3.ZERO\n    \n    if Input.is_action_pressed(\"ui_right\"):\n        direction.x += 1\n    if Input.is_action_pressed(\"ui_left\"):\n        direction.x -= 1\n    if Input.is_action_pressed(\"ui_down\"):\n        direction.z += 1\n    if Input.is_action_pressed(\"ui_up\"):\n        direction.z -= 1\n    \n    direction = direction.normalized() * speed * delta\n    translation += direction\n```",
+      "ts": 1758948646
+    },
+    {
+      "role": "assistant",
+      "text": "User: in the AI world, what does MCP stand for and what does it mean?\nIris: MCP stands for \"Machine Control Program.\" In the context of artificial intelligence, it refers to a software component that controls and manages the interactions between a machine or robot and its environment. The MCP is responsible for executing tasks, making decisions, and adapting to changing situations.\n\nIn some AI systems, the MCP is also known as the \"control program\" or \"operating system.\" Its primary function is to ensure the smooth operation of the machine or robot, while also enabling it to learn from its experiences and improve its performance over time.\n\nThe MCP plays a crucial role in many AI applications, including robotics, autonomous vehicles, and smart homes. It's an essential component that enables machines to interact with their surroundings and make decisions based on the data they receive.",
+      "ts": 1758948881
     }
   ],
-  "artifacts": [],
-  "micro_summary": "Here’s a summary of the current project state: The project is currently in the “polishing” phase, focusing on refining the joke delivery and ensuring the joke’s humor remains consistent.",
-  "dialogue_bullets": "Here’s a summary of the chat:\n\n*   User requested a different joke.\n*   Iris provided a joke about a man asking about books on Pavlov’s dogs and Schrödinger’s cat.\n*   The librarian responded with a vague answer, indicating the books weren’t available.",
-  "summary": "New Summary: User requested a different joke. Response provided a joke about Pavlov’s dogs and Schrödinger’s cat.",
+  "artifacts": [
+    {
+      "lang": "gdscript",
+      "filename": null,
+      "content": "extends Spatial\n\nvar speed = 5.0\n\nfunc _process(delta):\n    var direction = Vector3.ZERO\n    \n    if Input.is_action_pressed(\"ui_right\"):\n        direction.x += 1\n    if Input.is_action_pressed(\"ui_left\"):\n        direction.x -= 1\n    if Input.is_action_pressed(\"ui_down\"):\n        direction.z += 1\n    if Input.is_action_pressed(\"ui_up\"):\n        direction.z -= 1\n    \n    direction = direction.normalized() * speed * delta\n    translation += direction",
+      "ts": 1758948646
+    }
+  ],
+  "micro_summary": "**Recall:**\n\n1.  MCP stands for Machine Control Program and refers to software that controls AI systems, particularly robots and autonomous vehicles.\n2.  The project is currently focused on planning and refinement of the MCP’s functionality for AI applications.\n\n",
+  "dialogue_bullets": "Here’s a summary in 6 bullets:\n\n*   **MCP Definition:** Machine Control Program (MCP) in AI refers to a software component managing machine interactions.\n*   **Function:** MCP executes tasks, makes decisions, and adapts to environment changes.\n*   **Role:** Ensures smooth machine operation and learning through experience.\n*   **Applications:** Crucial in robotics, autonomous vehicles, and smart homes.\n*   **Key Role:** Enables machine interaction and data-driven decision-making.\n*   **Overall Importance:** Essential for machine intelligence and adaptability.",
+  "summary": "Return the current summary.",
   "is_closed": false,
-  "last_updated": 1758746170
+  "last_updated": 1758948881
 }
