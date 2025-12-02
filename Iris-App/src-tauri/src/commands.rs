@@ -9,12 +9,15 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
-// Minimal fallback for ChatMessage if not imported from elsewhere
+// Extended ChatMessage with a unix timestamp (defaults to 0 when missing on disk)
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessage {
-    role: String,
-    text: String,
+    pub role: String,
+    pub text: String,
+    #[serde(default)]
+    pub time: i64, // unix seconds
 }
 
 
@@ -29,24 +32,22 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
 const MODEL_TAG: &str = "iris-organizer:latest";
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Artifact { pub lang: String, pub filename: Option<String>, pub content: String, pub ts: i64 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Msg { pub role: String, pub text: String, pub ts: i64 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TabMemory {
     pub tab_id: u32,
     pub title: String,
-    pub messages: Vec<Msg>,
+    pub messages: Vec<ChatMessage>,
     pub artifacts: Vec<Artifact>,
     pub micro_summary: String,
     pub dialogue_bullets: String,
     pub summary: String,
-    #[serde(default)]
     pub is_closed: bool,
-    #[serde(default)]
     pub last_updated: i64,
 }
 
@@ -58,46 +59,82 @@ pub struct CompiledContext {
     pub recent_artifacts: Vec<Artifact>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Snapshot {
-    pub tab_id: u32,
     pub title: String,
-    pub messages: Vec<Msg>,
+    pub messages: Vec<ChatMessage>,
+    #[serde(rename = "microSummary", alias = "micro_summary")]
+    #[serde(default)]
     pub micro_summary: String,
+    #[serde(rename = "dialogueBullets", alias = "dialogue_bullets")]
+    #[serde(default)]
     pub dialogue_bullets: String,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
-    pub last_updated: i64,
+    pub last_updated: Option<i64>,
 }
+
+#[derive(Deserialize)]
+pub struct UpdateTabMemoryArgs {
+#[serde(alias="tab_id", alias="tabId")]
+    pub tab_id: u32,
+    pub summary: String,
+    #[serde(alias="micro_summary", alias="microSummary")]
+    pub micro_summary: String,
+    #[serde(alias="dialogue_bullets", alias="dialogueBullets")]
+    pub dialogue_bullets: String,
+    #[serde(alias="new_message", alias="newMessage")]
+    pub new_message: String,
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSnapshotMemoryArgs {
+  pub tab_id: u32,
+  pub snapshot: Snapshot,
+}
+
+#[derive(Deserialize)]
+pub struct ReadTabSnapshotArgs {
+  pub key: String,
+}
+
+#[derive(Deserialize)]
+pub struct RestoreFullTabMemoryArgs {
+  #[serde(alias="tab_id", alias="tabId")]
+  pub tab_id: u32,
+  pub title: String,
+  pub messages: Vec<ChatMessage>,
+  pub artifacts: Vec<Artifact>,
+  #[serde(alias="micro_summary", alias="microSummary")]
+  pub micro_summary: String,
+  #[serde(alias="dialogue_bullets", alias="dialogueBullets")]
+  pub dialogue_bullets: String,
+  pub summary: String,
+  #[serde(alias="last_updated", alias="lastUpdated")]
+  pub last_updated: Option<i64>,
+}
+
 
 // ========== helpers ==========
 
-fn dev_memory_dir() -> Result<PathBuf, String> {
-    let mut dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    if dir.ends_with("src-tauri") { dir.pop(); }
-    let dir = dir.join("iris_memory");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
-}
-
-fn prod_memory_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or("could not get exe dir")?;
-    let dir = exe_dir.join("iris_memory");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
-}
-
 fn memory_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    if cfg!(debug_assertions) { dev_memory_dir() } else { prod_memory_dir(app) }
+    // Use Tauri 2.0's built-in path resolver
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {}", e))?;
+
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    Ok(base)
 }
 
 fn tab_file(app: &tauri::AppHandle, tab_id: u32) -> Result<PathBuf, String> {
-    Ok(memory_dir(app)?.join(format!("tab_{}.json", tab_id)))
+    let dir = iris_open_tabs_dir(app)?;
+    Ok(dir.join(format!("tab_{}.json", tab_id)))
 }
 
 
@@ -135,49 +172,32 @@ fn save_tab(app: &tauri::AppHandle, mem: &TabMemory) -> Result<(), String> {
     atomic_write_json(&p, &s)
 }
 
+#[tauri::command]
+pub fn show_devtools(app: tauri::AppHandle) -> Result<(), String> {
+    // for Tauri 2, we can get the main window and open devtools on its webview
+    if let Some(window) = app.get_webview_window("main") {
+        window.open_devtools();
+        Ok(())
+    } else {
+        Err("no 'main' webview window found".into())
+    }
+}
+
+
 // ========== commands ==========
 
 #[tauri::command]
-#[allow(non_snake_case)]
-pub fn update_tab_memory(
-    app: tauri::AppHandle,
-    tabId: u32,
-    summary: String,
-    micro_summary: Option<String>,
-    microSummary: Option<String>,
-    dialogue_bullets: Option<String>,
-    dialogueBullets: Option<String>,
-    new_message: Option<String>,
-    newMessage: Option<String>,
-    artifacts: Vec<Artifact>,
-) -> Result<(), String> {
-    let micro_summary = microSummary.or(micro_summary)
-        .ok_or("missing micro_summary/microSummary")?;
-    let dialogue_bullets = dialogueBullets.or(dialogue_bullets)
-        .ok_or("missing dialogue_bullets/dialogueBullets")?;
-    let new_message = newMessage.or(new_message)
-        .ok_or("missing new_message/newMessage")?;
-
-    // Existing implementation, using coalesced locals:
-    let mut mem = load_tab(&app, tabId)?;
-    // MIGRATION: normalize messages
-    let (norm, changed) = normalize_messages(
-        mem.messages.iter().map(|m| ChatMessage { role: m.role.clone(), text: m.text.clone() }).collect()
-    );
-    if changed {
-        mem.messages = norm.iter().map(|m| Msg { role: m.role.clone(), text: m.text.clone(), ts: now_ts() }).collect();
-    }
-
-    mem.tab_id = tabId;
-    mem.summary = summary;
-    mem.micro_summary = micro_summary;
-    mem.dialogue_bullets = dialogue_bullets;
-    mem.messages.push(Msg { role: "llm".into(), text: new_message, ts: now_ts() });
+pub fn update_tab_memory(app: tauri::AppHandle, args: UpdateTabMemoryArgs) -> Result<(), String> {
+    let mut mem = load_tab(&app, args.tab_id)?;
+    mem.summary = args.summary;
+    mem.micro_summary = args.micro_summary;
+    mem.dialogue_bullets = args.dialogue_bullets;
     let ts = now_ts();
-    let mut arts = artifacts;
+    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts });
+    let mut arts = args.artifacts;
     for a in arts.iter_mut() { a.ts = ts; }
     mem.artifacts.extend(arts);
-    mem.last_updated = now_ts();
+    mem.last_updated = ts;
     save_tab(&app, &mem)
 }
 
@@ -225,45 +245,55 @@ pub fn get_compiled_context(
 }
 
 #[tauri::command]
-pub fn close_tab_and_snapshot(app: tauri::AppHandle, tab_id: u32) -> Result<(), String> {
-  let mut mem = load_tab(&app, tab_id)?;
-  mem.is_closed = true;
-  mem.last_updated = now_ts();
-  let dir = memory_dir(&app)?;
-  let path1 = { let mut p = dir.clone(); p.push("last_closed_tab_1.json"); p };
-  let path2 = { let mut p = dir.clone(); p.push("last_closed_tab_2.json"); p };
-  let path3 = { let mut p = dir.clone(); p.push("last_closed_tab_3.json"); p };
-  // rotate: _2 -> _3, _1 -> _2
-  if path3.exists() { let _ = fs::remove_file(&path3); }
-  if path2.exists() { fs::rename(&path2, &path3).map_err(|e| e.to_string())?; }
-  if path1.exists() { fs::rename(&path1, &path2).map_err(|e| e.to_string())?; }
-  // write new _1
-  let s = serde_json::to_string_pretty(&mem).map_err(|e| e.to_string())?;
-  atomic_write_json(&path1, &s)?;
-  // delete tab file
-  let tf = tab_file(&app, tab_id)?;
-  if tf.exists() { let _ = fs::remove_file(tf); }
+pub fn close_tab_and_snapshot(app: tauri::AppHandle, tab_id: u32, mut snapshot: Snapshot) -> Result<(), String> {
+  let now = now_ts();
+  if snapshot.last_updated.unwrap_or(0) == 0 {
+    snapshot.last_updated = Some(now);
+  }
+  for m in &mut snapshot.messages {
+    if m.time == 0 {
+      m.time = now;
+    }
+  }
+
+  let lf = iris_last_closed_file(&app)?;
+  iris_write_snapshot_file(&lf, &snapshot)?;
+
+  if let Ok(dir) = iris_open_tabs_dir(&app) {
+    let p = dir.join(format!("tab_{}.json", tab_id));
+    let _ = remove_file(&p);
+  }
+
   Ok(())
 }
 
 #[tauri::command]
-pub fn restore_last_closed_tab(app: tauri::AppHandle) -> Result<TabMemory, String> {
-  let dir = memory_dir(&app)?;
-  let path1 = { let mut p = dir.clone(); p.push("last_closed_tab_1.json"); p };
-  let path2 = { let mut p = dir.clone(); p.push("last_closed_tab_2.json"); p };
-  let path3 = { let mut p = dir.clone(); p.push("last_closed_tab_3.json"); p };
+// AFTER (normalize timestamps and return Snapshot without tab_id)
+pub fn restore_last_closed_tab(app: tauri::AppHandle) -> Result<Snapshot, String> {
+  let lf = iris_last_closed_file(&app)?;
+  let s = fs::read_to_string(&lf).map_err(|e| e.to_string())?;
 
-  if !path1.exists() { return Err("no recent closed tabs".into()); }
+  // Try parse as Snapshot first, else fall back to TabMemory mapping
+  if let Ok(mut snap) = serde_json::from_str::<Snapshot>(&s) {
+    let now = now_ts();
+    if snap.last_updated.unwrap_or(0) == 0 { snap.last_updated = Some(now); }
+    for m in &mut snap.messages { if m.time == 0 { m.time = now; } }
+    return Ok(snap);
+  }
 
-  let s = fs::read_to_string(&path1).map_err(|e| e.to_string())?;
   let mem: TabMemory = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-
-  // rotate down
-  let _ = fs::remove_file(&path1);
-  if path2.exists() { fs::rename(&path2, &path1).map_err(|e| e.to_string())?; }
-  if path3.exists() { fs::rename(&path3, &path2).map_err(|e| e.to_string())?; }
-
-  Ok(mem)
+  let now = now_ts();
+  let mut snap = Snapshot {
+    title: mem.title.clone(),
+    messages: mem.messages.clone(),
+    micro_summary: mem.micro_summary.clone(),
+    dialogue_bullets: mem.dialogue_bullets.clone(),
+    summary: mem.summary.clone(),
+    artifacts: mem.artifacts.clone(),
+    last_updated: Some(mem.last_updated),
+  };
+  for m in &mut snap.messages { if m.time == 0 { m.time = now; } }
+  Ok(snap)
 }
 
 #[tauri::command]
@@ -404,50 +434,77 @@ pub fn close_window(window: tauri::Window) {
 }
 
 #[tauri::command]
+#[allow(dead_code)]
+pub fn migrate_open_tabs_to_snapshot_format(app: tauri::AppHandle) -> Result<usize, String> {
+  let dir = iris_open_tabs_dir(&app)?;
+  let mut count = 0;
+
+  if let Ok(rd) = read_dir(&dir) {
+    for e in rd.flatten() {
+      let path = e.path();
+      if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+      if path.to_string_lossy().contains(".tmp") { continue; }
+
+      if migrate_legacy_tabmemory_to_snapshot(&path).is_ok() {
+        count += 1;
+      }
+    }
+  }
+
+  eprintln!("[migrate_open_tabs_to_snapshot_format] Migrated {} files", count);
+  Ok(count)
+}
+
+#[tauri::command]
 pub async fn list_open_tabs(app: tauri::AppHandle) -> Result<Vec<Snapshot>, String> {
-    let dir = memory_dir(&app)?;
-    let mut out = Vec::new();
-    if !dir.exists() { return Ok(out); }
+    let dir = iris_open_tabs_dir(&app)?;
+  eprintln!("[list_open_tabs] Reading from directory: {}", dir.display());
+    let mut out: Vec<Snapshot> = Vec::new();
 
-    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
-        let path = entry.path();
+    if let Ok(rd) = read_dir(&dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+            // skip tmp-like files
+            if path.to_string_lossy().contains(".tmp") { continue; }
 
-        let is_final = path.extension().and_then(|s| s.to_str()) == Some("json");
-        let looks_tmp = path.extension().and_then(|s| s.to_str()).map(|x| x.contains(".tmp")).unwrap_or(false);
-        if !is_final || looks_tmp { continue; }
-
-        let name_ok = path.file_name().and_then(|s| s.to_str()).map_or(false, |n| n.starts_with("tab_"));
-        if !name_ok { continue; }
-
-        let s = match fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
-        let mem: Result<TabMemory, _> = serde_json::from_str(&s);
-        let mut mem = match mem { Ok(m) => m, Err(_) => continue };
-
-        // MIGRATION: normalize messages
-        let (norm, changed) = normalize_messages(
-            mem.messages.iter().map(|m| ChatMessage { role: m.role.clone(), text: m.text.clone() }).collect()
-        );
-        if changed {
-            mem.messages = norm.iter().map(|m| Msg { role: m.role.clone(), text: m.text.clone(), ts: now_ts() }).collect();
-            let _ = save_tab(&app, &mem);
+            match iris_read_snapshot_file(&path) {
+                Ok(mut snap) => {
+                    // normalize messages if needed
+                    let (norm, changed) = normalize_messages(&snap.messages);
+                    if changed {
+                        snap.messages = norm.clone();
+                        let _ = iris_write_snapshot_file(&path, &snap);
+                    }
+                    out.push(snap);
+                }
+                Err(err) => {
+                    eprintln!("[list_open_tabs] skipping corrupt {}: {}", path.display(), err);
+                    continue;
+                }
+            }
         }
-
-        if mem.is_closed { continue; }
-
-        out.push(Snapshot {
-            tab_id: mem.tab_id,
-            title: mem.title.clone(),
-            messages: mem.messages.clone(),
-            micro_summary: mem.micro_summary.clone(),
-            dialogue_bullets: mem.dialogue_bullets.clone(),
-            summary: mem.summary.clone(),
-            artifacts: mem.artifacts.clone(),
-            last_updated: mem.last_updated,
-        });
     }
 
-    out.sort_by_key(|s| s.last_updated);
+      eprintln!("[list_open_tabs] Found {} snapshots", out.len());
+    // If empty during dev, seed from ./iris_memory (one-shot)
+    if out.is_empty() && cfg!(debug_assertions) {
+        let copied = seed_open_tabs_from_dev_dir(app.clone());
+        if copied > 0 {
+            if let Ok(rd) = read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                        if let Ok(snap) = iris_read_snapshot_file(&p) {
+                            out.push(snap);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| b.last_updated.unwrap_or(0).cmp(&a.last_updated.unwrap_or(0)));
     Ok(out)
 }
 
@@ -490,40 +547,20 @@ pub async fn ensure_model(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-#[allow(non_snake_case)]
-pub fn restore_full_tab_memory(
-    app: tauri::AppHandle,
-    tabId: u32,
-    title: String,
-    messages: Vec<ChatMessage>,
-    artifacts: Vec<Artifact>,
-    micro_summary: Option<String>,
-    microSummary: Option<String>,
-    dialogue_bullets: Option<String>,
-    dialogueBullets: Option<String>,
-    summary: String,
-    last_updated: Option<i64>,
-    lastUpdated: Option<i64>,
-) -> Result<(), String> {
-    let micro_summary = microSummary.or(micro_summary)
-        .ok_or("missing micro_summary/microSummary")?;
-    let dialogue_bullets = dialogueBullets.or(dialogue_bullets)
-        .ok_or("missing dialogue_bullets/dialogueBullets")?;
-    let last_updated = lastUpdated.or(last_updated).unwrap_or_else(now_ts);
-
-    // Existing implementation, using coalesced locals:
-    let mem = TabMemory {
-        tab_id: tabId,
-        title,
-        messages: messages.into_iter().map(|m| Msg { role: m.role, text: m.text, ts: now_ts() }).collect(),
-        artifacts,
-        micro_summary,
-        dialogue_bullets,
-        summary,
-        is_closed: false,
-        last_updated,
-    };
-    save_tab(&app, &mem)
+pub fn restore_full_tab_memory(app: tauri::AppHandle, args: RestoreFullTabMemoryArgs) -> Result<(), String> {
+  // load/normalize/save as you already do, but only via args.*
+  let mem = TabMemory {
+    tab_id: args.tab_id,
+    title: args.title,
+    messages: args.messages,
+    artifacts: args.artifacts,
+    micro_summary: args.micro_summary,
+    dialogue_bullets: args.dialogue_bullets,
+    summary: args.summary,
+    is_closed: false,
+    last_updated: args.last_updated.unwrap_or_else(now_ts),
+  };
+  save_tab(&app, &mem)
 }
 
 fn is_standard_role(s: &str) -> bool {
@@ -542,19 +579,19 @@ fn split_legacy_block(txt: &str) -> Option<(String, String)> {
   None
 }
 
-fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+fn normalize_messages(msgs: &[ChatMessage]) -> (Vec<ChatMessage>, bool) {
   let mut changed = false;
   let mut out: Vec<ChatMessage> = Vec::new();
-  for m in msgs.into_iter() {
+  for m in msgs.iter() {
     let role_l = m.role.to_lowercase();
     if is_standard_role(&role_l) {
-      out.push(ChatMessage { role: role_l, text: m.text });
+      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts() });
     } else if let Some((u, a)) = split_legacy_block(&m.text) {
-      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u }); }
-      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a }); }
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts() }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts() }); }
       changed = true;
     } else {
-      out.push(ChatMessage { role: "llm".into(), text: m.text });
+      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts() });
       if role_l != "llm" { changed = true; }
     }
   }
@@ -563,12 +600,14 @@ fn normalize_messages(mut msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
 
 // new code starts here
 #[tauri::command]
+#[allow(dead_code)]
 pub fn save_snapshot(path: &str, snap: &Snapshot) -> Result<(), String> {
   let s = serde_json::to_string_pretty(snap).map_err(|e| e.to_string())?;
   atomic_write_json(&PathBuf::from(path), &s)
 }
 
 #[tauri::command]
+#[allow(dead_code)]
 pub fn load_snapshot(path: &str) -> Result<Snapshot, String> {
   let s = fs::read_to_string(path).map_err(|e| e.to_string())?;
   let mut snap: Snapshot = serde_json::from_str(&s).map_err(|e| e.to_string())?;
@@ -578,41 +617,190 @@ pub fn load_snapshot(path: &str) -> Result<Snapshot, String> {
 
 #[tauri::command]
 pub fn update_snapshot_memory(
-  app: tauri::AppHandle,
-  snapshot_path: String,
-  summary: String,
-  micro_summary: Option<String>,
-  microSummary: Option<String>,
-  dialogue_bullets: Option<String>,
-  dialogueBullets: Option<String>,
-  new_message: Option<String>,
-  newMessage: Option<String>,
-  artifacts: Vec<Artifact>,
+    app: tauri::AppHandle,
+    args: UpdateSnapshotMemoryArgs,
 ) -> Result<(), String> {
-  let mut snap = load_snapshot(&snapshot_path)?;
-  let (norm, changed) = normalize_messages(snap.messages);
-  if changed {
-    snap.messages = norm.clone();
-    let _ = save_snapshot(&snapshot_path, &snap);
+    let mut snapshot = args.snapshot;
+    let now = now_ts();
+    if snapshot.last_updated.unwrap_or(0) == 0 {
+        snapshot.last_updated = Some(now);
+    }
+    for m in &mut snapshot.messages {
+        if m.time == 0 {
+            m.time = now;
+        }
+    }
+
+    let dir = iris_open_tabs_dir(&app)?;
+    let path = dir.join(format!("tab_{}.json", args.tab_id));
+    iris_write_snapshot_file(&path, &snapshot)
+}
+
+#[tauri::command]
+pub fn read_tab_snapshot(app: tauri::AppHandle, args: ReadTabSnapshotArgs) -> Result<Snapshot, String> {
+  let path = iris_normalize_key_to_path(&app, &args.key)?;
+  if !path.exists() {
+    return Err(format!("snapshot not found: {}", path.display()));
   }
-  // use norm for frontend
 
-  let micro_summary = microSummary.or(micro_summary)
-      .ok_or("missing micro_summary/microSummary")?;
-  let dialogue_bullets = dialogueBullets.or(dialogue_bullets)
-      .ok_or("missing dialogue_bullets/dialogueBullets")?;
-  let new_message = newMessage.or(new_message)
-      .ok_or("missing new_message/newMessage")?;
-
-  snap.summary = summary;
-  snap.micro_summary = micro_summary;
-  snap.dialogue_bullets = dialogue_bullets;
-  snap.messages.push(Msg { role: "llm".into(), text: new_message, ts: now_ts() });
-  let ts = now_ts();
-  let mut arts = artifacts;
-  for a in arts.iter_mut() { a.ts = ts; }
-  snap.artifacts.extend(arts);
-  snap.last_updated = now_ts();
-  save_snapshot(&snapshot_path, &snap)
+  match iris_read_snapshot_file(&path) {
+    Ok(snap) => Ok(snap),
+    Err(e) => Err(e),
+  }
 }
 // new code ends here
+
+#[tauri::command]
+pub fn debug_memory_dir(app: tauri::AppHandle) -> String {
+  match memory_dir(&app) {
+    Ok(p) => p.display().to_string(),
+    Err(e) => e,
+  }
+}
+
+// APPEND: new iris_* helpers, debug_list_open_tab_files, and seed_open_tabs_from_dev_dir
+use std::fs::{read, write, read_dir, create_dir_all, remove_file, copy};
+use serde_json::{from_slice, to_vec_pretty};
+
+fn iris_open_tabs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let mut p = memory_dir(app)?;
+  p.push("open_tabs");
+  create_dir_all(&p).map_err(|e| e.to_string())?;
+  Ok(p)
+}
+
+fn iris_last_closed_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let mut p = memory_dir(app)?;
+  p.push("last_closed.json");
+  Ok(p)
+}
+
+fn iris_normalize_key_to_path(app: &tauri::AppHandle, key: &str) -> Result<PathBuf, String> {
+  let dir = iris_open_tabs_dir(app)?;
+  let k = key.trim();
+  let fname = if k.ends_with(".json") {
+    k.to_string()
+  } else if k.starts_with("tab_") {
+    if k.ends_with(".json") { k.to_string() } else { format!("{k}.json") }
+  } else {
+    format!("tab_{k}.json")
+  };
+  Ok(dir.join(fname))
+}
+
+/// Migration helper: converts legacy TabMemory to Snapshot format and rewrites the file.
+#[allow(dead_code)]
+fn migrate_legacy_tabmemory_to_snapshot(path: &std::path::Path) -> Result<Snapshot, String> {
+  let bytes = read(path).map_err(|e| e.to_string())?;
+
+  // First, try parsing as Snapshot (already-migrated)
+  if let Ok(snap) = from_slice::<Snapshot>(&bytes) {
+    return Ok(snap);
+  }
+
+  // Fallback: parse as legacy TabMemory
+  let mem: TabMemory = from_slice(&bytes).map_err(|e| e.to_string())?;
+  let now = now_ts();
+  let mut snap = Snapshot {
+    title: mem.title.clone(),
+    messages: mem.messages.clone(),
+    micro_summary: mem.micro_summary.clone(),
+    dialogue_bullets: mem.dialogue_bullets.clone(),
+    summary: mem.summary.clone(),
+    artifacts: mem.artifacts.clone(),
+    last_updated: Some(if mem.last_updated > 0 { mem.last_updated } else { now }),
+  };
+  for m in &mut snap.messages { if m.time == 0 { m.time = now; } }
+  snap.messages.retain(|m| m.role != "system");
+
+  // Rewrite the file in the new format
+  let _ = iris_write_snapshot_file(path, &snap);
+  eprintln!("[migrate_legacy_tabmemory_to_snapshot] Migrated {} to Snapshot format", path.display());
+
+  Ok(snap)
+}
+
+fn iris_read_snapshot_file(path: &std::path::Path) -> Result<Snapshot, String> {
+  let bytes = read(path).map_err(|e| e.to_string())?;
+
+  // First, try parsing as the newer Snapshot format
+  let sres: Result<Snapshot, serde_json::Error> = from_slice(&bytes);
+  if let Ok(mut snap) = sres {
+    snap.messages.retain(|m| m.role != "system");
+    return Ok(snap);
+  }
+
+  // Fallback: older TabMemory format — convert into Snapshot (and rewrite file)
+  let mres: Result<TabMemory, serde_json::Error> = from_slice(&bytes);
+  if let Ok(mem) = mres {
+    let now = now_ts();
+    let mut snap = Snapshot {
+      title: mem.title.clone(),
+      messages: mem.messages.clone(),
+      micro_summary: mem.micro_summary.clone(),
+      dialogue_bullets: mem.dialogue_bullets.clone(),
+      summary: mem.summary.clone(),
+      artifacts: mem.artifacts.clone(),
+      last_updated: Some(mem.last_updated),
+    };
+    for m in &mut snap.messages { if m.time == 0 { m.time = now; } }
+    snap.messages.retain(|m| m.role != "system");
+    // Rewrite in new format for next time
+    let _ = iris_write_snapshot_file(path, &snap);
+    return Ok(snap);
+  }
+
+  // Neither format parsed — return combined error messages for debugging
+  let s_err = sres.err().map(|e| e.to_string()).unwrap_or_else(|| "no snapshot error".into());
+  let m_err = mres.err().map(|e| e.to_string()).unwrap_or_else(|| "no tabmem error".into());
+  Err(format!("failed to parse snapshot: snapshot_err: {}; tabmem_err: {}", s_err, m_err))
+}
+
+fn iris_write_snapshot_file(path: &std::path::Path, snap: &Snapshot) -> Result<(), String> {
+  let bytes = to_vec_pretty(snap).map_err(|e| e.to_string())?;
+  let result = write(path, bytes).map_err(|e| e.to_string());
+  if result.is_ok() {
+    eprintln!("[iris_write_snapshot_file] Successfully wrote {} bytes to: {}", snap.messages.len(), path.display());
+  }
+  result
+}
+
+#[tauri::command]
+pub fn debug_list_open_tab_files(app: tauri::AppHandle) -> Vec<String> {
+  let mut names = Vec::new();
+  if let Ok(dir) = iris_open_tabs_dir(&app) {
+    if let Ok(rd) = read_dir(&dir) {
+      for e in rd.flatten() {
+        if let Some(n) = e.file_name().to_str() {
+          names.push(n.to_string());
+        }
+      }
+    }
+  }
+  names
+}
+
+/// Development helper: copy ./iris_memory/tab_*.json into open_tabs if present (one-shot)
+#[tauri::command]
+pub fn seed_open_tabs_from_dev_dir(app: tauri::AppHandle) -> usize {
+  if !cfg!(debug_assertions) { return 0; }
+//   let base = match memory_dir(&app) { Ok(p) => p, Err(_) => return 0 };
+  let dev = PathBuf::from("./iris_memory");
+  if !dev.exists() { return 0; }
+  let open = match iris_open_tabs_dir(&app) { Ok(p) => p, Err(_) => return 0 };
+  let mut copied = 0usize;
+  if let Ok(rd) = read_dir(&dev) {
+    for e in rd.flatten() {
+      let p = e.path();
+      let name_ok = p.file_name().and_then(|s| s.to_str()).map(|n| n.starts_with("tab_") && n.ends_with(".json")).unwrap_or(false);
+      if name_ok {
+        if let Some(name) = p.file_name() {
+          let mut dst = open.clone();
+          dst.push(name);
+          if copy(&p, &dst).is_ok() { copied += 1; }
+        }
+      }
+    }
+  }
+  copied
+}

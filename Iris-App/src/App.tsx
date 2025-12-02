@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 import "./App.css";
+import type { ChatMessage, Artifact } from "./types/models";
+
 
 import {
   OLLAMA_URL,
@@ -14,6 +16,9 @@ import {
   updateTabMemory,
   restoreFullTabMemory,
   listOpenTabs,
+  readTabSnapshot, 
+  persistSnapshot,
+  migrateOpenTabsToSnapshotFormat
 } from "./state/memory";
 import {
   updateMessagesAppendUser,
@@ -65,7 +70,6 @@ type Tab = {
   messages?: Message[];
 };
 type TestModelResult = { ok: boolean; error: string | null; response?: string };
-type Artifact = { lang: string; filename?: string; content: string; ts?: number };
 type Snapshot = {
   title: string;
   messages: { role: "user" | "llm"; text: string }[];
@@ -83,6 +87,20 @@ function isCoderIntent(text: string): boolean {
   return fences || codeyWords || fileNames;
 }
 
+// Local, minimal wait to let Tauri inject window.__TAURI__
+async function waitForTauri(timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  // quick exit if it's already there
+  if ((window as any).__TAURI__?.invoke) return;
+
+  while (Date.now() - start < timeoutMs) {
+    if ((window as any).__TAURI__?.invoke) return;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  // no throw; we just return and let callers decide what to do
+}
+
+
 function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
@@ -96,6 +114,7 @@ function App() {
   ]);
   const [activeTab, setActiveTab] = useState(1);
   const [openMenu, setOpenMenu] = useState<null | "file" | "options">(null);
+  const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
   const abortController = useRef<AbortController | null>(null);
   const historyRef = useRef<HTMLDivElement>(null);
   const taskbarRef = useRef<HTMLDivElement>(null);
@@ -106,27 +125,98 @@ function App() {
 
   const currentTab = tabs.find(t => t.id === activeTab);
 
+  // helper: retry listOpenTabs a few times to be resilient to late Tauri injection
+  async function tryListOpenTabs(retries = 4) {
+    for (let i = 0; i < retries; i++) {
+      console.log("[App] Attempt", i + 1, "to load open tabs");
+      try {
+        const snaps = await listOpenTabs();
+        if (Array.isArray(snaps) && snaps.length) return snaps;
+      } catch (e) {
+        console.warn("listOpenTabs fail", e);
+      }
+      await new Promise(r => setTimeout(r, 400 * (i + 1))); // 400,800,1200,1600
+    }
+    return [];
+  }
+
   useEffect(() => {
-    setModelStatus("checking");
-    // waitForTauri().then(() => {
-      Promise.all([
-        ensureModel("iris-coder:latest")
-          .then(() => setCoderReady(true))
-          .catch(e => { setCoderReady(false); console.error("ensure_model", e); }),
-        // universal prompts and open tabs
-        listOpenTabs()
-          .then(async (snaps) => {
-            if (!Array.isArray(snaps) || snaps.length === 0) return;
-            const capped = snaps.slice(-8);
+    (async () => {
+      try {
+        // be more patient for Tauri injection on slow machines
+        await waitForTauri(8000);
+
+        setModelStatus("checking");
+        
+        // Run migration on startup (converts legacy TabMemory to Snapshot format)
+        try {
+          const migrated = await migrateOpenTabsToSnapshotFormat();
+          if (migrated > 0) {
+            console.log("[App] Migrated", migrated, "legacy tab files to Snapshot format");
+          }
+        } catch (e) {
+          console.warn("[App] Migration skipped/failed (non-fatal):", e);
+        }
+
+        await Promise.all([
+          ensureModel("iris-coder:latest")
+            .then(() => setCoderReady(true))
+            .catch((e) => {
+              setCoderReady(false);
+              console.error("ensure_model", e);
+            }),
+
+          // universal prompts and open tabs (with retries)
+          (async () => {
+            const snaps = await tryListOpenTabs();
+            if (!snaps.length) {
+              console.warn("No snapshots yet (Tauri late or store empty).");
+              return;
+            }
+
+            // sort by freshness and cap to 8
+            const capped = snaps
+              .slice()
+              .sort((a, b) => (b.last_updated ?? 0) - (a.last_updated ?? 0))
+              .slice(0, 8);
+
+              console.log("[App] Loaded", capped.length, "snapshots on startup");
             let nextId = 1;
-            const newTabs: Tab[] = capped.map((snap, i) => ({
+            // TODO: We're generating new incremental tab IDs on the frontend instead of preserving stable backend tab IDs.
+            // This can cause desync with backend memory, and needs follow-up.
+            const newTabs: Tab[] = capped.map((snap) => ({
               id: nextId++,
               title: snap.title && snap.title.trim() ? snap.title : `Tab #${nextId - 1}`,
               type: "chat",
-              messages: normalizeMessages(snap.messages)
+              messages: normalizeMessages(snap.messages),
             }));
+
             setTabs(newTabs);
             setActiveTab(newTabs[newTabs.length - 1].id);
+
+            // Hydration fallback: if frontend messages are missing, try a per-tab read snapshot
+            for (let i = 0; i < newTabs.length; ++i) {
+              const tab = newTabs[i];
+              const snap = capped[i];
+              if (!tab.messages || tab.messages.length === 0) {
+                try {
+                  if (typeof readTabSnapshot === "function") {
+                    const full = await readTabSnapshot((snap as any).id ?? i);
+                    if (full?.messages?.length) {
+                      setTabs(prev =>
+                        prev.map(t =>
+                          t.id === tab.id ? { ...t, messages: normalizeMessages(full.messages) } : t
+                        )
+                      );
+                    }
+                  }
+                } catch (e) {
+                  console.warn("readTabSnapshot failed:", e);
+                }
+              }
+            }
+
+            // restore each snapshot into backend memory (keep existing behavior)
             for (let i = 0; i < newTabs.length; ++i) {
               const tab = newTabs[i];
               const snap = capped[i];
@@ -138,19 +228,21 @@ function App() {
                 microSummary: snap.microSummary,
                 dialogueBullets: snap.dialogueBullets,
                 summary: snap.summary,
-                lastUpdated: snap.last_updated ?? ((Date.now()/1000)|0),
+                lastUpdated: typeof snap.last_updated === "number" ? snap.last_updated : ((Date.now() / 1000) | 0),
               });
             }
-          })
-          .catch(e => { console.error("list_open_tabs", e); })
-      ])
-        .then(() => setModelStatus("ready"))
-        .catch(() => setModelStatus("error"));
-    // }).catch(e => {
-    //   setModelStatus("error");
-    //   console.error("Tauri never became ready", e);
-    // });
+          })()
+        ]);
+
+        setModelStatus("ready");
+      } catch (e) {
+        setModelStatus("error");
+        console.error("Tauri never became ready or init failed", e);
+      }
+    })();
   }, []);
+
+
 
   useEffect(() => {
     if (historyRef.current) {
@@ -176,27 +268,58 @@ function App() {
           // You may want to modularize this as well
           if (window.__TAURI__?.invoke) {
             const snap = await window.__TAURI__?.invoke("restore_last_closed_tab") as Snapshot;
-            if (!snap || !snap.messages) return;
-            const usedIds = tabs.map(t => t.id);
-            let newId = 1;
-            while (usedIds.includes(newId)) newId++;
-            const newTab: Tab = {
-              id: newId,
-              title: snap.title || `Tab #${newId}`,
-              type: "chat",
-              messages: snap.messages
-            };
-            setTabs(prev => [...prev, newTab]);
-            setActiveTab(newId);
-            await createTabMemory(newId);
-            await updateTabMemory({
-              tabId: newId,
-              summary: snap.summary,
-              microSummary: snap.microSummary,
-              dialogueBullets: snap.dialogueBullets,
-              newMessage: snap.messages.map((m: {role: "user" | "llm"; text: string}) => `${m.role === "user" ? "User" : "Iris"}: ${m.text}`).join("\n"),
-              artifacts: snap.artifacts
-            });
+            if (snap && Array.isArray(snap.messages) && snap.messages.length) {
+              const usedIds = tabs.map(t => t.id);
+              let newId = 1;
+              while (usedIds.includes(newId)) newId++;
+              const newTab: Tab = {
+                id: newId,
+                title: snap.title || `Tab #${newId}`,
+                type: "chat",
+                messages: normalizeMessages(snap.messages)
+              };
+              setTabs(prev => [...prev, newTab]);
+              setActiveTab(newId);
+              await createTabMemory(newId);
+              await updateTabMemory({
+                tabId: newId,
+                summary: snap.summary,
+                microSummary: snap.microSummary,
+                dialogueBullets: snap.dialogueBullets,
+                newMessage: snap.messages.map((m: {role: "user" | "llm"; text: string}) => `${m.role === "user" ? "User" : "Iris"}: ${m.text}`).join("\n"),
+                artifacts: snap.artifacts
+              });
+            } else {
+              // backend returned no messages — try localStorage fallback (last-closed snapshot)
+              const raw = localStorage.getItem("iris:lastClosed");
+              if (raw) {
+                try {
+                  const s2 = JSON.parse(raw);
+                  if (s2?.messages?.length) {
+                    const usedIds = tabs.map(t => t.id);
+                    let newId = 1; while (usedIds.includes(newId)) newId++;
+                    const newTab: Tab = {
+                      id: newId,
+                      title: s2.title || `Tab #${newId}`,
+                      type: "chat",
+                      messages: normalizeMessages(s2.messages)
+                    };
+                    setTabs(prev => [...prev, newTab]);
+                    setActiveTab(newId);
+
+                    await createTabMemory(newId);
+                    await updateTabMemory({
+                      tabId: newId,
+                      summary: s2.summary,
+                      microSummary: s2.microSummary,
+                      dialogueBullets: s2.dialogueBullets,
+                      newMessage: s2.messages.map((m:any)=>`${m.role==="user"?"User":"Iris"}: ${m.text}`).join("\n"),
+                      artifacts: s2.artifacts
+                    });
+                  }
+                } catch {}
+              }
+            }
           }
         } catch {}
       }
@@ -228,10 +351,17 @@ function App() {
     // 1) Validate input and tab BEFORE setting any flags
     const text = input.trim();
     if (!text || currentTab?.type !== "chat") return;
+    setInput("");
+    queueMicrotask(() => { if (inputRef.current) { inputRef.current.style.height = "auto"; }});
+
+    // Capture the originating tab id so async work always attributes to the original tab
+    const requestTabId = activeTab;
 
     // Create a local controller and assign it once
     const controller = new AbortController();
     abortController.current = controller;
+    // reset stopped flag when starting a new send
+    stoppedRef.current = false;
 
     // 2) Compute coderish FIRST, then ensure the right model
     let compiled: {
@@ -253,18 +383,20 @@ function App() {
 
     // 3) Flip UI to “thinking” and block Send
     setThinking(true);
+    // keep respondingTab tied to the UI-active tab (existing behavior)
     setRespondingTab(activeTab);
     setIrisStatus("thinking");
     setIsGenerating(true);
 
-    updateTabMessages(activeTab, msgs => updateMessagesAppendUser(msgs, text));
+    // Use requestTabId for all message/memory writes so they remain bound to the original request
+    updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, text));
 
     try {
       // get_compiled_context is still a tauri invoke, not modularized yet
       try {
         if (window.__TAURI__?.invoke) {
 
-          const result = await window.__TAURI__?.invoke("get_compiled_context", { tabId: activeTab, tokenBudget: 1200 }) as typeof compiled;
+          const result = await window.__TAURI__?.invoke("get_compiled_context", { tabId: requestTabId, tokenBudget: 1200 }) as typeof compiled;
           if (result && typeof result === "object") {
             compiled = {
               microSummary: result.microSummary ?? "",
@@ -356,11 +488,11 @@ Respond only inside <final>...</final>.
         onHeaders: () => setIrisStatus(coderish ? "coding" : "responding"),
         onFirstToken: (first) => {
           streamedText += first;
-          updateTabMessages(activeTab, msgs => insertLLMBubble(msgs, first));
+          updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, first));
         },
         onTokens: (delta) => {
           streamedText += delta;
-          updateTabMessages(activeTab, msgs => patchLastLLMBubble(msgs, delta));
+          updateTabMessages(requestTabId, msgs => patchLastLLMBubble(msgs, delta));
         },
         onDone: () => {
           // No message replacement here; streamedText already has the full reply
@@ -417,7 +549,7 @@ ${text}
         }
       }
 
-      updateTabMessages(activeTab, msgs => {
+      updateTabMessages(requestTabId, msgs => {
         const copy = [...msgs];
         for (let i = copy.length - 1; i >= 0; --i) {
           if (copy[i].role === "llm") {
@@ -454,7 +586,9 @@ ${deliveredText}
 If the summary needs to be updated, return the new summary. If not, return the current summary unchanged.
 `;
 
-      const dialogueBulletsPrompt = `Summarize the following chat into <=6 bullets preserving names, files, decisions:\nUser: ${text}\nIris: ${deliveredText}`;
+      const dialogueBulletsPrompt = `Summarize the following chat into <=6 bullets preserving names, files, decisions:
+User: ${text}
+Iris: ${deliveredText}`;
 
       const { microSummary: newMicroSummary, projectSummary: newProjectSummary, dialogueBullets: newDialogueBullets } =
         await summarizeExchange({ model: SUMMARY_MODEL, microSummaryPrompt, projectSummaryPrompt, dialogueBulletsPrompt });
@@ -462,14 +596,56 @@ If the summary needs to be updated, return the new summary. If not, return the c
       const now = Math.floor(Date.now() / 1000);
       const artifactsWithTs = artifacts.map((a: Artifact) => ({ ...a, ts: now }));
 
+      // If the user hit Stop after summarization, don't write memory
+      if (stoppedRef.current) return;
+
       await updateTabMemory({
-        tabId: activeTab,
+        tabId: requestTabId,
         summary: newProjectSummary,
         microSummary: newMicroSummary,
         dialogueBullets: newDialogueBullets,
         newMessage: `User: ${text}\nIris: ${deliveredText}`,
         artifacts: artifactsWithTs,
       });
+
+      // Persist a full snapshot so the backend's open_tabs/tab_<id>.json is updated (non-fatal)
+      try {
+        const tabObj = tabs.find(t => t.id === requestTabId);
+        const nowTs = Math.floor(Date.now() / 1000);
+        // Start from whatever the UI currently has (may be slightly stale),
+        // then ensure the most recent user + Iris exchange is represented.
+        const baseMsgs = (tabObj?.messages || []).map((m: any) => ({
+          role: m.role,
+          text: m.text,
+          time: (m as any).time ?? nowTs,
+        }));
+
+        const messagesForSnapshot: { role: 'user' | 'llm'; text: string; time: number }[] = [...baseMsgs];
+
+        // Ensure last user message is present
+        if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'user' ||
+            messagesForSnapshot[messagesForSnapshot.length - 1].text !== text) {
+          messagesForSnapshot.push({ role: 'user', text, time: nowTs });
+        }
+
+        // Ensure last LLM message is present/updated
+        if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'llm' ||
+            messagesForSnapshot[messagesForSnapshot.length - 1].text !== deliveredText) {
+          messagesForSnapshot.push({ role: 'llm', text: deliveredText, time: nowTs });
+        }
+
+        await persistSnapshot(requestTabId, {
+          title: tabObj?.title ?? `Tab #${requestTabId}`,
+          messages: messagesForSnapshot,
+          microSummary: newMicroSummary ?? "",
+          dialogueBullets: newDialogueBullets ?? "",
+          summary: newProjectSummary ?? "",
+          artifacts: artifactsWithTs ?? [],
+          last_updated: nowTs,
+        });
+      } catch (e) {
+        console.warn("[persistSnapshot] failed (non-fatal):", e);
+      }
 
       setIsSummarizing(false);
       setIrisStatus("idle");
@@ -482,7 +658,7 @@ If the summary needs to be updated, return the new summary. If not, return the c
       setRespondingTab(null);
       setIsSummarizing(false);
 
-      updateTabMessages(activeTab, msgs => [
+      updateTabMessages(requestTabId, msgs => [
         ...msgs,
         { role: "llm", text: `[Error: ${err?.message || err}]` }
       ]);
@@ -496,6 +672,8 @@ If the summary needs to be updated, return the new summary. If not, return the c
 
   function handleStop(e: React.FormEvent) {
     e.preventDefault();
+    // mark stopped so in-flight async work can bail early
+    stoppedRef.current = true;
     if (abortController.current) {
       abortController.current.abort();
       setIsGenerating(false);
@@ -555,24 +733,53 @@ If the summary needs to be updated, return the new summary. If not, return the c
   }
 
   async function handleCloseTab(tabId: number) {
-    await window.__TAURI__?.invoke("close_tab_and_snapshot", { tabId });
+    let backendOk = false;
+    try {
+      if (window.__TAURI__?.invoke) {
+        await window.__TAURI__?.invoke("close_tab_and_snapshot", { tabId });
+        backendOk = true;
+      }
+    } catch (e) {
+      console.warn("close_tab_and_snapshot failed; closing UI anyway:", e);
+    }
+
+    // Always update UI (optimistic close)
     setTabs(prevTabs => {
       const idx = prevTabs.findIndex(tab => tab.id === tabId);
       let newTabs = prevTabs.filter(tab => tab.id !== tabId);
-      const settingsTab = newTabs.find(tab => tab.type === "settings");
-      if (settingsTab && newTabs[newTabs.length - 1].type !== "settings") {
-        newTabs = [
-          ...newTabs.filter(tab => tab.type !== "settings"),
-          settingsTab
-        ];
+
+      // keep Settings pinned to the right if present
+      const settings = newTabs.find(t => t.type === "settings");
+      if (settings && newTabs[newTabs.length - 1]?.type !== "settings") {
+        newTabs = [...newTabs.filter(t => t.type !== "settings"), settings];
       }
+
       if (tabId === activeTab && newTabs.length > 0) {
-        const newIdx = idx > 0 ? idx - 1 : 0;
+        const newIdx = Math.max(0, idx - 1);
         setActiveTab(newTabs[newIdx].id);
       }
       return newTabs;
     });
+
+    // Optional fallback: persist a last-closed snapshot client-side if backend failed
+    if (!backendOk) {
+      try {
+        const closed = currentTab?.messages?.length
+          ? {
+              title: currentTab?.title ?? "Tab",
+              messages: currentTab?.messages ?? [],
+              microSummary: "",
+              dialogueBullets: "",
+              summary: "",
+              artifacts: [],
+              last_updated: Math.floor(Date.now()/1000),
+            }
+          : null;
+        if (closed) localStorage.setItem("iris:lastClosed", JSON.stringify(closed));
+      } catch {}
+    }
   }
+
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -581,6 +788,7 @@ If the summary needs to be updated, return the new summary. If not, return the c
         !taskbarRef.current.contains(e.target as Node)
       ) {
         setOpenMenu(null);
+        setOpenSubmenu(null);
       }
     }
     if (openMenu) {
@@ -614,6 +822,7 @@ If the summary needs to be updated, return the new summary. If not, return the c
   };
 
   const lastSentRef = useRef<string>("");
+  const stoppedRef = useRef<boolean>(false);
 
   return (
     <div className="chat-root">
@@ -640,8 +849,48 @@ If the summary needs to be updated, return the new summary. If not, return the c
             Options ▾
           </button>
           {openMenu === "options" && (
-            <div className="dropdown options-dropdown" onClick={e => e.stopPropagation()}>
+            <div
+              className="dropdown options-dropdown"
+              onClick={e => e.stopPropagation()}
+              onMouseLeave={() => { setOpenMenu(null); setOpenSubmenu(null); }}
+            >
               <div className="dropdown-item" onClick={handleSettings}>Settings</div>
+
+              <div
+                className="dropdown-item"
+                onMouseEnter={() => setOpenSubmenu("development")}
+                onMouseLeave={() => setOpenSubmenu(null)}
+                onClick={e => e.stopPropagation()}
+                style={{ position: "relative" }}
+              >
+                Development ▶
+                {openSubmenu === "development" && (
+                  <div
+                    className="submenu"
+                    onMouseEnter={() => { /* keep parent open */ }}
+                    onMouseLeave={() => setOpenSubmenu(null)}
+                  >
+                    <div
+                      className="submenu-item"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          const invoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+                          if (invoke) {
+                            await invoke("show_devtools");
+                          } else {
+                            alert("Tauri not available (web mode?)");
+                          }
+                        } catch (err: any) {
+                          alert("Failed to open devtools: " + err?.message);
+                        }
+                      }}
+                    >
+                      Open DevTools
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -819,7 +1068,6 @@ If the summary needs to be updated, return the new summary. If not, return the c
             type="submit"
             disabled={
               modelStatus === "checking" ||
-              isGenerating ||
               (respondingTab !== null && respondingTab !== activeTab && !isGenerating)
             }
           >

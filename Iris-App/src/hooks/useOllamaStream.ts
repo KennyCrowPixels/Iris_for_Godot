@@ -40,8 +40,24 @@ export default function useOllamaStream() {
       signal,
     };
 
-    const response = await fetch(OLLAMA_URL, fetchOptions);
-    if (!response.ok || !response.body) throw new Error("No response body from Ollama");
+    let response: Response | null = null;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await fetch(OLLAMA_URL, fetchOptions);
+        if (response && response.ok && response.body) break;
+        // read body text on error to help debug
+        const txt = response ? await response.text().catch(() => "") : "";
+        lastErr = new Error(`Ollama responded with status ${response?.status}: ${txt}`);
+        response = null;
+      } catch (err) {
+        lastErr = err;
+        response = null;
+      }
+      // retry once after a short backoff
+      await new Promise(r => setTimeout(r, 300));
+    }
+    if (!response) throw lastErr || new Error("No response body from Ollama");
     if (onHeaders) onHeaders();
 
     const reader = response.body.getReader();

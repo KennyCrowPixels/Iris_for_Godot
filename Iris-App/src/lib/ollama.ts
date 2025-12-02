@@ -21,10 +21,13 @@ export async function fetchJson(url: string, init: RequestInit): Promise<any> {
   return res.json();
 }
 
-// export async function waitForTauri(timeout = 5000): Promise<void> {
-//   const start = Date.now();
-//   while (!(window as any).__TAURI__?.invoke) {
-//     if (Date.now() - start > timeout) throw new Error("Tauri not ready after timeout");
-//     await new Promise(res => setTimeout(res, 50));
-//   }
-// }
+export async function waitForTauri(timeout = 5000): Promise<void> {
+  const start = Date.now();
+  while (true) {
+    const tauri = (window as any).__TAURI__;
+    const ready = !!(tauri && (typeof tauri.invoke === "function" || (tauri.core && typeof tauri.core.invoke === "function")));
+    if (ready) return;
+    if (Date.now() - start > timeout) throw new Error("Tauri not ready after timeout");
+    await new Promise(res => setTimeout(res, 50));
+  }
+}

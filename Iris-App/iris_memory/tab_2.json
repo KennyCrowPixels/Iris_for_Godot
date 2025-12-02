@@ -3,39 +3,60 @@
   "title": "",
   "messages": [
     {
-      "role": "assistant",
-      "text": "User: please tell me a joke\nIris: Why don't scientists trust atoms? Because they make up everything!\nWhat do you call a fake noodle? An impasta!\nWhy don't eggs tell jokes? They'd crack each other up!",
-      "ts": 1758687889
+      "role": "user",
+      "text": "please tell me a joke"
     },
     {
-      "role": "assistant",
-      "text": "User: please give me a basic 2d player movement script\nIris: **2D Player Movement Script**\n```csharp\nusing System;\n\npublic class PlayerMovement```\n**Example Use Case:**\n\nCreate a new game object to hold the player movement script.\nSet up input keys for movement (W, A, S, D).\nCall `Update` method on the player object in your game loop.\nUse `GetPosition` method to update the player's position on the screen.",
-      "ts": 1758687958
+      "role": "llm",
+      "text": "Why don't scientists trust atoms? Because they make up everything!\nWhat do you call a fake noodle? An impasta!\nWhy don't eggs tell jokes? They'd crack each other up!"
     },
     {
-      "role": "assistant",
-      "text": "User: please give me a basic 3d player movement script in GDScript\nIris: ```gdscript\nextends Spatial\n\nvar speed = 5.0\n\nfunc _process(delta):\n    var direction = Vector3.ZERO\n    \n    if Input.is_action_pressed(\"ui_right\"):\n        direction.x += 1\n    if Input.is_action_pressed(\"ui_left\"):\n        direction.x -= 1\n    if Input.is_action_pressed(\"ui_down\"):\n        direction.z += 1\n    if Input.is_action_pressed(\"ui_up\"):\n        direction.z -= 1\n    \n    direction = direction.normalized() * speed * delta\n    translate(direction)\n```",
-      "ts": 1758746312
+      "role": "user",
+      "text": "please give me a basic 2d player movement script"
     },
     {
-      "role": "assistant",
-      "text": "User: please tell me another joke\nIris: Why don't scientists trust atoms? Because they make up everything!\nWhy don't eggs tell jokes? They'd crack each other up!\nWhat do you call a fake noodle? An impasta!",
-      "ts": 1758947701
+      "role": "llm",
+      "text": "**2D Player Movement Script**\n```csharp\nusing System;\n\npublic class PlayerMovement```\n**Example Use Case:**\n\nCreate a new game object to hold the player movement script.\nSet up input keys for movement (W, A, S, D).\nCall `Update` method on the player object in your game loop.\nUse `GetPosition` method to update the player's position on the screen."
     },
     {
-      "role": "assistant",
-      "text": "User: haha, that's great. I'm thinking of a number between 1 and 10. Guess which number I'm thinking of\nIris: You're thinking of a number between 1 and 10. My guess is... 5!",
-      "ts": 1758947794
+      "role": "user",
+      "text": "please give me a basic 3d player movement script in GDScript"
     },
     {
-      "role": "assistant",
-      "text": "User: What is 13*43?\nIris: 13 * 43 = 559",
-      "ts": 1758947827
+      "role": "llm",
+      "text": "```gdscript\nextends Spatial\n\nvar speed = 5.0\n\nfunc _process(delta):\n    var direction = Vector3.ZERO\n    \n    if Input.is_action_pressed(\"ui_right\"):\n        direction.x += 1\n    if Input.is_action_pressed(\"ui_left\"):\n        direction.x -= 1\n    if Input.is_action_pressed(\"ui_down\"):\n        direction.z += 1\n    if Input.is_action_pressed(\"ui_up\"):\n        direction.z -= 1\n    \n    direction = direction.normalized() * speed * delta\n    translate(direction)\n```"
     },
     {
-      "role": "assistant",
-      "text": "User: who was the 45th president of the United States?\nIris: Donald Trump",
-      "ts": 1758948519
+      "role": "user",
+      "text": "please tell me another joke"
+    },
+    {
+      "role": "llm",
+      "text": "Why don't scientists trust atoms? Because they make up everything!\nWhy don't eggs tell jokes? They'd crack each other up!\nWhat do you call a fake noodle? An impasta!"
+    },
+    {
+      "role": "user",
+      "text": "haha, that's great. I'm thinking of a number between 1 and 10. Guess which number I'm thinking of"
+    },
+    {
+      "role": "llm",
+      "text": "You're thinking of a number between 1 and 10. My guess is... 5!"
+    },
+    {
+      "role": "user",
+      "text": "What is 13*43?"
+    },
+    {
+      "role": "llm",
+      "text": "13 * 43 = 559"
+    },
+    {
+      "role": "user",
+      "text": "who was the 45th president of the United States?"
+    },
+    {
+      "role": "llm",
+      "text": "Donald Trump"
     }
   ],
   "artifacts": [

@@ -18,15 +18,21 @@ fn main() {
             commands::get_compiled_context,
             commands::close_tab_and_snapshot,
             commands::restore_last_closed_tab,
+            commands::read_tab_snapshot,
+            commands::test_model,
             commands::create_tab_memory,
             ensure_coder_lite_model,
             commands::get_universal_prompts,
-            commands::test_model,
             commands::get_tab_context,
             commands::close_window,
             commands::list_open_tabs,
             commands::restore_full_tab_memory,
             ensure_model,
+            commands::update_snapshot_memory,
+            commands::debug_memory_dir,
+            commands::debug_list_open_tab_files,
+            commands::seed_open_tabs_from_dev_dir,
+            commands::show_devtools,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
