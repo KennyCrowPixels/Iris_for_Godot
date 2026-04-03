@@ -12,12 +12,15 @@ export type Artifact = {
 };
 
 export type Snapshot = {
+  tab_id?: number;
   title: string;
   messages: ChatMessage[];
+  associatedProjectId?: string | null;
   microSummary: string;
   dialogueBullets: string;
   summary: string;
   artifacts: Artifact[];
+  promptHistory?: string[];
   last_updated?: number;
 };
 
@@ -70,23 +73,12 @@ function tauriInvoke<T = unknown>(cmd: string, args?: any): Promise<T> {
 // ---------------------------
 
 export async function createTabMemory(tabId: number): Promise<void> {
-  console.log("[createTabMemory] tab_id=", tabId);
   await tauriInvoke("create_tab_memory", { tab_id: tabId });
 }
 
 export async function updateTabMemory(args: UpdateArgs): Promise<void> {
   // Tauri 2: command functions receive a struct parameter named `args`,
   // so we must wrap the payload under that key at the transport level
-  try {
-    console.log("[updateTabMemory] payload=", {
-      tab_id: args.tabId,
-      summary: args.summary,
-      micro_summary: args.microSummary,
-      dialogue_bullets: args.dialogueBullets,
-      new_message: args.newMessage,
-      artifacts: args.artifacts,
-    });
-  } catch {}
   await tauriInvoke("update_tab_memory", {
     args: {
       tab_id: args.tabId,
@@ -100,20 +92,16 @@ export async function updateTabMemory(args: UpdateArgs): Promise<void> {
 }
 
 export async function restoreFullTabMemory(args: RestoreArgs): Promise<void> {
-  console.log("[restoreFullTabMemory] tab_id=", args.tabId, "title=", args.title, "messages=", (args.messages || []).length);
-  // Tauri 2: command functions receive a struct parameter named `args`,
-  // so wrap the payload under that key at the transport level
+  // Pass the payload directly as the command takes RestoreFullTabMemoryArgs
   await tauriInvoke("restore_full_tab_memory", {
-    args: {
-      tab_id: args.tabId,
-      title: args.title,
-      messages: args.messages,
-      artifacts: args.artifacts,
-      micro_summary: args.microSummary,
-      dialogue_bullets: args.dialogueBullets,
-      summary: args.summary,
-      last_updated: args.lastUpdated,
-    }
+    tab_id: args.tabId,
+    title: args.title,
+    messages: args.messages,
+    artifacts: args.artifacts,
+    micro_summary: args.microSummary,
+    dialogue_bullets: args.dialogueBullets,
+    summary: args.summary,
+    last_updated: args.lastUpdated,
   });
 }
 
@@ -142,8 +130,6 @@ export async function readTabSnapshot(key: string | number): Promise<Snapshot | 
 // New helper: persist a full Snapshot to backend open-tabs (calls update_snapshot_memory)
 export async function persistSnapshot(tabId: number, snapshotLike: Snapshot): Promise<void> {
   try {
-    console.log("[persistSnapshot] Persisting tab", tabId, "with", snapshotLike.messages.length, "messages");
-    console.log("[persistSnapshot] Messages:", snapshotLike.messages);
     const now = Math.floor(Date.now() / 1000);
     const msgsWithTime = (snapshotLike.messages || []).map(m => ({
       role: m.role,
@@ -151,17 +137,22 @@ export async function persistSnapshot(tabId: number, snapshotLike: Snapshot): Pr
       time: typeof m.time === "number" ? m.time : now,
     }));
     const snapToSend: Snapshot = {
+      tab_id: tabId,
       title: snapshotLike.title,
       messages: msgsWithTime,
+      associatedProjectId: snapshotLike.associatedProjectId ?? null,
       microSummary: snapshotLike.microSummary,
       dialogueBullets: snapshotLike.dialogueBullets,
       summary: snapshotLike.summary,
       artifacts: snapshotLike.artifacts ?? [],
+      promptHistory: Array.isArray(snapshotLike.promptHistory) ? snapshotLike.promptHistory.map(String) : [],
       last_updated: snapshotLike.last_updated ?? now,
     };
-    console.log("[persistSnapshot] Invoking update_snapshot_memory with:", snapToSend);
     await tauriInvoke("update_snapshot_memory", { 
-      args: { tab_id: tabId, snapshot: snapToSend } 
+      args: {
+        tab_id: tabId,
+        snapshot: snapToSend,
+      }
     });
   } catch (e) {
     console.warn("[persistSnapshot] failed:", e);
@@ -196,6 +187,13 @@ export async function seedOpenTabsFromDevDir(): Promise<number> {
 export async function migrateOpenTabsToSnapshotFormat(): Promise<number> {
   try {
     return await tauriInvoke<number>("migrate_open_tabs_to_snapshot_format");
+  } catch {
+    return 0;
+  }
+}
+export async function sanitizeTabTitles(): Promise<number> {
+  try {
+    return await tauriInvoke<number>("sanitize_tab_titles");
   } catch {
     return 0;
   }

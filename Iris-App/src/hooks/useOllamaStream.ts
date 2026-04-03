@@ -4,6 +4,7 @@ import { OLLAMA_URL } from "../lib/ollama";
 export default function useOllamaStream() {
   async function stream({
     model,
+    images,
     prompt,
     options,
     signal,
@@ -13,6 +14,7 @@ export default function useOllamaStream() {
     onDone,
   }: {
     model: string;
+      images?: string[];
     prompt: string;
     options?: Record<string, any>;
     signal: AbortSignal;
@@ -32,6 +34,7 @@ export default function useOllamaStream() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
+        ...(images && images.length ? { images } : {}),
         prompt,
         stream: true,
         keep_alive: "90s",
@@ -60,7 +63,9 @@ export default function useOllamaStream() {
     if (!response) throw lastErr || new Error("No response body from Ollama");
     if (onHeaders) onHeaders();
 
-    const reader = response.body.getReader();
+    const body = response.body;
+    if (!body) throw new Error("Ollama response missing body");
+    const reader = body.getReader();
 
     while (!done) {
       const { value, done: doneReading } = await reader.read();

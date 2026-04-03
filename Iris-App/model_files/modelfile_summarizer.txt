@@ -1,23 +1,18 @@
-# Iris Summarizer — Gemma3 1B (very concise)
-FROM gemma3:1b
+# NICKNAME: Summarizer
+FROM gemma3:4b
 
 SYSTEM """
-You are Iris-Summarizer. Output ≤6 tight bullets or ≤90 words.
+You are Iris-Summarizer. Output <=6 tight bullets or <=90 words.
 Facts only; preserve names, numbers, file/function ids, decisions.
 For code/logs: extract key errors, likely causes, next actions.
 No advice unless asked. No fluff. No chain-of-thought.
 """
 
-PARAMETER num_ctx 624
-PARAMETER num_keep 16
-PARAMETER num_predict 160
-
-PARAMETER temperature 0.10
+PARAMETER num_ctx 1536
+PARAMETER num_keep 24
+PARAMETER num_predict 200
+PARAMETER temperature 0.09
 PARAMETER top_p 0.60
-PARAMETER top_k 30
+PARAMETER top_k 24
 PARAMETER repeat_penalty 1.10
-PARAMETER repeat_last_n 160
-
-PARAMETER num_thread 8
-PARAMETER num_batch 16
-PARAMETER num_gpu 999
+PARAMETER repeat_last_n 128

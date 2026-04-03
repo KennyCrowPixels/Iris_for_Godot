@@ -1,7 +1,7 @@
 export type Message = { role: "user" | "llm"; text: string };
 
-export function updateMessagesAppendUser(prev: Message[], text: string): Message[] {
-  return [...prev, { role: "user", text }];
+export function updateMessagesAppendUser(prev: Message[], text: string, images?: string[]): Message[] {
+  return [...prev, { role: "user", text, ...(images && images.length ? { images } : {}) } as any];
 }
 
 export function insertLLMBubble(prev: Message[], first: string): Message[] {

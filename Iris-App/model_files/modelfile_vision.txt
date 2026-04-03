@@ -1,33 +1,17 @@
-# Iris Vision — Balanced (CPU-light, long answers)
-# Purpose: analyze screenshots / UI layouts via VLM
-# Note: send images via API ({"images":[<base64>]}). No extra settings needed here.
+# NICKNAME: Vision
+FROM qwen2-vl:2b-instruct
 
-FROM qwen2-vl:2b-instruct-q4_K_M
-# If this tag isn't available on your box, try:
-# FROM qwen2-vl:2b-instruct
-# or another available quant (e.g., q4_0)
+SYSTEM """
+You are Iris-Vision. Analyze images and UI captures with clear, grounded observations.
+Call out uncertainty when image evidence is weak.
+Prefer concise, actionable findings over speculation.
+"""
 
-# Context / length
-PARAMETER num_ctx        1408
-PARAMETER num_keep       48
-PARAMETER num_predict    1024
-PARAMETER seed           -1
-
-# Sampling (balanced; descriptive but not rambly)
-PARAMETER temperature    0.35
-PARAMETER top_p          0.9
-PARAMETER top_k          40
-PARAMETER typical_p      1.0
+PARAMETER num_ctx 2048
+PARAMETER num_keep 48
+PARAMETER num_predict 1000
+PARAMETER temperature 0.32
+PARAMETER top_p 0.90
+PARAMETER top_k 40
 PARAMETER repeat_penalty 1.07
-PARAMETER repeat_last_n  192
-PARAMETER presence_penalty  0.0
-PARAMETER frequency_penalty 0.0
-PARAMETER penalize_nl    true
-PARAMETER ignore_eos     false
-
-# Throughput / offload (light on CPU; offload max to GPU if possible)
-PARAMETER num_thread     2
-PARAMETER num_batch      4
-PARAMETER num_gpu        999
-# (If your runtime uses gpu_layers instead of num_gpu, use:)
-# PARAMETER gpu_layers   999
+PARAMETER repeat_last_n 192
