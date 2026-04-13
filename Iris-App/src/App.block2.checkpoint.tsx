@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 import { invoke } from '@tauri-apps/api/core';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import "./App.css";
 import type { ChatMessage, Artifact } from "./types/models";
 
@@ -166,11 +165,6 @@ type ActiveRoutine = {
   status: "pending_confirm" | "running" | "done" | "cancelled" | "error";
 };
 
-type WorkLogEntry = {
-  ts: number;
-  text: string;
-};
-
 type McpToolDescriptor = {
   mcpId: string;
   mcpName: string;
@@ -203,37 +197,6 @@ type ParsedExplicitDesktopCall = {
   args: Record<string, any>;
 };
 
-type ParsedExplicitProjectCall = {
-  action: "checkpoint" | "checkpoints" | "restore";
-  args: Record<string, any>;
-};
-
-type InferredActions = {
-  fs: ParsedExplicitFsCall | null;
-  ssh: ParsedExplicitSshCall | null;
-  desktop: ParsedExplicitDesktopCall | null;
-  mcp: ParsedExplicitMcpCall | null;
-  project: ParsedExplicitProjectCall | null;
-};
-
-type IrisActionTrace = {
-  id: string;
-  ts: number;
-  action: string;
-  reason: string;
-  argsSummary: string;
-  outcome: string;
-};
-
-const IRIS_ACTION_REPOSITORY = [
-  "filesystem.list/read/write/delete/move/mkdir",
-  "ssh.list/read/write/delete/move/mkdir/exec",
-  "desktop.list/read/write/delete/move/mkdir",
-  "mcp.connect/list_tools/call_tool",
-  "project.checkpoint/checkpoints/restore",
-  "network.search/weather",
-] as const;
-
 function parseExplicitMcpCall(text: string): ParsedExplicitMcpCall | null {
   const t = text.trim();
   const slash = t.match(/^\/mcp\s+([A-Za-z0-9_.:-]+)(?:\s+(\{[\s\S]*\}))?$/i);
@@ -251,44 +214,6 @@ function parseExplicitMcpCall(text: string): ParsedExplicitMcpCall | null {
     }
   } catch {}
   return { toolName, args: {} };
-}
-
-function parseToolCallsFromText(text: string): Array<{ toolName: string; args: Record<string, unknown> }> {
-  const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
-  const lines = String(text || "").split(/\r?\n/);
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!/^TOOL_CALL\s*:/i.test(line)) continue;
-    const payload = line.replace(/^TOOL_CALL\s*:\s*/i, "").trim();
-    if (!payload.startsWith("{")) continue;
-    try {
-      const parsed = JSON.parse(payload);
-      const toolName = String(parsed?.tool || parsed?.toolName || "").trim();
-      const args = parsed?.args || parsed?.arguments || {};
-      if (!toolName) continue;
-      if (!args || typeof args !== "object" || Array.isArray(args)) {
-        calls.push({ toolName, args: {} });
-      } else {
-        calls.push({ toolName, args: args as Record<string, unknown> });
-      }
-    } catch {
-      // Ignore malformed lines and keep scanning.
-    }
-  }
-  return calls;
-}
-
-function resolveMcpToolMatch(catalog: McpToolDescriptor[], requestedToolName: string): McpToolDescriptor | null {
-  const raw = String(requestedToolName || "").trim().toLowerCase();
-  if (!raw) return null;
-  const exact = catalog.find((t) => t.toolName.toLowerCase() === raw);
-  if (exact) return exact;
-  const withMcpName = catalog.find((t) => `${t.mcpName}.${t.toolName}`.toLowerCase() === raw);
-  if (withMcpName) return withMcpName;
-  const withMcpId = catalog.find((t) => `${t.mcpId}.${t.toolName}`.toLowerCase() === raw);
-  if (withMcpId) return withMcpId;
-  const suffix = catalog.find((t) => raw.endsWith(`.${t.toolName.toLowerCase()}`));
-  return suffix || null;
 }
 
 function parseExplicitFsCall(text: string): ParsedExplicitFsCall | null {
@@ -345,119 +270,6 @@ function parseExplicitDesktopCall(text: string): ParsedExplicitDesktopCall | nul
   return { action, args: {} };
 }
 
-function parseExplicitProjectCall(text: string): ParsedExplicitProjectCall | null {
-  const t = text.trim();
-  const slash = t.match(/^\/project\s+(checkpoint|checkpoints|restore)(?:\s+(\{[\s\S]*\}))?$/i);
-  const verbose = t.match(/(?:^|\n)\s*project\s+(checkpoint|checkpoints|restore)(?:\s+(\{[\s\S]*\}))?\s*$/i);
-  const m = slash || verbose;
-  if (m) {
-    const action = String(m[1] || "").toLowerCase() as ParsedExplicitProjectCall["action"];
-    const rawArgs = String(m[2] || "").trim();
-    if (!rawArgs) return { action, args: {} };
-    try {
-      const parsed = JSON.parse(rawArgs);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return { action, args: parsed as Record<string, any> };
-      }
-    } catch {}
-    return { action, args: {} };
-  }
-
-  const lower = t.toLowerCase();
-  if (/\brestore\b/.test(lower) && /\b(previous|prior|last|checkpoint|state)\b/.test(lower)) {
-    return { action: "restore", args: {} };
-  }
-  if (/\b(checkpoint)\b/.test(lower) && /\b(save|create|capture|take|make)\b/.test(lower)) {
-    return { action: "checkpoint", args: {} };
-  }
-  if (/\b(checkpoints?)\b/.test(lower) && /\b(list|show|view|what|which)\b/.test(lower)) {
-    return { action: "checkpoints", args: {} };
-  }
-  return null;
-}
-
-function inferConversationalActions(text: string): InferredActions {
-  const lower = text.toLowerCase();
-  const jsonPayload = (() => {
-    const m = text.match(/(\{[\s\S]*\})/);
-    if (!m) return {} as Record<string, any>;
-    try {
-      const parsed = JSON.parse(m[1]);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? parsed as Record<string, any>
-        : {};
-    } catch {
-      return {} as Record<string, any>;
-    }
-  })();
-  const guessPath = (() => {
-    const m = text.match(/(?:file|path|folder|directory)\s+([A-Za-z0-9_./\\:-]+)/i);
-    return m ? m[1] : "";
-  })();
-
-  const project = parseExplicitProjectCall(text);
-
-  let fs: ParsedExplicitFsCall | null = null;
-  if (!fs && /(list|show).*(files|folders|directory)|what.*files/i.test(lower)) {
-    fs = { action: "list", args: { path: guessPath || "." } };
-  } else if (!fs && /(read|open|show).*(file|contents?)/i.test(lower)) {
-    fs = { action: "read", args: { path: guessPath } };
-  } else if (!fs && /(create|make).*(folder|directory)/i.test(lower)) {
-    fs = { action: "mkdir", args: { path: guessPath } };
-  } else if (!fs && /(delete|remove).*(file|folder|directory)/i.test(lower)) {
-    fs = { action: "delete", args: { path: guessPath, recursive: true } };
-  } else if (!fs && /(write|update|edit).*(file|contents?)/i.test(lower) && guessPath) {
-    fs = { action: "write", args: { path: guessPath, content: String((jsonPayload as any).content || "") } };
-  }
-
-  let ssh: ParsedExplicitSshCall | null = null;
-  if (/(ssh|remote server|raspberry pi|remote machine)/i.test(lower)) {
-    if (/(run|execute|exec|command)/i.test(lower)) {
-      ssh = { action: "exec", args: jsonPayload };
-    } else if (/(list|show).*(files|folders|directory)/i.test(lower)) {
-      ssh = { action: "list", args: { path: guessPath || ".", ...jsonPayload } };
-    } else if (/(read|open|show).*(file|contents?)/i.test(lower)) {
-      ssh = { action: "read", args: { path: guessPath, ...jsonPayload } };
-    }
-  }
-
-  let desktop: ParsedExplicitDesktopCall | null = null;
-  if (/(desktop|this computer|local machine|on my pc)/i.test(lower)) {
-    if (/(list|show).*(files|folders|directory)/i.test(lower)) {
-      desktop = { action: "list", args: { path: guessPath || ".", ...jsonPayload } };
-    } else if (/(read|open|show).*(file|contents?)/i.test(lower)) {
-      desktop = { action: "read", args: { path: guessPath, ...jsonPayload } };
-    } else if (/(create|make).*(folder|directory)/i.test(lower)) {
-      desktop = { action: "mkdir", args: { path: guessPath, ...jsonPayload } };
-    }
-  }
-
-  let mcp: ParsedExplicitMcpCall | null = null;
-  const toolMatch = text.match(/(?:mcp\s+tool|tool)\s+([A-Za-z0-9_.:-]+)/i);
-  if (toolMatch && /(mcp|godot|bridge|server tool)/i.test(lower)) {
-    mcp = {
-      toolName: String(toolMatch[1] || "").trim(),
-      args: jsonPayload,
-    };
-  }
-
-  return { fs, ssh, desktop, mcp, project };
-}
-
-function detectFlowAdjustmentNote(text: string): string | null {
-  const lower = text.toLowerCase();
-  if (/(too long|be concise|shorter|brief)/i.test(lower)) return "Prefer concise responses unless deeper detail is requested.";
-  if (/(more detail|go deeper|more thorough|expand)/i.test(lower)) return "Provide deeper, stepwise detail by default.";
-  if (/(ask me before|don't do that automatically|confirm first)/i.test(lower)) return "Ask for explicit confirmation before performing impactful actions.";
-  if (/(stop using slash commands|no slash commands|conversational only)/i.test(lower)) return "Infer actions from conversational language; do not require slash commands.";
-  return null;
-}
-
-function isActionWhyQuestion(text: string): boolean {
-  const lower = text.toLowerCase();
-  return /(why did you|why were you|what did you do|what steps did you take|why that step|explain your steps)/i.test(lower);
-}
-
 function isSimpleCasualRequest(text: string): boolean {
   const t = text.trim().toLowerCase();
   if (!t) return false;
@@ -478,8 +290,7 @@ function isReferentialFollowup(text: string): boolean {
   const patterns = [
     /\bthat\b/, /\bit\b/, /\bthis\b/, /\bthose\b/, /\bthese\b/, /\bprevious\b/, /\babove\b/,
     /\byou said\b/, /\bearlier\b/, /\bcontinue\b/, /\bgo on\b/, /\bkeep going\b/, /\bmore\b/,
-    /\belaborate\b/, /\bdeeper\b/, /\bexpand\b/, /\bwhat did you mean\b/, /\bwhy\b/,
-    /\bwhat joke\b/, /\byou just told me\b/, /\bjust said\b/
+    /\belaborate\b/, /\bdeeper\b/, /\bexpand\b/, /\bwhat did you mean\b/, /\bwhy\b/
   ];
   if (patterns.some((rx) => rx.test(t))) return true;
   if (/^(and|also|plus|then)\b/.test(t)) return true;
@@ -519,26 +330,6 @@ function parseWeatherRequest(text: string): { location: string; dayOffset: numbe
   let dayOffset = 0;
   if (lower.includes("day after tomorrow")) dayOffset = 2;
   else if (lower.includes("tomorrow")) dayOffset = 1;
-  else {
-    const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-    const weekdayIdx = weekdays.findIndex((d) => new RegExp(`\\b${d}\\b`, "i").test(lower));
-    if (weekdayIdx >= 0) {
-      const nowIdx = new Date().getDay();
-      dayOffset = (weekdayIdx - nowIdx + 7) % 7;
-      if (dayOffset === 0) dayOffset = 7;
-    }
-  }
-
-  const inMatch = raw.match(/\b(?:in|for|at)\s+(.+)$/i);
-  if (inMatch?.[1]) {
-    const loc = inMatch[1]
-      .replace(/\b(?:today|tonight|tomorrow|day after tomorrow|this morning|this afternoon|this evening|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
-      .replace(/\b(?:weather|forecast|like|please|now|right now|currently)\b/gi, "")
-      .replace(/^[\s,.-]+|[\s,.-]+$/g, "")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    if (loc) return { location: loc, dayOffset };
-  }
 
   let location = raw
     .replace(/\?+$/g, "")
@@ -571,19 +362,6 @@ function buildWeatherReply(payload: any): string {
     `- ${summary}`,
     sourceUrl ? `Source: ${sourceUrl}` : ""
   ].filter(Boolean).join("\n");
-}
-
-function sanitizeAssistantOutput(raw: string): string {
-  let out = String(raw || "").replace(/<\/?final>/gi, "").trim();
-  const improvedIdx = out.toLowerCase().indexOf("here's an improved final response");
-  if (improvedIdx >= 0) {
-    out = out.slice(improvedIdx + "here's an improved final response".length).replace(/^\s*[:\-]\s*/, "").trim();
-  }
-  out = out
-    .replace(/^\s*(user intent|current draft analysis|output)\s*:\s*.*$/gim, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return out;
 }
 
 async function persistDirectReply(params: {
@@ -669,12 +447,7 @@ function parseMcpTarget(raw: unknown): { type: "url" | "stdio"; command?: string
   const parts = s.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
   if (parts.length >= 1) {
     const command = (parts[0] ?? "").replace(/^["']|["']$/g, "");
-    let args = parts.slice(1).map(a => a.replace(/^["']|["']$/g, ""));
-    // Common user typo: full uv.exe path followed by an extra leading "uv" token.
-    if (/uv(?:\.exe)?$/i.test(command) && args[0]?.toLowerCase() === "uv") {
-      args = args.slice(1);
-    }
-    return { type: "stdio", command, args };
+    return { type: "stdio", command, args: parts.slice(1).map(a => a.replace(/^["']|["']$/g, "")) };
   }
   return { type: "url" };
 }
@@ -1152,14 +925,11 @@ function App() {
   const [openMenu, setOpenMenu] = useState<null | "file" | "options">(null);
   const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
   const abortController = useRef<AbortController | null>(null);
-  const mcpProbeAbortedRef = useRef<Set<string>>(new Set());
   const historyRef = useRef<HTMLDivElement>(null);
   const taskbarRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const promptHistoryIndexRef = useRef<number>(-1);
   const promptHistoryDraftRef = useRef<string>("");
-  const projectDraftSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-  const mcpToolCacheRef = useRef<Record<string, { tools: McpToolDescriptor[]; ts: number }>>({});
   const isMounted = useRef(true);
 
   const [useCoder, setUseCoder] = useState(false);
@@ -1174,7 +944,6 @@ function App() {
   const [reposEnabled, setReposEnabled] = useState(true);
   const [mcpEnabled, setMcpEnabled] = useState(true);
   const [desktopToolsEnabled, setDesktopToolsEnabled] = useState(false);
-  const [desktopDashboardEnabled, setDesktopDashboardEnabled] = useState(false);
   const [hwToast, setHwToast] = useState<string | null>(null);
   const hwToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [assistantName, setAssistantName] = useState("Iris");
@@ -1184,26 +953,16 @@ function App() {
   const [networkEnabled, setNetworkEnabled] = useState(false);
   const [universalDatawebEnabled, setUniversalDatawebEnabled] = useState(true);
   const [networkDraftEnabled, setNetworkDraftEnabled] = useState(false);
-  const [manualDownloadUrl, setManualDownloadUrl] = useState("");
-  const [releaseNotesUrl, setReleaseNotesUrl] = useState("");
-  const [updateFeedUrl, setUpdateFeedUrl] = useState("");
-  const [autoUpdatesEnabled, setAutoUpdatesEnabled] = useState(false);
   // MCP draft: buffered edits, only saved to repoStore on "Save MCPs" button
   const [mcpDraft, setMcpDraft] = useState<McpConnection[]>([]);
   const [sshDraft, setSshDraft] = useState<SshConnection[]>([]);
   const [mcpLaunchStatus, setMcpLaunchStatus] = useState<Record<string, { pid: number; launched: boolean }>>({});
-  const [mcpHealthStatus, setMcpHealthStatus] = useState<Record<string, { state: "stopped" | "launching" | "bridge_up" | "connected" | "error"; message: string; toolCount?: number }>>({});
   const [sshConnectStatus, setSshConnectStatus] = useState<Record<string, { connected: boolean; checking: boolean; message?: string }>>({});
   const [chatBridgePanelOpen, setChatBridgePanelOpen] = useState(false);
-  const [actionTraceByTab, setActionTraceByTab] = useState<Record<number, IrisActionTrace[]>>({});
-  const [flowAdjustmentsByTab, setFlowAdjustmentsByTab] = useState<Record<number, string[]>>({});
   // Routine execution state
   const [activeRoutine, setActiveRoutine] = useState<ActiveRoutine | null>(null);
   const [activeRoutineTabId, setActiveRoutineTabId] = useState<number | null>(null);
-  const [routineExpanded, setRoutineExpanded] = useState(false);
-  const [workLogByTab, setWorkLogByTab] = useState<Record<number, WorkLogEntry[]>>({});
   const [windowList, setWindowList] = useState<WindowInfo[]>([]);
-  const [systemStats, setSystemStats] = useState<{ cpuPercent: number; memUsedMb: number; memTotalMb: number } | null>(null);
   const [corePersonaPrompt, setCorePersonaPrompt] = useState("");
   const [userPersonaPrompt, setUserPersonaPrompt] = useState("");
   const [userPersonaSavedPrompt, setUserPersonaSavedPrompt] = useState("");
@@ -1356,18 +1115,15 @@ function App() {
     promptHistoryDraftRef.current = "";
   }, [activeTab]);
   const activeProject = repoStore.projects.find((p) => p.id === activeProjectId) || null;
-  const activeProjectMcpIds = new Set((activeProject?.mcpIds || []).map((id) => String(id)));
-  const activeProjectSshIds = new Set((activeProject?.sshIds || []).map((id) => String(id)));
   const launchableProjectMcps = activeProject
     ? repoStore.mcps.filter((m) => {
-        if (!m.enabled || !activeProjectMcpIds.has(String(m.id))) return false;
+        if (!m.enabled || !(activeProject.mcpIds || []).includes(m.id)) return false;
         const parsed = parseMcpTarget(m.target);
-        const isStdio = m.connectionType === "stdio" || parsed.type === "stdio";
-        return isStdio && !!(m.launchCommand || parsed.command);
+        return parsed.type === "stdio" && !!(m.launchCommand || parsed.command);
       })
     : [];
   const launchableProjectSsh = activeProject
-    ? repoStore.sshs.filter((s) => s.enabled && !!s.host.trim() && activeProjectSshIds.has(String(s.id)))
+    ? repoStore.sshs.filter((s) => s.enabled && !!s.host.trim() && (activeProject.sshIds || []).includes(s.id))
     : [];
   const showChatBridgeControls = currentTab?.type === "chat" && (launchableProjectMcps.length > 0 || launchableProjectSsh.length > 0);
   const llmCapabilities = profileCapabilities(llmProfile);
@@ -1466,9 +1222,6 @@ function App() {
           if (typeof flags?.desktopToolsEnabled === "boolean") {
             setDesktopToolsEnabled(flags.desktopToolsEnabled);
           }
-          if (typeof flags?.desktopDashboardEnabled === "boolean") {
-            setDesktopDashboardEnabled(flags.desktopDashboardEnabled);
-          }
           if (typeof flags?.assistantName === "string" && String(flags.assistantName).trim()) {
             setAssistantName(String(flags.assistantName));
           }
@@ -1484,18 +1237,6 @@ function App() {
           if (typeof flags?.networkEnabled === "boolean") {
             setNetworkEnabled(flags.networkEnabled);
             setNetworkDraftEnabled(flags.networkEnabled);
-          }
-          if (typeof flags?.manualDownloadUrl === "string") {
-            setManualDownloadUrl(String(flags.manualDownloadUrl));
-          }
-          if (typeof flags?.releaseNotesUrl === "string") {
-            setReleaseNotesUrl(String(flags.releaseNotesUrl));
-          }
-          if (typeof flags?.updateFeedUrl === "string") {
-            setUpdateFeedUrl(String(flags.updateFeedUrl));
-          }
-          if (typeof flags?.autoUpdatesEnabled === "boolean") {
-            setAutoUpdatesEnabled(!!flags.autoUpdatesEnabled);
           }
           if (typeof flags?.universalDatawebEnabled === "boolean") {
             setUniversalDatawebEnabled(flags.universalDatawebEnabled);
@@ -1557,16 +1298,10 @@ function App() {
               projects: Array.isArray((store as any).projects)
                 ? (store as any).projects.map((p: any) => ({
                     ...p,
-                    id: String(p?.id ?? makeId("proj")),
-                    name: String(p?.name ?? "Project"),
-                    enabled: p?.enabled == null ? true : !!p.enabled,
-                    description: String(p?.description ?? ""),
                     manipulationRootPath: String(p?.manipulationRootPath ?? p?.manipulation_root_path ?? ""),
                     datawebEnabled: p?.datawebEnabled == null ? true : !!p.datawebEnabled,
-                    repoIds: Array.isArray(p?.repoIds) ? p.repoIds.map(String) : [],
-                    entryIds: Array.isArray(p?.entryIds) ? p.entryIds.map(String) : [],
-                    mcpIds: Array.isArray(p?.mcpIds) ? p.mcpIds.map(String) : [],
-                    sshIds: Array.isArray(p?.sshIds) ? p.sshIds.map(String) : [],
+                    mcpIds: Array.isArray(p?.mcpIds) ? p.mcpIds : [],
+                    sshIds: Array.isArray(p?.sshIds) ? p.sshIds : [],
                   }))
                 : [],
             });
@@ -1820,30 +1555,6 @@ function App() {
     }
   }, [showChatBridgeControls]);
 
-  // Poll open windows and system stats while Desktop Dashboard is active
-  useEffect(() => {
-    if (!desktopDashboardEnabled) return;
-    const pollWindows = async () => {
-      try {
-        const ws = await invoke("list_windows") as WindowInfo[];
-        setWindowList(Array.isArray(ws) ? ws : []);
-      } catch {
-        setWindowList([]);
-      }
-    };
-    const pollStats = async () => {
-      try {
-        const s = await invoke("get_system_stats") as { cpuPercent: number; memUsedMb: number; memTotalMb: number };
-        setSystemStats(s);
-      } catch { /* ignore */ }
-    };
-    pollWindows();
-    pollStats();
-    const wId = setInterval(pollWindows, 5000);
-    const sId = setInterval(pollStats, 4000);
-    return () => { clearInterval(wId); clearInterval(sId); };
-  }, [desktopDashboardEnabled]);
-
   // Ctrl+T new tab, Ctrl+Shift+T restore last closed tab
   useEffect(() => {
     const handler = async (e: KeyboardEvent) => {
@@ -1965,28 +1676,6 @@ function App() {
   const [thinkingSeconds, setThinkingSeconds] = useState<number>(0);
 
   const { stream } = useOllamaStream();
-  function appendWorkLog(tabId: number, text: string) {
-    const normalized = String(text || "").trim();
-    if (!normalized) return;
-    const ts = Date.now();
-    setWorkLogByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      if (existing.length > 0 && existing[existing.length - 1].text === normalized) {
-        return prev;
-      }
-      return { ...prev, [tabId]: [...existing, { ts, text: normalized }].slice(-24) };
-    });
-  }
-
-  function setThinkingProgress(tabId: number, step: string) {
-    setThinkingStep(step);
-    appendWorkLog(tabId, step);
-  }
-
-  function clearWorkLog(tabId: number) {
-    setWorkLogByTab((prev) => ({ ...prev, [tabId]: [] }));
-  }
-
   function setRoutineStepStatus(stepId: string, patch: Partial<RoutineStep>) {
     setActiveRoutine(prev => {
       if (!prev) return prev;
@@ -2030,7 +1719,6 @@ function App() {
     };
     setActiveRoutine(routine);
     setActiveRoutineTabId(tabId);
-    appendWorkLog(tabId, `Routine started: ${routine.goal}`);
 
     if (routine.isLongRunning) {
       const proceed = await askCenteredConfirm({
@@ -2078,7 +1766,7 @@ function App() {
     const ambiguousWindowTarget = scored.length > 1 && Math.abs(topScore - secondScore) <= 1;
     if (pick) {
       windowHint = ambiguousWindowTarget
-        ? `Window targeting is ambiguous between multiple windows. Trying top candidate first: ${pick.title} (${pick.processName}), score ${topScore}.`
+        ? `Window targeting is ambiguous between multiple windows. Capturing full desktop to avoid selecting the wrong window. Top candidate: ${pick.title} (${pick.processName}), score ${topScore}.`
         : `Window target selected: ${pick.title} (${pick.processName}), score ${topScore}.`;
     }
 
@@ -2087,11 +1775,10 @@ function App() {
 
     for (const step of steps) {
       setRoutineStepStatus(step.id, { status: "running" });
-      appendWorkLog(tabId, `Routine step running: ${step.label}`);
       try {
         if (step.type === "screenshot") {
           let base64 = "";
-          if (pick?.id) {
+          if (!ambiguousWindowTarget && pick?.id) {
             try {
               base64 = await invoke("take_window_screenshot", { windowId: pick.id }) as string;
             } catch {
@@ -2103,21 +1790,17 @@ function App() {
           const dataUrl = `data:image/png;base64,${base64}`;
           capturedImages.push(dataUrl);
           setRoutineStepStatus(step.id, { status: "done", result: "Screenshot captured", imageData: dataUrl });
-          appendWorkLog(tabId, `Routine step done: ${step.label}`);
-          updateTabMessages(tabId, msgs => ([...msgs, { role: "llm", text: "Captured screenshot for analysis.", images: [dataUrl] }]));
+          updateTabMessages(tabId, msgs => ([...msgs, { role: "user", text: "Captured screenshot for analysis.", images: [dataUrl] }]));
         } else {
           setRoutineStepStatus(step.id, { status: "done" });
-          appendWorkLog(tabId, `Routine step done: ${step.label}`);
         }
       } catch (e: any) {
         sawRoutineError = true;
         setRoutineStepStatus(step.id, { status: "error", error: e?.message || String(e) });
-        appendWorkLog(tabId, `Routine step error: ${step.label}`);
       }
     }
 
     setActiveRoutine(prev => prev ? { ...prev, status: sawRoutineError ? "error" : "done" } : prev);
-    appendWorkLog(tabId, sawRoutineError ? "Routine completed with errors" : "Routine completed");
     return { images: capturedImages, windowHint };
   }
   async function sendMessage(e: React.FormEvent) {
@@ -2129,17 +1812,9 @@ function App() {
     // 1) Validate input and tab BEFORE setting any flags
     const text = input.trim();
     let hasImages = pendingImages.length > 0;
-    const inferredEarlyActions = inferConversationalActions(text);
-    const hasConversationalActionIntent = !!(
-      inferredEarlyActions.fs ||
-      inferredEarlyActions.ssh ||
-      inferredEarlyActions.desktop ||
-      inferredEarlyActions.mcp ||
-      inferredEarlyActions.project
-    );
-    const bridgeOrFsExplicit = /^\/(mcp|fs|ssh|desktop|project)\b/i.test(text);
+    const bridgeOrFsExplicit = /^\/(mcp|fs|ssh|desktop)\b/i.test(text);
     const referentialFollowup = isReferentialFollowup(text);
-    const quickMode = !hasImages && !bridgeOrFsExplicit && !hasConversationalActionIntent && isSimpleCasualRequest(text) && !referentialFollowup;
+    const quickMode = !hasImages && !bridgeOrFsExplicit && isSimpleCasualRequest(text) && !referentialFollowup;
     if ((!text && !hasImages) || currentTab?.type !== "chat") return;
     if (hasImages && !modelConfig.visionEnabled) {
       alert("Vision model is disabled. Enable Vision in Settings > LLMs to send images.");
@@ -2165,32 +1840,6 @@ function App() {
     promptHistoryIndexRef.current = -1;
     promptHistoryDraftRef.current = "";
 
-    const flowAdjustmentNote = applyFlowAdjustmentFeedback(requestTabId, text);
-    const recentActionTrace = actionTraceByTab[requestTabId] || [];
-    if (isActionWhyQuestion(text) && recentActionTrace.length) {
-      const lines = recentActionTrace.slice(-6).map((a) => {
-        const when = new Date(a.ts * 1000).toLocaleTimeString();
-        return `- ${when}: ${a.action} | reason: ${a.reason} | args: ${a.argsSummary} | outcome: ${a.outcome}`;
-      }).join("\n");
-      const replyText = [
-        "Here is why I took those steps:",
-        lines,
-        "I choose actions based on your request context, project links, and available bridge/tool state. If you want a different flow, tell me the preference and I will adapt immediately.",
-      ].join("\n");
-      updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
-      try {
-        await persistDirectReply({
-          requestTabId,
-          tabs,
-          userDisplayText,
-          replyText,
-          associatedProjectId: tabProjectMap[requestTabId] ?? null,
-          promptHistory: promptHistoryForTurn,
-        });
-      } catch {}
-      return;
-    }
-
     // Interpret/routing is owned by backend planner.
     let compiled: {
       microSummary: string,
@@ -2205,8 +1854,7 @@ function App() {
     };
 
     let preloadedSnapshot: Snapshot | null = null;
-    clearWorkLog(requestTabId);
-    setThinkingProgress(requestTabId, "Loading tab memory...");
+    setThinkingStep("Loading tab memory...");
     try {
       preloadedSnapshot = await readTabSnapshot(requestTabId);
     } catch {}
@@ -2272,7 +1920,7 @@ function App() {
     let primaryModel = hasImages ? "iris-vision:latest" : (coderish ? "iris-coder:latest" : "iris-organizer:latest");
 
     if (interpretV2Enabled && !quickMode) {
-      setThinkingProgress(requestTabId, "Interpreting request...");
+      setThinkingStep("Interpreting request...");
       try {
         const caps = profileCapabilities(llmProfile);
         const tb = caps.tokenBudget;
@@ -2424,7 +2072,7 @@ function App() {
     setRespondingTab(activeTab);
     setIrisStatus("thinking");
     setIsGenerating(true);
-    setThinkingProgress(requestTabId, "Waking local runtime...");
+    setThinkingStep("Waking local runtime...");
 
     const weatherRequest = !hasImages && !bridgeOrFsExplicit
       ? parseWeatherRequest(text)
@@ -2433,7 +2081,7 @@ function App() {
       const finishWeatherPath = async (replyText: string) => {
         updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
         try {
-          setThinkingProgress(requestTabId, "Saving memory...");
+          setThinkingStep("Saving memory...");
           await persistDirectReply({
             requestTabId,
             tabs,
@@ -2460,7 +2108,7 @@ function App() {
       }
 
       try {
-        setThinkingProgress(requestTabId, "Fetching forecast...");
+        setThinkingStep("Fetching forecast...");
         const weather = await withTimeout(
           invoke("weather_lookup", {
             location: weatherRequest.location,
@@ -2481,7 +2129,7 @@ function App() {
 
     try {
       await ensureOllamaServer();
-      setThinkingProgress(requestTabId, "Checking selected model...");
+      setThinkingStep("Checking selected model...");
       await ensureModel(primaryModel);
     } catch (err: any) {
       try {
@@ -2510,7 +2158,7 @@ function App() {
     // message already appended above
 
     try {
-      setThinkingProgress(requestTabId, "Gathering context...");
+      setThinkingStep("Gathering context...");
       // get_compiled_context: use planner-prepared context when available; otherwise legacy fetch.
       if (!plannerV2?.compiledContext) {
         try {
@@ -2603,7 +2251,6 @@ function App() {
         : ((preloadedSnapshot as any)?.associatedProjectId ?? (memorySnapshot as any)?.associatedProjectId ?? null);
       const selectedProject = repoStore.projects.find((p) => p.id === selectedProjectId && p.enabled) || null;
       const projectIdeationFastPath = !!selectedProject && !hasImages && isProjectIdeationRequest(text);
-      const engineeringTaskRequest = !!selectedProject && !hasImages && !quickMode && /(create|build|implement|add|make|refactor|fix)/i.test(text) && /(project|scene|node|godot|feature|system|cloud|effect)/i.test(text);
       let activeManipulationRoot: { name: string; path: string } | null = null;
       let activeMcps: McpConnection[] = [];
       let projectContext = "";
@@ -2777,196 +2424,88 @@ function App() {
       let fsExecutionLog = "";
       let sshExecutionLog = "";
       let desktopExecutionLog = "";
-      let projectExecutionLog = "";
-      const inferredActions = inferConversationalActions(text);
-      const projectAction = parseExplicitProjectCall(text) || inferredActions.project;
-      const fsAction = parseExplicitFsCall(text) || inferredActions.fs;
-      const sshAction = parseExplicitSshCall(text) || inferredActions.ssh;
-      const desktopAction = parseExplicitDesktopCall(text) || inferredActions.desktop;
-      if (projectAction) {
-        const rootPath = String(projectAction.args.root || projectAction.args.projectRoot || activeManipulationRoot?.path || "").trim();
-        if (!selectedProject) {
-          projectExecutionLog = "- Project checkpoint command requested, but no enabled project is selected for this tab.";
-        } else if (!rootPath) {
-          projectExecutionLog = "- Project checkpoint command requested, but no project manipulation root is configured.";
-        } else {
-          try {
-            if (projectAction.action === "checkpoint") {
-              const label = String(projectAction.args.label || projectAction.args.name || "").trim() || null;
-              const meta = await invoke("capture_project_checkpoint", {
-                projectId: selectedProject.id,
-                root: rootPath,
-                label,
-              }) as any;
-              projectExecutionLog = `- Captured checkpoint ${String(meta?.id || "(unknown)")} for ${selectedProject.name} (${Number(meta?.fileCount || 0)} files).`;
-              appendActionTrace(requestTabId, {
-                action: "project.checkpoint",
-                reason: "User requested project state capture",
-                argsSummary: JSON.stringify({ projectId: selectedProject.id, root: rootPath, label }),
-                outcome: "ok",
-              });
-            } else if (projectAction.action === "checkpoints") {
-              const items = await invoke("list_project_checkpoints", {
-                projectId: selectedProject.id,
-                root: rootPath,
-              }) as any[];
-              const preview = (Array.isArray(items) ? items : []).slice(0, 8).map((cp) => {
-                const label = String(cp?.label || "").trim();
-                const ts = Number(cp?.createdAt || 0);
-                const when = ts > 0 ? new Date(ts * 1000).toLocaleString() : "unknown time";
-                return `- ${String(cp?.id || "(unknown)")}${label ? ` (${label})` : ""} | ${when} | files=${Number(cp?.fileCount || 0)}`;
-              }).join("\n");
-              projectExecutionLog = `- Available checkpoints for ${selectedProject.name}:\n${preview || "(none)"}`;
-              appendActionTrace(requestTabId, {
-                action: "project.checkpoints",
-                reason: "User requested available checkpoints",
-                argsSummary: JSON.stringify({ projectId: selectedProject.id, root: rootPath }),
-                outcome: "ok",
-              });
-            } else if (projectAction.action === "restore") {
-              let checkpointId = String(projectAction.args.checkpointId || projectAction.args.id || "").trim();
-              if (!checkpointId || checkpointId.toLowerCase() === "latest") {
-                const items = await invoke("list_project_checkpoints", {
-                  projectId: selectedProject.id,
-                  root: rootPath,
-                }) as any[];
-                const pick = Array.isArray(items) ? items[0] : null;
-                checkpointId = String(pick?.id || "").trim();
-              }
-              if (!checkpointId) {
-                projectExecutionLog = `- Restore requested for ${selectedProject.name}, but no checkpoints were found.`;
-              } else {
-                const clean = !!(projectAction.args.clean ?? false);
-                const result = await invoke("restore_project_checkpoint", {
-                  projectId: selectedProject.id,
-                  root: rootPath,
-                  checkpointId,
-                  clean,
-                }) as string;
-                projectExecutionLog = `- ${result}`;
-                appendActionTrace(requestTabId, {
-                  action: "project.restore",
-                  reason: "User requested rollback/restore",
-                  argsSummary: JSON.stringify({ projectId: selectedProject.id, checkpointId, clean }),
-                  outcome: "ok",
-                });
-              }
-            }
-          } catch (err: any) {
-            projectExecutionLog = `- Project ${projectAction.action} failed in ${selectedProject.name}: ${String(err?.message || err || "unknown error")}`;
-            appendActionTrace(requestTabId, {
-              action: `project.${projectAction.action}`,
-              reason: "Action execution failed",
-              argsSummary: JSON.stringify(projectAction.args || {}),
-              outcome: String(err?.message || err || "error"),
-            });
-          }
-        }
-      }
-
-      if (fsAction) {
-        const rootPath = String(fsAction.args.root || fsAction.args.projectRoot || activeManipulationRoot?.path || "").trim();
-        const rootName = String(fsAction.args.project || fsAction.args.projectName || activeManipulationRoot?.name || "project").trim();
+      const explicitFs = parseExplicitFsCall(text);
+      const explicitSsh = parseExplicitSshCall(text);
+      const explicitDesktop = parseExplicitDesktopCall(text);
+      if (explicitFs) {
+        const rootPath = String(explicitFs.args.root || explicitFs.args.projectRoot || activeManipulationRoot?.path || "").trim();
+        const rootName = String(explicitFs.args.project || explicitFs.args.projectName || activeManipulationRoot?.name || "project").trim();
         if (!rootPath) {
           fsExecutionLog = "- FS command requested, but no project manipulation root is configured for the current project.";
         } else {
-          const relPath = String(fsAction.args.path || fsAction.args.relPath || fsAction.args.file || "");
+          const relPath = String(explicitFs.args.path || explicitFs.args.relPath || explicitFs.args.file || "");
           try {
-            if (fsAction.action === "list") {
+            if (explicitFs.action === "list") {
               const items = await invoke("fs_list_dir", { root: rootPath, path: relPath || "." }) as RepoEntry[];
               const preview = (Array.isArray(items) ? items : []).slice(0, 80).map((i) => `${i.isDir ? "[DIR]" : "[FILE]"} ${i.path}`).join("\n");
               fsExecutionLog = `- FS list on ${rootName}${relPath ? `/${relPath}` : ""}:\n${preview || "(empty)"}`;
-            } else if (fsAction.action === "read") {
-              const maxChars = Number(fsAction.args.maxChars ?? fsAction.args.max_chars ?? 20000);
+            } else if (explicitFs.action === "read") {
+              const maxChars = Number(explicitFs.args.maxChars ?? explicitFs.args.max_chars ?? 20000);
               const content = await invoke("fs_read_text", { root: rootPath, path: relPath, maxChars }) as string;
               fsExecutionLog = `- FS read ${rootName}/${relPath}:\n${content}`;
-            } else if (fsAction.action === "write") {
-              const content = String(fsAction.args.content ?? "");
-              const overwrite = fsAction.args.overwrite == null ? true : !!fsAction.args.overwrite;
-              const createDirs = fsAction.args.createDirs == null ? true : !!fsAction.args.createDirs;
+            } else if (explicitFs.action === "write") {
+              const content = String(explicitFs.args.content ?? "");
+              const overwrite = explicitFs.args.overwrite == null ? true : !!explicitFs.args.overwrite;
+              const createDirs = explicitFs.args.createDirs == null ? true : !!explicitFs.args.createDirs;
               const result = await invoke("fs_write_text", { root: rootPath, path: relPath, content, overwrite, createDirs }) as string;
               fsExecutionLog = `- ${result}`;
-            } else if (fsAction.action === "delete") {
-              const recursive = !!(fsAction.args.recursive ?? false);
+            } else if (explicitFs.action === "delete") {
+              const recursive = !!(explicitFs.args.recursive ?? false);
               const result = await invoke("fs_delete_path", { root: rootPath, path: relPath, recursive }) as string;
               fsExecutionLog = `- ${result}`;
-            } else if (fsAction.action === "move") {
-              const fromPath = String(fsAction.args.from || fsAction.args.fromPath || "");
-              const toPath = String(fsAction.args.to || fsAction.args.toPath || "");
+            } else if (explicitFs.action === "move") {
+              const fromPath = String(explicitFs.args.from || explicitFs.args.fromPath || "");
+              const toPath = String(explicitFs.args.to || explicitFs.args.toPath || "");
               const result = await invoke("fs_move_path", { root: rootPath, fromPath, toPath }) as string;
               fsExecutionLog = `- ${result}`;
-            } else if (fsAction.action === "mkdir") {
+            } else if (explicitFs.action === "mkdir") {
               const result = await invoke("fs_make_dir", { root: rootPath, path: relPath }) as string;
               fsExecutionLog = `- ${result}`;
             }
-            appendActionTrace(requestTabId, {
-              action: `filesystem.${fsAction.action}`,
-              reason: "Action inferred from user request",
-              argsSummary: JSON.stringify(fsAction.args || {}),
-              outcome: "ok",
-            });
           } catch (err: any) {
-            fsExecutionLog = `- FS ${fsAction.action} failed in ${rootName}: ${String(err?.message || err || "unknown error")}`;
-            appendActionTrace(requestTabId, {
-              action: `filesystem.${fsAction.action}`,
-              reason: "Action execution failed",
-              argsSummary: JSON.stringify(fsAction.args || {}),
-              outcome: String(err?.message || err || "error"),
-            });
+            fsExecutionLog = `- FS ${explicitFs.action} failed in ${rootName}: ${String(err?.message || err || "unknown error")}`;
           }
         }
       }
 
-      if (desktopAction) {
+      if (explicitDesktop) {
         if (!desktopToolsEnabled) {
           desktopExecutionLog = "- Desktop command requested, but Desktop Tools is disabled.";
         } else if (!activeManipulationRoot?.path) {
           desktopExecutionLog = "- Desktop command requested, but no project manipulation root is configured.";
         } else {
           const rootPath = activeManipulationRoot.path;
-          const relPath = String(desktopAction.args.path || desktopAction.args.relPath || desktopAction.args.file || "");
+          const relPath = String(explicitDesktop.args.path || explicitDesktop.args.relPath || explicitDesktop.args.file || "");
           try {
-            if (desktopAction.action === "list") {
+            if (explicitDesktop.action === "list") {
               const items = await invoke("fs_list_dir", { root: rootPath, path: relPath || "." }) as RepoEntry[];
               const preview = (Array.isArray(items) ? items : []).slice(0, 80).map((i) => `${i.isDir ? "[DIR]" : "[FILE]"} ${i.path}`).join("\n");
               desktopExecutionLog = `- Desktop list ${relPath || "."}:\n${preview || "(empty)"}`;
-            } else if (desktopAction.action === "read") {
-              const maxChars = Number(desktopAction.args.maxChars ?? desktopAction.args.max_chars ?? 20000);
+            } else if (explicitDesktop.action === "read") {
+              const maxChars = Number(explicitDesktop.args.maxChars ?? explicitDesktop.args.max_chars ?? 20000);
               const content = await invoke("fs_read_text", { root: rootPath, path: relPath, maxChars }) as string;
               desktopExecutionLog = `- Desktop read ${relPath}:\n${content}`;
-            } else if (desktopAction.action === "write") {
-              const content = String(desktopAction.args.content ?? "");
-              const overwrite = desktopAction.args.overwrite == null ? true : !!desktopAction.args.overwrite;
-              const createDirs = desktopAction.args.createDirs == null ? true : !!desktopAction.args.createDirs;
+            } else if (explicitDesktop.action === "write") {
+              const content = String(explicitDesktop.args.content ?? "");
+              const overwrite = explicitDesktop.args.overwrite == null ? true : !!explicitDesktop.args.overwrite;
+              const createDirs = explicitDesktop.args.createDirs == null ? true : !!explicitDesktop.args.createDirs;
               const result = await invoke("fs_write_text", { root: rootPath, path: relPath, content, overwrite, createDirs }) as string;
               desktopExecutionLog = `- ${result}`;
-            } else if (desktopAction.action === "delete") {
-              const recursive = !!(desktopAction.args.recursive ?? false);
+            } else if (explicitDesktop.action === "delete") {
+              const recursive = !!(explicitDesktop.args.recursive ?? false);
               const result = await invoke("fs_delete_path", { root: rootPath, path: relPath, recursive }) as string;
               desktopExecutionLog = `- ${result}`;
-            } else if (desktopAction.action === "move") {
-              const fromPath = String(desktopAction.args.from || desktopAction.args.fromPath || "");
-              const toPath = String(desktopAction.args.to || desktopAction.args.toPath || "");
+            } else if (explicitDesktop.action === "move") {
+              const fromPath = String(explicitDesktop.args.from || explicitDesktop.args.fromPath || "");
+              const toPath = String(explicitDesktop.args.to || explicitDesktop.args.toPath || "");
               const result = await invoke("fs_move_path", { root: rootPath, fromPath, toPath }) as string;
               desktopExecutionLog = `- ${result}`;
-            } else if (desktopAction.action === "mkdir") {
+            } else if (explicitDesktop.action === "mkdir") {
               const result = await invoke("fs_make_dir", { root: rootPath, path: relPath }) as string;
               desktopExecutionLog = `- ${result}`;
             }
-            appendActionTrace(requestTabId, {
-              action: `desktop.${desktopAction.action}`,
-              reason: "Action inferred from user request",
-              argsSummary: JSON.stringify(desktopAction.args || {}),
-              outcome: "ok",
-            });
           } catch (err: any) {
-            desktopExecutionLog = `- Desktop ${desktopAction.action} failed: ${String(err?.message || err || "unknown error")}`;
-            appendActionTrace(requestTabId, {
-              action: `desktop.${desktopAction.action}`,
-              reason: "Action execution failed",
-              argsSummary: JSON.stringify(desktopAction.args || {}),
-              outcome: String(err?.message || err || "error"),
-            });
+            desktopExecutionLog = `- Desktop ${explicitDesktop.action} failed: ${String(err?.message || err || "unknown error")}`;
           }
         }
       }
@@ -2975,8 +2514,8 @@ function App() {
         ? repoStore.sshs.filter((s) => (selectedProject.sshIds || []).includes(s.id) && s.enabled)
         : [];
 
-      if (sshAction) {
-        const requestedConnection = String(sshAction.args.connectionId || sshAction.args.connection || sshAction.args.sshId || "").trim();
+      if (explicitSsh) {
+        const requestedConnection = String(explicitSsh.args.connectionId || explicitSsh.args.connection || explicitSsh.args.sshId || "").trim();
         const pick = requestedConnection
           ? activeSshs.find((s) => s.id === requestedConnection || s.name.toLowerCase() === requestedConnection.toLowerCase())
           : activeSshs[0];
@@ -2986,9 +2525,9 @@ function App() {
           try {
             const raw = await withTimeout(invoke("ssh_tool_call", {
               connection: pick,
-              action: sshAction.action,
-              arguments: sshAction.args,
-            }) as Promise<any>, 12000, `ssh_tool_call:${sshAction.action}`);
+              action: explicitSsh.action,
+              arguments: explicitSsh.args,
+            }) as Promise<any>, 12000, `ssh_tool_call:${explicitSsh.action}`);
             const pretty = (() => {
               try {
                 return JSON.stringify(raw, null, 2);
@@ -2996,60 +2535,31 @@ function App() {
                 return String(raw);
               }
             })();
-            sshExecutionLog = `- Executed SSH ${pick.name}.${sshAction.action} with args ${JSON.stringify(sshAction.args)}\n${pretty}`;
-            appendActionTrace(requestTabId, {
-              action: `ssh.${sshAction.action}`,
-              reason: `Action inferred for SSH connection ${pick.name}`,
-              argsSummary: JSON.stringify(sshAction.args || {}),
-              outcome: "ok",
-            });
+            sshExecutionLog = `- Executed SSH ${pick.name}.${explicitSsh.action} with args ${JSON.stringify(explicitSsh.args)}\n${pretty}`;
           } catch (err: any) {
-            sshExecutionLog = `- SSH ${pick.name}.${sshAction.action} failed: ${String(err?.message || err || "unknown error")}`;
-            appendActionTrace(requestTabId, {
-              action: `ssh.${sshAction.action}`,
-              reason: `Action failed for SSH connection ${pick.name}`,
-              argsSummary: JSON.stringify(sshAction.args || {}),
-              outcome: String(err?.message || err || "error"),
-            });
+            sshExecutionLog = `- SSH ${pick.name}.${explicitSsh.action} failed: ${String(err?.message || err || "unknown error")}`;
           }
         }
       }
 
       if (!projectIdeationFastPath && !quickMode && mcpContextActive && activeMcps.length) {
-        setThinkingProgress(requestTabId, "Connecting MCP tools...");
+        setThinkingStep("Connecting MCP tools...");
         for (const mcp of activeMcps) {
           const parsed = parseMcpTarget(mcp.target);
-          const connectionType = parsed.type;
+          const connectionType = (mcp.connectionType === "stdio" || mcp.connectionType === "url") ? mcp.connectionType : parsed.type;
           const command = mcp.launchCommand || parsed.command;
           const args = Array.isArray(mcp.launchArgs) ? mcp.launchArgs.map(String) : (parsed.args ?? []);
           const target = typeof mcp.target === "string" ? mcp.target : "";
           try {
-            const cacheKey = `${mcp.id}::${command || ""}::${args.join(" ")}`;
-            const cached = mcpToolCacheRef.current[cacheKey];
-            const recentlyCached = !!cached && (Date.now() - cached.ts) < 120000;
-            if (recentlyCached && cached.tools.length) {
-              appendWorkLog(requestTabId, `MCP ${mcp.name}: using cached tool list (${cached.tools.length})`);
-              mcpToolCatalog = [...mcpToolCatalog, ...cached.tools];
-              setMcpHealthStatus((prev) => ({
-                ...prev,
-                [mcp.id]: { state: "connected", message: `connected (${cached.tools.length} tools · cache)`, toolCount: cached.tools.length },
-              }));
-              continue;
-            }
-
             const conn = await withTimeout(invoke("connect_mcp_server", {
               mcpId: mcp.id,
               target,
               connectionType,
               command: connectionType === "stdio" ? command : (parsed.url || target),
               args,
-            }) as Promise<{ connected: boolean; pid?: number | null }>, 1600, `connect_mcp_server:${mcp.name}`);
+            }) as Promise<{ connected: boolean; pid?: number | null }>, 2500, `connect_mcp_server:${mcp.name}`);
             if (conn?.connected && typeof conn?.pid === "number" && conn.pid > 0) {
               setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: conn.pid!, launched: true } }));
-            }
-            if (conn?.connected) {
-              appendWorkLog(requestTabId, `MCP ${mcp.name}: connected, listing tools...`);
-              setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "bridge_up", message: "connected, checking tools..." } }));
             }
 
             const tools = await withTimeout(invoke("mcp_list_tools", {
@@ -3058,7 +2568,7 @@ function App() {
               connectionType,
               command: connectionType === "stdio" ? command : (parsed.url || target),
               args,
-            }) as Promise<Array<{ name: string; description?: string; inputSchema?: any }>>, 2200, `mcp_list_tools:${mcp.name}`);
+            }) as Promise<Array<{ name: string; description?: string; inputSchema?: any }>>, 3500, `mcp_list_tools:${mcp.name}`);
             const normalized = (Array.isArray(tools) ? tools : []).map((t) => ({
               mcpId: mcp.id,
               mcpName: mcp.name,
@@ -3070,33 +2580,21 @@ function App() {
               description: String(t?.description || ""),
               inputSchema: t?.inputSchema,
             })).filter((t) => t.toolName.length > 0);
-            mcpToolCacheRef.current[cacheKey] = { tools: normalized, ts: Date.now() };
             mcpToolCatalog = [...mcpToolCatalog, ...normalized];
-            appendWorkLog(requestTabId, `MCP ${mcp.name}: ${normalized.length} tools ready`);
-            setMcpHealthStatus((prev) => ({
-              ...prev,
-              [mcp.id]: {
-                state: "connected",
-                message: normalized.length ? `connected (${normalized.length} tools)` : "connected (0 tools)",
-                toolCount: normalized.length,
-              },
-            }));
           } catch (err: any) {
             const msg = String(err?.message || err || "unknown MCP error");
             mcpToolExecutionLog += `${mcpToolExecutionLog ? "\n" : ""}- ${mcp.name}: connection failed (${msg})`;
-            appendWorkLog(requestTabId, `MCP ${mcp.name}: connection failed (${msg})`);
-            setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: msg } }));
           }
         }
 
-        const explicitCall = parseExplicitMcpCall(text) || inferredActions.mcp;
+        const explicitCall = parseExplicitMcpCall(text);
         if (explicitCall) {
-          const match = resolveMcpToolMatch(mcpToolCatalog, explicitCall.toolName);
+          const match = mcpToolCatalog.find((t) => t.toolName.toLowerCase() === explicitCall.toolName.toLowerCase());
           if (!match) {
             const available = mcpToolCatalog.map((t) => `${t.mcpName}.${t.toolName}`).join(", ");
             mcpToolExecutionLog += `${mcpToolExecutionLog ? "\n" : ""}- Requested MCP tool '${explicitCall.toolName}' was not found. Available tools: ${available || "(none)"}`;
           } else {
-            setThinkingProgress(requestTabId, `Running MCP tool: ${match.toolName}`);
+            setThinkingStep(`Running MCP tool: ${match.toolName}`);
             try {
               const raw = await withTimeout(invoke("mcp_call_tool", {
                 mcpId: match.mcpId,
@@ -3115,47 +2613,12 @@ function App() {
                 }
               })();
               mcpToolExecutionLog += `${mcpToolExecutionLog ? "\n" : ""}- Executed ${match.mcpName}.${match.toolName} with args ${JSON.stringify(explicitCall.args)}\n${pretty}`;
-              appendWorkLog(requestTabId, `MCP tool done: ${match.mcpName}.${match.toolName}`);
-              appendActionTrace(requestTabId, {
-                action: `mcp.${match.toolName}`,
-                reason: `Tool execution on ${match.mcpName}`,
-                argsSummary: JSON.stringify(explicitCall.args || {}),
-                outcome: "ok",
-              });
             } catch (err: any) {
               const msg = String(err?.message || err || "tool call failed");
               mcpToolExecutionLog += `${mcpToolExecutionLog ? "\n" : ""}- Tool call ${match.mcpName}.${match.toolName} failed: ${msg}`;
-              appendWorkLog(requestTabId, `MCP tool failed: ${match.mcpName}.${match.toolName}`);
-              appendActionTrace(requestTabId, {
-                action: `mcp.${match.toolName}`,
-                reason: `Tool execution failed on ${match.mcpName}`,
-                argsSummary: JSON.stringify(explicitCall.args || {}),
-                outcome: msg,
-              });
             }
           }
         }
-      }
-
-      // If an engineering task was requested but every MCP failed to connect, tell the user
-      // how to fix it rather than letting the LLM loop endlessly with no tools.
-      if (engineeringTaskRequest && mcpContextActive && activeMcps.length > 0 && mcpToolCatalog.length === 0) {
-        const mcpNames = activeMcps.map((m) => m.name).join(", ");
-        const warn = [
-          `⚠️ **MCP bridge not running** — I can't reach the project tools for **${mcpNames}**.`,
-          "",
-          "To execute tasks on your Godot project I need the bridge active:",
-          "1. Open **Bridge Servers** in the top chat bar",
-          `2. Find \`${mcpNames}\` → click **▶ Launch**`,
-          "3. Send your message again",
-          "",
-          "Without the bridge I can answer questions but cannot create or edit project files.",
-        ].join("\n");
-        updateTabMessages(requestTabId, (msgs) => insertLLMBubble(msgs, warn));
-        setThinkingStep("");
-        setIrisStatus("idle");
-        clearWorkLog(requestTabId);
-        return;
       }
 
       if (DEBUG_MEMORY) {
@@ -3182,7 +2645,7 @@ function App() {
       const model = primaryModel;
       const options = coderish ? coderOpts : organizerOpts;
       setThinkingModel((primaryModel || "iris-organizer:latest").replace(/:latest$/i, ""));
-      setThinkingProgress(requestTabId, "Preparing response...");
+      setThinkingStep("Preparing response...");
 
       let prompt = plannerPrompt;
       if (projectIdeationFastPath && selectedProject) {
@@ -3230,31 +2693,11 @@ function App() {
         const toolLines = mcpToolCatalog
           .map((t) => `- ${t.mcpName}.${t.toolName}${t.description ? `: ${t.description}` : ""}`)
           .join("\n");
-        const toolCallNote = engineeringTaskRequest
-          ? `\nTo call a tool, output exactly this on its own line:\nTOOL_CALL: {"tool": "exact_tool_name", "args": {"key": "value"}}\nYou will receive a TOOL_RESULT for each call. Use tool calls to ACT — do not just describe what to do.`
-          : `\nOnly claim MCP tool output if it appears under MCP execution results.`;
-        prompt = `${prompt}\n\nLive MCP tools available right now:\n${toolLines}${toolCallNote}`;
+        prompt = `${prompt}\n\nLive MCP tools available right now:\n${toolLines}\nOnly claim MCP tool output if it appears under MCP execution results.`;
       }
 
       if (activeManipulationRoot?.path) {
         prompt = `${prompt}\n\nDirect project access:\n- Project manipulation root: ${activeManipulationRoot.path}\n- Prefer direct filesystem actions through the manipulation root for normal file edits, file moves, and folder operations.\n- Prefer MCP only when it gives project-engine-specific leverage that direct filesystem access does not.`;
-      }
-
-      const actionTraceLines = (actionTraceByTab[requestTabId] || [])
-        .slice(-8)
-        .map((a) => `- ${new Date(a.ts * 1000).toLocaleTimeString()}: ${a.action} | reason=${a.reason} | outcome=${a.outcome}`)
-        .join("\n");
-      const flowAdjustments = flowAdjustmentsByTab[requestTabId] || [];
-      const allFlowAdjustments = [
-        ...(flowAdjustments || []),
-        ...(flowAdjustmentNote ? [flowAdjustmentNote] : []),
-      ];
-      prompt = `${prompt}\n\nIris internal action repository:\n${IRIS_ACTION_REPOSITORY.map((a) => `- ${a}`).join("\n")}\nUse these actions based on intent and context; slash commands are optional and should not be required.`;
-      if (actionTraceLines.trim()) {
-        prompt = `${prompt}\n\nRecent internal action trace:\n${actionTraceLines}`;
-      }
-      if (allFlowAdjustments.length) {
-        prompt = `${prompt}\n\nUser feedback adjustments currently active:\n${allFlowAdjustments.map((n) => `- ${n}`).join("\n")}`;
       }
 
       if (fsExecutionLog.trim()) {
@@ -3280,10 +2723,6 @@ function App() {
         prompt = `${prompt}\n\nDesktop execution results:\n${desktopExecutionLog}`;
       }
 
-      if (projectExecutionLog.trim()) {
-        prompt = `${prompt}\n\nProject checkpoint results:\n${projectExecutionLog}`;
-      }
-
       if (projectContext && !projectIdeationFastPath) {
         const gatingRules = !reposContextActive && !mcpContextActive
           ? "- Repos and MCP context toggles are OFF; do not fabricate tool outputs."
@@ -3299,7 +2738,7 @@ function App() {
           ? "- Use deeper reasoning loops (plan -> execute -> self-check -> iterate) until a satisfactory result is reached."
           : "- Use one short plan/execute/check loop and ask before deeper iteration.";
 
-        prompt = `${prompt}\n\nProject Dataweb Context:\n${projectContext}\n\nContext routing rules:\n- If user asks for project overview/status, answer from project description + registry + selected references summary.\n- Do not output raw tutorial steps unless user explicitly asks for implementation steps.\n- Use repository excerpts only for concrete implementation/debug requests.\n- Use MCP mentions only when execution/integration is requested.\n${gatingRules}\n\nExecution loop contract:\n- Plan with project dataweb (repos + MCPs when enabled).\n- Execute one concrete step.\n- Self-check results.\n${loopDepthRule}\n- Provide concise progress updates while working, then summarize completed work and next steps.\n${engineeringTaskRequest ? "- CRITICAL: Use TOOL_CALL directives to actually execute actions — do not just describe what to do. Format: TOOL_CALL: {\\\"tool\\\": \\\"exact_tool_name\\\", \\\"args\\\": {\\\"key\\\": \\\"value\\\"}} — one per line. Phases: Inspect (list_directory/read_file) → Plan → Execute (write_file/create_scene/etc via TOOL_CALLs) → Verify → Polish. Keep issuing TOOL_CALLs until the task is done." : ""}\n\nUse this project context for grounding when relevant.`;
+        prompt = `${prompt}\n\nProject Dataweb Context:\n${projectContext}\n\nContext routing rules:\n- If user asks for project overview/status, answer from project description + registry + selected references summary.\n- Do not output raw tutorial steps unless user explicitly asks for implementation steps.\n- Use repository excerpts only for concrete implementation/debug requests.\n- Use MCP mentions only when execution/integration is requested.\n${gatingRules}\n\nExecution loop contract:\n- Plan with project dataweb (repos + MCPs when enabled).\n- Execute one concrete step.\n- Self-check results.\n${loopDepthRule}\n- Provide concise progress updates while working, then summarize completed work and next steps.\n\nUse this project context for grounding when relevant.`;
       }
 
       if (!projectIdeationFastPath && selectedProject?.datawebEnabled && projectDatawebText.trim()) {
@@ -3313,7 +2752,7 @@ function App() {
       const networkQuery = normalizeConversationalQuery(text);
       if (!projectIdeationFastPath && networkEnabled && shouldUseNetworkForPrompt(networkQuery)) {
         try {
-          setThinkingProgress(requestTabId, "Searching network sources...");
+          setThinkingStep("Searching network sources...");
           const net = await withTimeout(invoke("network_search", {
             query: networkQuery,
             projectContext: projectContext || "",
@@ -3325,11 +2764,11 @@ function App() {
             .join("\n\n");
           if (evidence.trim()) {
             prompt = `${prompt}\n\nNetwork Assist (fresh internet context):\n${evidence}\n\nWhen the user asks for weather/news/current events, answer directly from these snippets first and do not claim you lack real-time access.`;
-            setThinkingProgress(requestTabId, "Network context merged");
+            setThinkingStep("Network context merged");
           }
         } catch (e) {
           console.warn("network_lookup failed", e);
-          setThinkingProgress(requestTabId, "Network lookup unavailable; continuing offline");
+          setThinkingStep("Network lookup unavailable; continuing offline");
         }
       }
 
@@ -3345,11 +2784,11 @@ function App() {
       const deterministicReply = String(deterministicProjectReply || plannerV2?.deterministicReply || plannerV2?.deterministic_reply || "").trim();
       if (deterministicReply) {
         setIrisStatus("responding");
-        setThinkingProgress(requestTabId, "Applying backend rule...");
+        setThinkingStep("Applying backend rule...");
         streamedText = deterministicReply;
         updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, deterministicReply));
       } else {
-        setThinkingProgress(requestTabId, "Generating response...");
+        setThinkingStep("Generating response...");
         await stream({
           model,
           prompt,
@@ -3370,168 +2809,19 @@ function App() {
           },
         });
 
-        // --- Agentic MCP tool-use loop ---
-        // If the model emitted TOOL_CALL directives, execute them and continue.
-        if (!stoppedRef.current && engineeringTaskRequest && mcpToolCatalog.length > 0) {
-          const MAX_AGENT_ITERS = 5;
-          let agentContext = prompt;
-          let agentResponse = streamedText;
-          let agentActionsRan = 0;
-          for (let agentIter = 0; agentIter < MAX_AGENT_ITERS; agentIter++) {
-            if (stoppedRef.current) break;
-            let pendingCalls = parseToolCallsFromText(agentResponse);
-            if (pendingCalls.length === 0 && agentIter === 0) {
-              setThinkingProgress(requestTabId, "Planning concrete tool calls...");
-              const toolInventory = mcpToolCatalog
-                .slice(0, 40)
-                .map((t) => `- ${t.mcpName}.${t.toolName}${t.description ? `: ${t.description}` : ""}`)
-                .join("\n");
-              let forcedCallsText = "";
-              await stream({
-                model: "iris-organizer:latest",
-                prompt: [
-                  "You are an execution planner for MCP tools.",
-                  "Return only tool calls. Do not return prose.",
-                  `User request:\n${text}`,
-                  `Available MCP tools:\n${toolInventory}`,
-                  "Output format (one per line, max 3 lines):",
-                  "TOOL_CALL: {\"tool\":\"exact_tool_name\",\"args\":{}}",
-                  "If no tool can help, output exactly: NO_TOOL_CALL",
-                ].join("\n\n"),
-                options: {
-                  num_ctx: 1024,
-                  num_keep: 24,
-                  num_predict: 220,
-                  temperature: 0.1,
-                  top_p: 0.9,
-                  top_k: 40,
-                  repeat_penalty: 1.06,
-                },
-                signal: controller.signal,
-                onFirstToken: (first) => {
-                  forcedCallsText += first;
-                },
-                onTokens: (delta) => {
-                  forcedCallsText += delta;
-                },
-              });
-              pendingCalls = parseToolCallsFromText(forcedCallsText);
-              if (pendingCalls.length === 0) {
-                appendWorkLog(requestTabId, "No actionable tool calls generated");
-                break;
-              }
-            }
-            if (pendingCalls.length === 0) break;
-
-            // Execute each tool call and collect results
-            let toolResultsBlock = "";
-            for (const tc of pendingCalls) {
-              const match = resolveMcpToolMatch(mcpToolCatalog, tc.toolName);
-              if (!match) {
-                const avail = mcpToolCatalog.map((t) => `${t.mcpName}.${t.toolName}`).slice(0, 20).join(", ");
-                toolResultsBlock += `\nTOOL_RESULT [${tc.toolName}]: Error - tool not found. Available: ${avail || "(none)"}`;
-                appendWorkLog(requestTabId, `Tool not found: ${tc.toolName}`);
-                continue;
-              }
-              setThinkingProgress(requestTabId, `Executing: ${match.toolName}...`);
-              try {
-                const raw = await withTimeout(
-                  invoke("mcp_call_tool", {
-                    mcpId: match.mcpId,
-                    target: match.target,
-                    connectionType: match.connectionType,
-                    command: match.connectionType === "stdio" ? match.command : match.target,
-                    args: match.args ?? [],
-                    toolName: match.toolName,
-                    arguments: tc.args,
-                  }) as Promise<unknown>,
-                  14000,
-                  `agentic_tool:${match.toolName}`
-                );
-                const resultText = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
-                toolResultsBlock += `\nTOOL_RESULT [${tc.toolName}]:\n${resultText.slice(0, 3000)}`;
-                appendWorkLog(requestTabId, `ok ${match.toolName}`);
-                agentActionsRan += 1;
-                appendActionTrace(requestTabId, {
-                  action: `mcp.${match.toolName}`,
-                  reason: "Agentic tool execution",
-                  argsSummary: JSON.stringify(tc.args || {}),
-                  outcome: "ok",
-                });
-              } catch (err: unknown) {
-                const errMsg = String((err as any)?.message || err || "tool failed");
-                toolResultsBlock += `\nTOOL_RESULT [${tc.toolName}]: Error - ${errMsg}`;
-                appendWorkLog(requestTabId, `fail ${match.toolName}: ${errMsg.slice(0, 80)}`);
-                appendActionTrace(requestTabId, {
-                  action: `mcp.${match.toolName}`,
-                  reason: "Agentic tool failed",
-                  argsSummary: JSON.stringify(tc.args || {}),
-                  outcome: errMsg,
-                });
-              }
-            }
-            if (!toolResultsBlock.trim()) break;
-
-            // Append tool results divider to the displayed bubble
-            const divider = `\n\n---\n${toolResultsBlock.trim()}\n\n`;
-            updateTabMessages(requestTabId, (msgs) => {
-              const copy = [...msgs];
-              for (let i = copy.length - 1; i >= 0; --i) {
-                if (copy[i].role === "llm") {
-                  copy[i] = { ...copy[i], text: copy[i].text + divider };
-                  break;
-                }
-              }
-              return copy;
-            });
-
-            // Build continuation prompt
-            agentContext = [
-              agentContext,
-              `\nPrevious assistant response:\n${agentResponse.slice(0, 2000)}`,
-              `\nTool execution results:${toolResultsBlock}`,
-              `\nContinue. Output more TOOL_CALL lines if needed, or provide a final completion summary when the task is verified done.`,
-            ].join("\n");
-
-            setThinkingProgress(requestTabId, `Agent pass ${agentIter + 2}...`);
-            let nextText = "";
-            await stream({
-              model,
-              prompt: agentContext,
-              options: { ...options, num_predict: 700 },
-              signal: controller.signal,
-              onFirstToken: (t) => {
-                nextText += t;
-                updateTabMessages(requestTabId, (msgs) => patchLastLLMBubble(msgs, t));
-              },
-              onTokens: (delta) => {
-                nextText += delta;
-                updateTabMessages(requestTabId, (msgs) => patchLastLLMBubble(msgs, delta));
-              },
-            });
-            if (!nextText.trim()) break;
-            streamedText += divider + nextText;
-            agentResponse = nextText;
-            if (!agentResponse.includes("TOOL_CALL:")) break;
-          }
-
-          if (agentActionsRan === 0) {
-            appendWorkLog(requestTabId, "No MCP actions executed; returned guidance only");
-          }
-        }
-
         const iterationBudget = iterationBudgetForProfile(llmProfile);
         if (!hasImages && !quickMode && iterationBudget > 1 && streamedText.trim()) {
           let workingDraft = streamedText;
           for (let iter = 2; iter <= iterationBudget; iter++) {
             if (stoppedRef.current) break;
-            setThinkingProgress(requestTabId, `Self-review pass ${iter}/${iterationBudget}...`);
+            setThinkingStep(`Self-review pass ${iter}/${iterationBudget}...`);
             const reviewPrompt = [
               "You are performing an internal quality-control pass before finalizing a user response.",
-              "Output strictly in one of these forms only:",
-              "DONE",
-              "REVISE:<final user-facing answer only>",
-              "No analysis headings, no intent summaries, no commentary.",
+              "First decode user intent(s) briefly, then check whether the current draft satisfies them.",
+              "If the draft is good enough, output exactly: DONE",
+              "If it needs improvement, output exactly one improved full final response prefixed with REVISE:",
+              "You may backtrack and change approach if the current draft is weak, ungrounded, or misses key constraints.",
+              "Keep improvements practical and concise unless the user requested depth.",
               "",
               `User request:\n${text}`,
               "",
@@ -3564,10 +2854,7 @@ function App() {
             if (!trimmed || /^DONE\s*$/i.test(trimmed)) {
               break;
             }
-            if (!/^REVISE:/i.test(trimmed)) {
-              break;
-            }
-            const revised = sanitizeAssistantOutput(trimmed.replace(/^REVISE:\s*/i, "").trim());
+            const revised = trimmed.replace(/^REVISE:\s*/i, "").trim();
             if (!revised) {
               break;
             }
@@ -3579,7 +2866,7 @@ function App() {
 
       // --- Artifact extraction and filename sniff ---
       fullText = streamedText;
-      let deliveredText = sanitizeAssistantOutput(fullText);
+      let deliveredText = fullText.replace(/<\/?final>/gi, "").trim();
       if (networkHits.length) {
         const sourcesBlock = networkHits
           .slice(0, 4)
@@ -3672,7 +2959,7 @@ function App() {
       // Persist memory to disk first (desktop-safe, crash-resistant).
       // Summaries are updated in a background step after raw transcript is safely written.
       try {
-        setThinkingProgress(requestTabId, "Saving memory...");
+        setThinkingStep("Saving memory...");
         const tabObj = tabs.find(t => t.id === requestTabId);
         const nowTs = Math.floor(Date.now() / 1000);
         // Build from in-memory UI messages only to avoid disk read/write contention.
@@ -4471,49 +3758,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     }
   }
 
-  function isValidHttpUrl(value: string): boolean {
-    const t = String(value || "").trim();
-    return /^https?:\/\//i.test(t);
-  }
-
-  async function saveUpdateSettings() {
-    if (manualDownloadUrl.trim() && !isValidHttpUrl(manualDownloadUrl)) {
-      alert("Manual download URL must start with http:// or https://");
-      return;
-    }
-    if (releaseNotesUrl.trim() && !isValidHttpUrl(releaseNotesUrl)) {
-      alert("Release notes URL must start with http:// or https://");
-      return;
-    }
-    if (updateFeedUrl.trim() && !isValidHttpUrl(updateFeedUrl)) {
-      alert("Update feed URL must start with http:// or https://");
-      return;
-    }
-    try {
-      await invoke("set_setup_flags", {
-        args: {
-          manualDownloadUrl: manualDownloadUrl.trim(),
-          releaseNotesUrl: releaseNotesUrl.trim(),
-          updateFeedUrl: updateFeedUrl.trim(),
-          autoUpdatesEnabled,
-        },
-      });
-      alert("Update links saved.");
-    } catch (e: any) {
-      alert("Failed to save update settings: " + (e?.message || e));
-    }
-  }
-
-  async function openExternalUpdateUrl(url: string) {
-    const target = String(url || "").trim();
-    if (!isValidHttpUrl(target)) return;
-    try {
-      await openUrl(target);
-    } catch (e: any) {
-      alert("Could not open link: " + (e?.message || e));
-    }
-  }
-
   async function persistRepoStore(next: RepoProjectStore) {
     setRepoStore(next);
     try {
@@ -4523,7 +3767,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     }
   }
 
-  async function saveBridgeSettings() {
+  async function saveMcpSettings() {
     // Enrich each MCP entry with parsed connectionType/launchCommand/launchArgs before persisting.
     const enriched: McpConnection[] = (Array.isArray(mcpDraft) ? mcpDraft : []).map((mcp) => {
       const parsed = parseMcpTarget(mcp?.target);
@@ -4539,6 +3783,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         launchArgs: parsed.args,
       };
     });
+    setMcpDraft(enriched);
+    await persistRepoStore({ ...repoStore, mcps: enriched });
+  }
+
+  async function saveSshSettings() {
     const normalized: SshConnection[] = (Array.isArray(sshDraft) ? sshDraft : []).map((s) => ({
       ...s,
       name: String(s.name || "SSH").trim() || "SSH",
@@ -4553,78 +3802,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       enabled: !!s.enabled,
       notes: String(s.notes || ""),
     }));
-    setMcpDraft(enriched);
     setSshDraft(normalized);
-    // Single atomic save prevents the two separate snapshots from clobbering each other.
-    await persistRepoStore({ ...repoStore, mcps: enriched, sshs: normalized });
+    await persistRepoStore({ ...repoStore, sshs: normalized });
   }
 
-  function appendActionTrace(tabId: number, entry: Omit<IrisActionTrace, "id" | "ts">) {
-    const trace: IrisActionTrace = {
-      id: makeId("act"),
-      ts: Math.floor(Date.now() / 1000),
-      ...entry,
-    };
-    setActionTraceByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      return { ...prev, [tabId]: [...existing, trace].slice(-60) };
-    });
-  }
-
-  function applyFlowAdjustmentFeedback(tabId: number, text: string): string | null {
-    const note = detectFlowAdjustmentNote(text);
-    if (!note) return null;
-    setFlowAdjustmentsByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      if (existing.includes(note)) return prev;
-      return { ...prev, [tabId]: [...existing, note].slice(-10) };
-    });
-    return note;
-  }
-
-  async function probeMcpReadiness(mcp: McpConnection): Promise<{ connected: boolean; toolCount: number; message: string }> {
-    const parsed = parseMcpTarget(mcp.target);
-    const connectionType = parsed.type;
-    const command = connectionType === "stdio"
-      ? (mcp.launchCommand || parsed.command)
-      : (parsed.url || mcp.target);
-    const args = Array.isArray(mcp.launchArgs) ? mcp.launchArgs : (parsed.args ?? []);
-
-    const conn = await withTimeout(
-      invoke("connect_mcp_server", {
-        mcpId: mcp.id,
-        target: mcp.target,
-        connectionType,
-        command,
-        args,
-      }) as Promise<{ connected: boolean; pid?: number | null; protocol?: string | null }>,
-      65000,
-      `connect_mcp_server:${mcp.name}`
-    );
-
-    if (conn?.connected && typeof conn?.pid === "number" && conn.pid > 0) {
-      setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: conn.pid!, launched: true } }));
-    }
-
-    const tools = await withTimeout(
-      invoke("mcp_list_tools", {
-        mcpId: mcp.id,
-        target: mcp.target,
-        connectionType,
-        command,
-        args,
-      }) as Promise<Array<{ name: string }>>,
-      35000,
-      `mcp_list_tools:${mcp.name}`
-    );
-
-    const toolCount = Array.isArray(tools) ? tools.length : 0;
-    const proto = conn?.protocol ? ` · ${conn.protocol}` : "";
-    return {
-      connected: !!conn?.connected,
-      toolCount,
-      message: toolCount > 0 ? `connected (${toolCount} tools${proto})` : `connected (0 tools${proto})`,
-    };
+  async function saveBridgeSettings() {
+    await saveMcpSettings();
+    await saveSshSettings();
   }
 
   async function launchMcpServer(mcp: McpConnection) {
@@ -4633,54 +3817,37 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       alert("This MCP connection target is a URL, not a launch command. Enter a command string (e.g. 'uv run /path/server.py') to use Launch.");
       return;
     }
-    // Clear any previous abort for this id; show Stop button immediately.
-    mcpProbeAbortedRef.current.delete(mcp.id);
-    setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: true } }));
-    setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "launching", message: "establishing connection..." } }));
     try {
-      const readiness = await probeMcpReadiness(mcp);
-      // If Stop was pressed during the probe, ignore result.
-      if (mcpProbeAbortedRef.current.has(mcp.id)) return;
-      if (readiness.connected) {
-        setMcpHealthStatus((prev) => ({
-          ...prev,
-          [mcp.id]: { state: "connected", message: readiness.message, toolCount: readiness.toolCount },
-        }));
-      } else {
-        setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: readiness.message } }));
-        try { await invoke("stop_mcp_server", { mcpId: mcp.id }); } catch (_) { /* ignore */ }
-        setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: false } }));
-      }
-    } catch (probeErr: any) {
-      if (mcpProbeAbortedRef.current.has(mcp.id)) return;
-      const msg = String(probeErr?.message || probeErr || "connection failed");
-      setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: msg } }));
-      try { await invoke("stop_mcp_server", { mcpId: mcp.id }); } catch (_) { /* ignore */ }
       setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: false } }));
+      const pid = await invoke("launch_mcp_server", {
+        mcpId: mcp.id,
+        command: mcp.launchCommand || parsed.command,
+        args: Array.isArray(mcp.launchArgs) ? mcp.launchArgs : (parsed.args ?? []),
+      }) as number;
+      setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid, launched: true } }));
+    } catch (e: any) {
+      setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: false } }));
+      alert("Failed to launch MCP server: " + (e?.message || String(e)));
     }
   }
 
   async function stopMcpServer(mcp: McpConnection) {
-    const isLaunching = mcpHealthStatus[mcp.id]?.state === "launching";
-    // Skip confirm dialog while still establishing connection.
-    if (!isLaunching) {
-      const proceed = await askCenteredConfirm({
-        title: "Stop Bridge Server?",
-        message: `Are you sure you want to stop "${mcp.name}"?`,
-        confirmLabel: "Stop",
-        cancelLabel: "Cancel",
-      });
-      if (!proceed) return;
-    }
-
-    // Mark any pending probe as cancelled so launchMcpServer doesn't overwrite UI state.
-    mcpProbeAbortedRef.current.add(mcp.id);
+    const proceed = await askCenteredConfirm({
+      title: "Stop Bridge Server?",
+      message: `Are you sure you want to stop "${mcp.name}"?`,
+      confirmLabel: "Stop",
+      cancelLabel: "Cancel",
+    });
+    if (!proceed) return;
 
     try {
-      await invoke("stop_mcp_server", { mcpId: mcp.id });
-    } catch (_) { /* ignore */ }
-    setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: false } }));
-    setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "stopped", message: "stopped" } }));
+      const stopped = await invoke("stop_mcp_server", { mcpId: mcp.id }) as boolean;
+      if (stopped) {
+        setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: false } }));
+      }
+    } catch (e: any) {
+      alert("Failed to stop bridge: " + (e?.message || String(e)));
+    }
   }
 
   async function toggleMcpServer(mcp: McpConnection) {
@@ -4742,15 +3909,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     setProjectDescriptionDrafts((prev) => ({ ...prev, [projectId]: draft }));
     setProjectManipulationRootDrafts((prev) => ({ ...prev, [projectId]: manipulationRootPath }));
     setProjectDescriptionDirty((prev) => ({ ...prev, [projectId]: false }));
-  }
-
-  function queueProjectDraftAutosave(projectId: string) {
-    const existing = projectDraftSaveTimerRef.current[projectId];
-    if (existing) clearTimeout(existing);
-    projectDraftSaveTimerRef.current[projectId] = setTimeout(() => {
-      void saveProjectDescription(projectId);
-      delete projectDraftSaveTimerRef.current[projectId];
-    }, 900);
   }
 
   async function saveUserPersonaPrompt() {
@@ -5199,7 +4357,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 onClick={e => e.stopPropagation()}
                 style={{ position: "relative" }}
               >
-                <span>Development</span><span>▶</span>
+                Development ▶
                 {openSubmenu === "development" && (
                   <div
                     className="submenu"
@@ -5226,22 +4384,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     </div>
                   </div>
                 )}
-              </div>
-
-              <div
-                className="dropdown-item"
-                onClick={async (e) => {
-                  e.stopPropagation();
-                  const next = !desktopDashboardEnabled;
-                  setDesktopDashboardEnabled(next);
-                  try {
-                    await invoke("set_setup_flags", { args: { desktopDashboardEnabled: next } });
-                  } catch {}
-                  setOpenSubmenu(null);
-                  setOpenMenu(null);
-                }}
-              >
-                <span>{desktopDashboardEnabled ? "✓ " : ""}Desktop Dashboard</span>
               </div>
             </div>
           )}
@@ -5314,9 +4456,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           </div>
         ))}
         {currentTab?.type === "chat" && (
-          <div style={{ marginLeft: "auto", paddingRight: 12, display: "flex", alignItems: "center", gap: 8, position: "relative" }}>
+          <div style={{ marginLeft: "auto", paddingRight: 12, display: "flex", alignItems: "center", gap: 8 }}>
             {showChatBridgeControls && (
-              <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
                 <button
                   className={`setup-btn${chatBridgePanelOpen ? " primary" : ""}`}
                   onClick={() => setChatBridgePanelOpen((v) => !v)}
@@ -5325,83 +4467,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   Bridge Servers
                 </button>
                 {chatBridgePanelOpen && (
-                  <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, minWidth: 320, maxWidth: 460, maxHeight: 420, overflowY: "auto", border: "1px solid var(--app-border)", borderRadius: 8, padding: 8, background: "var(--app-panel-bg)", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 6px 18px rgba(0,0,0,0.35)", zIndex: 280 }}>
-                    {launchableProjectMcps.length > 1 && (
-                      <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
-                        <button
-                          className="setup-btn"
-                          onClick={() => {
-                            for (const mcp of launchableProjectMcps) {
-                              if (!mcpLaunchStatus[mcp.id]?.launched) {
-                                void launchMcpServer(mcp);
-                              }
-                            }
-                          }}
-                        >
-                          Launch All MCP
-                        </button>
-                        <button
-                          className="setup-btn"
-                          onClick={() => {
-                            for (const mcp of launchableProjectMcps) {
-                              if (mcpLaunchStatus[mcp.id]?.launched) {
-                                void stopMcpServer(mcp);
-                              }
-                            }
-                          }}
-                        >
-                          Stop All MCP
-                        </button>
-                      </div>
-                    )}
+                  <div style={{ minWidth: 280, border: "1px solid var(--app-border)", borderRadius: 8, padding: 8, background: "var(--app-panel-bg)", display: "flex", flexDirection: "column", gap: 6 }}>
                     {launchableProjectMcps.map((mcp) => (
                       <div key={`chat_mcp_${mcp.id}`} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                         <div style={{ fontSize: 12, color: "var(--app-text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          <div>
-                            {mcp.name}
-                            <span style={{ marginLeft: 6, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
-                              {mcpLaunchStatus[mcp.id]?.launched
-                                ? `(PID ${mcpLaunchStatus[mcp.id].pid})`
-                                : "(stopped)"}
-                            </span>
-                          </div>
-                          {mcpHealthStatus[mcp.id]?.message && mcpHealthStatus[mcp.id]?.state !== "error" && (
-                            <div style={{ color: isLightMode ? "#2f5f3b" : "#9be7b1" }}>
-                              {mcpHealthStatus[mcp.id]?.message}
-                            </div>
-                          )}
-                          {mcpHealthStatus[mcp.id]?.message && mcpHealthStatus[mcp.id]?.state === "error" && (
-                            <div style={{ color: isLightMode ? "#8b2b2b" : "#ff9f9f" }}>
-                              {mcpHealthStatus[mcp.id]?.message}
-                            </div>
-                          )}
+                          {mcp.name}
+                          <span style={{ marginLeft: 6, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
+                            {mcpLaunchStatus[mcp.id]?.launched ? `(PID ${mcpLaunchStatus[mcp.id].pid})` : "(stopped)"}
+                          </span>
                         </div>
-                        <div style={{ display: "flex", gap: 6 }}>
-                          <button className="setup-btn" onClick={() => toggleMcpServer(mcp)}>
-                            {mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
-                          </button>
-                          <button
-                            className="setup-btn"
-                            onClick={async () => {
-                              setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "launching", message: "checking..." } }));
-                              try {
-                                const readiness = await probeMcpReadiness(mcp);
-                                setMcpHealthStatus((prev) => ({
-                                  ...prev,
-                                  [mcp.id]: {
-                                    state: readiness.connected ? "connected" : "bridge_up",
-                                    message: readiness.message,
-                                    toolCount: readiness.toolCount,
-                                  },
-                                }));
-                              } catch (err: any) {
-                                setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: String(err?.message || err || "not connected") } }));
-                              }
-                            }}
-                          >
-                            Check
-                          </button>
-                        </div>
+                        <button className="setup-btn" onClick={() => toggleMcpServer(mcp)}>
+                          {mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
+                        </button>
                       </div>
                     ))}
                     {launchableProjectSsh.map((ssh) => {
@@ -5494,110 +4571,49 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               {thinkingSeconds >= 14 ? " (first response after launch can take up to about a minute)" : ""}
             </div>
           )}
-          {Array.isArray(workLogByTab[activeTab]) && workLogByTab[activeTab].length > 0 && (
-            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, lineHeight: 1.35 }}>
-              {workLogByTab[activeTab].slice(-5).map((entry, idx) => (
-                <div key={`${entry.ts}_${idx}`}>• {entry.text}</div>
-              ))}
-            </div>
-          )}
         </div>
       )}
 
-      {currentTab?.type === "chat" && activeRoutine && activeRoutineTabId === activeTab && (() => {
-        const activeStep = activeRoutine.steps.find(s => s.status === "running") ??
-          activeRoutine.steps.find(s => s.status === "pending") ?? null;
-        const doneCount = activeRoutine.steps.filter(s => s.status === "done").length;
-        return (
-          <div className="routine-card">
-            <div className="routine-header">
-              <strong>Routine:</strong> {activeRoutine.goal}
-              <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
-                <button
-                  type="button"
-                  className="setup-btn"
-                  style={{ padding: "2px 7px", fontSize: 11 }}
-                  onClick={() => setRoutineExpanded(e => !e)}
-                  title={routineExpanded ? "Collapse steps" : "Expand all steps"}
-                >
-                  {routineExpanded ? "▲" : "▼"} {doneCount}/{activeRoutine.steps.length}
-                </button>
-                <button
-                  type="button"
-                  className="setup-btn"
-                  style={{ padding: "2px 7px", fontSize: 11 }}
-                  onClick={() => { setActiveRoutine(null); setActiveRoutineTabId(null); setRoutineExpanded(false); }}
-                >
-                  ✕
-                </button>
-              </span>
-            </div>
-            {!routineExpanded && activeStep && (
-              <div className="routine-step running" style={{ marginTop: 4 }}>
-                <span className="routine-step-label">{activeStep.label}</span>
-                <span className="routine-step-status">{activeStep.status}</span>
-              </div>
-            )}
-            {routineExpanded && (
-              <>
-                <div className="routine-meta" style={{ marginTop: 4 }}>
-                  {activeRoutine.status.replace("_", " ")}
-                  {activeRoutine.isLongRunning ? " · long-running" : ""}
-                  {windowList.length ? ` · ${windowList.length} windows` : ""}
-                </div>
-                <div className="routine-steps">
-                  {activeRoutine.steps.map((s) => (
-                    <div key={s.id} className={`routine-step ${s.status}`}>
-                      <span className="routine-step-label">{s.label}</span>
-                      <span className="routine-step-status">{s.status}</span>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
+      {currentTab?.type === "chat" && activeRoutine && activeRoutineTabId === activeTab && (
+        <div className="routine-card">
+          <div className="routine-header">
+            <strong>Routine:</strong> {activeRoutine.goal}
+            <button
+              type="button"
+              className="setup-btn"
+              style={{ marginLeft: "auto", padding: "4px 8px", fontSize: 12 }}
+              onClick={() => {
+                setActiveRoutine(null);
+                setActiveRoutineTabId(null);
+              }}
+            >
+              Close
+            </button>
           </div>
-        );
-      })()}
-
-      {currentTab?.type === "chat" && desktopDashboardEnabled && (() => {
-        const latestImage = [...(currentTab.messages || [])]
-          .reverse()
-          .find((m: any) => Array.isArray(m?.images) && m.images.length > 0)?.images?.[0] as string | undefined;
-        return (
-          <div className="routine-card" style={{ marginTop: 8 }}>
-            <div className="routine-header">
-              <strong>Desktop Dashboard</strong>
-              <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.65 }}>·</span>
-              <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>
-                {windowList.length > 0 ? `${windowList.length} window${windowList.length !== 1 ? "s" : ""}` : "no windows detected"}
-              </span>
-            </div>
-            <div className="routine-meta" style={{ marginTop: 4 }}>
-              Project: {activeProject?.name || "none"} · MCP linked: {launchableProjectMcps.length}
-            </div>
-            {systemStats && (
-              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8, display: "flex", gap: 12 }}>
-                <span>CPU: {systemStats.cpuPercent.toFixed(1)}%</span>
-                <span>RAM: {systemStats.memUsedMb.toLocaleString()} / {systemStats.memTotalMb.toLocaleString()} MB</span>
-              </div>
-            )}
-            {windowList.length > 0 && (
-              <div style={{ marginTop: 4, fontSize: 11, opacity: 0.65, lineHeight: 1.4 }}>
-                {windowList.slice(0, 5).map((w, i) => (
-                  <div key={i}>▸ {w.title}</div>
-                ))}
-                {windowList.length > 5 && <div>…and {windowList.length - 5} more</div>}
-              </div>
-            )}
-            {latestImage && (
-              <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
-                <img src={latestImage} alt="Latest capture" style={{ width: 110, height: 64, objectFit: "cover", borderRadius: 6, border: "1px solid var(--app-border)" }} />
-                <span style={{ fontSize: 12, opacity: 0.85 }}>Latest captured frame</span>
-              </div>
-            )}
+          <div className="routine-meta">
+            Status: {activeRoutine.status.replace("_", " ")}
+            {activeRoutine.isLongRunning ? " | Long-running" : ""}
+            {windowList.length ? ` | Windows detected: ${windowList.length}` : ""}
           </div>
-        );
-      })()}
+          {windowList.length > 0 && (
+            <div className="routine-window-list">
+              {windowList.slice(0, 5).map((w) => (
+                <span key={`${w.id}_${w.title}`} className="routine-window-pill">
+                  {w.title}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="routine-steps">
+            {activeRoutine.steps.map((s) => (
+              <div key={s.id} className={`routine-step ${s.status}`}>
+                <span className="routine-step-label">{s.label}</span>
+                <span className="routine-step-status">{s.status}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {currentTab?.type === "chat" && (
         <div className="chat-history" ref={historyRef}>
@@ -5870,34 +4886,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       <button
                         className="setup-btn"
                         onClick={async () => {
-                          const proceed = await askCenteredConfirm({
-                            title: "Remove Repository",
-                            message: `Remove repository "${repo.name}" from settings?`,
-                            confirmLabel: "Remove",
-                            cancelLabel: "Cancel",
-                          });
-                          if (!proceed) return;
-                          const nextRepos = repoStore.repos.filter((r) => r.id !== repo.id);
-                          const nextProjects = repoStore.projects.map((p) => ({
-                            ...p,
-                            repoIds: p.repoIds.filter((rid) => rid !== repo.id),
-                            entryIds: p.entryIds.filter((eid) => !repo.entries.some((e) => e.id === eid)),
-                            mcpIds: p.mcpIds || [],
-                          }));
-                          await persistRepoStore({ repos: nextRepos, mcps: repoStore.mcps, sshs: repoStore.sshs, projects: nextProjects });
-                        }}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                    <div style={{ fontSize: 12, color: isLightMode ? "#495a6a" : "#a7a7a7", marginBottom: 8 }}>{repo.path}</div>
-                    {!!repoAutoStatus[repo.id] && (
-                      <div style={{ fontSize: 12, color: "#8fb2ff", marginBottom: 8 }}>{repoAutoStatus[repo.id]}</div>
-                    )}
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
-                      <button
-                        className="setup-btn"
-                        onClick={async () => {
                           await handleRefreshRepo(repo.id);
                         }}
                       >
@@ -5936,7 +4924,33 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       >
                         None
                       </button>
+                      <button
+                        className="setup-btn"
+                        onClick={async () => {
+                          const proceed = await askCenteredConfirm({
+                            title: "Remove Repository",
+                            message: `Remove repository "${repo.name}" from settings?`,
+                            confirmLabel: "Remove",
+                            cancelLabel: "Cancel",
+                          });
+                          if (!proceed) return;
+                          const nextRepos = repoStore.repos.filter((r) => r.id !== repo.id);
+                          const nextProjects = repoStore.projects.map((p) => ({
+                            ...p,
+                            repoIds: p.repoIds.filter((rid) => rid !== repo.id),
+                            entryIds: p.entryIds.filter((eid) => !repo.entries.some((e) => e.id === eid)),
+                            mcpIds: p.mcpIds || [],
+                          }));
+                          await persistRepoStore({ repos: nextRepos, mcps: repoStore.mcps, sshs: repoStore.sshs, projects: nextProjects });
+                        }}
+                      >
+                        Remove
+                      </button>
                     </div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#495a6a" : "#a7a7a7", marginBottom: 8 }}>{repo.path}</div>
+                    {!!repoAutoStatus[repo.id] && (
+                      <div style={{ fontSize: 12, color: "#8fb2ff", marginBottom: 8 }}>{repoAutoStatus[repo.id]}</div>
+                    )}
                     <div style={{ border: "1px solid #323232", borderRadius: 8, maxHeight: 220, overflowY: "auto", padding: 8 }}>
                       {buildRepoTree(repo).map((node) => {
                         const renderNode = (n: RepoTreeNode, depth: number) => {
@@ -6102,6 +5116,41 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           />
                           Enabled
                         </label>
+                        <button
+                          className="setup-btn"
+                          onClick={async () => {
+                            await handleRefreshProject(project);
+                          }}
+                        >
+                          Refresh
+                        </button>
+                        <button
+                          className="setup-btn"
+                          onClick={async () => {
+                            await handleAutoSelectProjectEntries(project, availableEntries);
+                          }}
+                          disabled={projectAutoSelectingId === project.id}
+                        >
+                          {projectAutoSelectingId === project.id ? "Automatic..." : "Automatic"}
+                        </button>
+                        <button
+                          className="setup-btn"
+                          onClick={async () => {
+                            await updateProjectEntrySelection(project.id, availableEntries.map((e) => e.id));
+                            setProjectAutoStatus((prev) => ({ ...prev, [project.id]: `All selected: ${availableEntries.length}` }));
+                          }}
+                        >
+                          All
+                        </button>
+                        <button
+                          className="setup-btn"
+                          onClick={async () => {
+                            await updateProjectEntrySelection(project.id, []);
+                            setProjectAutoStatus((prev) => ({ ...prev, [project.id]: "None selected" }));
+                          }}
+                        >
+                          None
+                        </button>
                         <label style={{ fontSize: 12, color: "var(--app-text)", border: "1px solid var(--app-border)", borderRadius: 6, padding: "4px 8px" }}>
                           <input
                             type="checkbox"
@@ -6151,6 +5200,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           Remove
                         </button>
                       </div>
+                      {!!projectAutoStatus[project.id] && (
+                        <div style={{ fontSize: 12, color: "#8fb2ff", marginBottom: 8 }}>{projectAutoStatus[project.id]}</div>
+                      )}
+
                       <div style={{ marginBottom: 8 }}>
                         <label style={{ display: "block", fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Description</label>
                         <textarea
@@ -6158,8 +5211,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           onChange={(e) => {
                             const draft = e.target.value;
                             setProjectDescriptionDrafts((prev) => ({ ...prev, [project.id]: draft }));
-                            setProjectDescriptionDirty((prev) => ({ ...prev, [project.id]: true }));
-                            queueProjectDraftAutosave(project.id);
+                            setProjectDescriptionDirty((prev) => ({
+                              ...prev,
+                              [project.id]: draft.trim() !== (project.description || "").trim() || (projectManipulationRootDrafts[project.id] ?? project.manipulationRootPath ?? "").trim() !== (project.manipulationRootPath || "").trim(),
+                            }));
                           }}
                           rows={3}
                           style={{ width: "100%", boxSizing: "border-box", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)", padding: 8 }}
@@ -6185,8 +5240,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                             onChange={(e) => {
                               const draft = e.target.value;
                               setProjectManipulationRootDrafts((prev) => ({ ...prev, [project.id]: draft }));
-                              setProjectDescriptionDirty((prev) => ({ ...prev, [project.id]: true }));
-                              queueProjectDraftAutosave(project.id);
+                              setProjectDescriptionDirty((prev) => ({
+                                ...prev,
+                                [project.id]: draft.trim() !== (project.manipulationRootPath || "").trim() || (projectDescriptionDrafts[project.id] ?? project.description ?? "").trim() !== (project.description || "").trim(),
+                              }));
                             }}
                             placeholder="Choose the root project folder for Iris to edit directly"
                             style={{ flex: 1, minWidth: 280, padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
@@ -6332,46 +5389,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
                       <div>
                         <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Referenced files/folders</div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
-                          <button
-                            className="setup-btn"
-                            onClick={async () => {
-                              await handleRefreshProject(project);
-                            }}
-                          >
-                            Refresh
-                          </button>
-                          <button
-                            className="setup-btn"
-                            onClick={async () => {
-                              await handleAutoSelectProjectEntries(project, availableEntries);
-                            }}
-                            disabled={projectAutoSelectingId === project.id}
-                          >
-                            {projectAutoSelectingId === project.id ? "Automatic..." : "Automatic"}
-                          </button>
-                          <button
-                            className="setup-btn"
-                            onClick={async () => {
-                              await updateProjectEntrySelection(project.id, availableEntries.map((e) => e.id));
-                              setProjectAutoStatus((prev) => ({ ...prev, [project.id]: `All selected: ${availableEntries.length}` }));
-                            }}
-                          >
-                            All
-                          </button>
-                          <button
-                            className="setup-btn"
-                            onClick={async () => {
-                              await updateProjectEntrySelection(project.id, []);
-                              setProjectAutoStatus((prev) => ({ ...prev, [project.id]: "None selected" }));
-                            }}
-                          >
-                            None
-                          </button>
-                          {!!projectAutoStatus[project.id] && (
-                            <span style={{ fontSize: 12, color: "#8fb2ff" }}>{projectAutoStatus[project.id]}</span>
-                          )}
-                        </div>
                         <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid #313131", borderRadius: 6, padding: 6 }}>
                           {linkedRepos.map((repo) => {
                             const repoEntries = repo.entries.filter((e) => repo.selectedEntryIds.includes(e.id));
@@ -6534,7 +5551,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
               <div style={{ marginBottom: 10, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
                 Target supports standard MCP formats: URL (`http://...`, `ws://...`) or stdio command (`uv run ...`). You can also paste JSON with `command/args`.
-                Iris can infer SSH/Desktop/Filesystem/Project actions from conversational requests; slash commands remain optional for power users.
+                SSH calls can be triggered in chat with /ssh list|read|write|delete|move|mkdir|exec {"{"} ... {"}"} once an SSH connection is associated to the selected project. Desktop parity commands are available with /desktop list|read|write|delete|move|mkdir {"{"} ... {"}"} when Desktop Tools is ON and a project manipulation root is set.
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: "min(72vh, 760px)", overflowY: "auto", overflowX: "hidden", paddingRight: 4 }}>
@@ -6596,16 +5613,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     {mcpLaunchStatus[mcp.id]?.launched && (
                       <div style={{ marginBottom: 8, fontSize: 12, color: isLightMode ? "#2f5f3b" : "#9be7b1" }}>
                         Running bridge process (PID {mcpLaunchStatus[mcp.id].pid})
-                      </div>
-                    )}
-                    {mcpHealthStatus[mcp.id]?.message && mcpHealthStatus[mcp.id]?.state !== "error" && (
-                      <div style={{ marginBottom: 8, fontSize: 12, color: isLightMode ? "#2f5f3b" : "#9be7b1" }}>
-                        MCP: {mcpHealthStatus[mcp.id].message}
-                      </div>
-                    )}
-                    {mcpHealthStatus[mcp.id]?.state === "error" && (
-                      <div style={{ marginBottom: 8, fontSize: 12, color: isLightMode ? "#7e2a2a" : "#ff9f9f" }}>
-                        MCP connection check failed: {mcpHealthStatus[mcp.id]?.message || "unknown error"}
                       </div>
                     )}
 
@@ -6824,67 +5831,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <div style={{ marginTop: 10, fontSize: 12, color: isLightMode ? "#4c6074" : "#b1b1b1", lineHeight: 1.45 }}>
                 Behavior: Iris checks local project context first. For time-sensitive or internet-only topics, Iris may run a lightweight network lookup and
                 blend those hints into its response.
-              </div>
-
-              <div style={{ marginTop: 18, borderTop: "1px solid var(--app-border)", paddingTop: 14 }}>
-                <h4 style={{ margin: "0 0 8px", color: "var(--app-text)" }}>Manual App Updates</h4>
-                <p style={{ marginTop: 0, fontSize: 12, color: isLightMode ? "#4c6074" : "#b1b1b1", lineHeight: 1.45 }}>
-                  Host your installer on your Google Site, then paste those links here. Users can install/update by downloading the latest installer manually.
-                </p>
-
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ display: "block", marginBottom: 4, fontSize: 12, color: "var(--app-text)" }}>Installer download URL</label>
-                  <input
-                    value={manualDownloadUrl}
-                    onChange={(e) => setManualDownloadUrl(e.target.value)}
-                    placeholder="https://sites.google.com/.../iris-installer.exe"
-                    style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
-                  />
-                </div>
-
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ display: "block", marginBottom: 4, fontSize: 12, color: "var(--app-text)" }}>Release notes URL (optional)</label>
-                  <input
-                    value={releaseNotesUrl}
-                    onChange={(e) => setReleaseNotesUrl(e.target.value)}
-                    placeholder="https://sites.google.com/.../iris-release-notes"
-                    style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
-                  />
-                </div>
-
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <button className="setup-btn primary" onClick={saveUpdateSettings}>Save Update Links</button>
-                  <button className="setup-btn" disabled={!isValidHttpUrl(manualDownloadUrl)} onClick={() => void openExternalUpdateUrl(manualDownloadUrl)}>
-                    Open Installer Download
-                  </button>
-                  <button className="setup-btn" disabled={!isValidHttpUrl(releaseNotesUrl)} onClick={() => void openExternalUpdateUrl(releaseNotesUrl)}>
-                    Open Release Notes
-                  </button>
-                </div>
-              </div>
-
-              <div style={{ marginTop: 18, borderTop: "1px solid var(--app-border)", paddingTop: 14, opacity: 0.62 }}>
-                <h4 style={{ margin: "0 0 8px", color: "var(--app-text)" }}>Automatic Updates (Coming Soon)</h4>
-                <p style={{ marginTop: 0, fontSize: 12, color: isLightMode ? "#4c6074" : "#b1b1b1", lineHeight: 1.45 }}>
-                  Planned feature: Iris checks an update feed and downloads the newest installer automatically.
-                </p>
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ display: "block", marginBottom: 4, fontSize: 12, color: "var(--app-text)" }}>Update feed URL (reserved)</label>
-                  <input
-                    value={updateFeedUrl}
-                    onChange={(e) => setUpdateFeedUrl(e.target.value)}
-                    placeholder="https://your-site.example.com/iris/update-feed.json"
-                    style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
-                  />
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                  <input type="checkbox" checked={autoUpdatesEnabled} disabled readOnly />
-                  <span style={{ fontSize: 12, color: "var(--app-text)" }}>Enable automatic updates (disabled until update feed is finalized)</span>
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <button className="setup-btn" disabled>Check for Updates (Coming Soon)</button>
-                  <button className="setup-btn" onClick={saveUpdateSettings}>Save Reserved Feed URL</button>
-                </div>
               </div>
             </div>
           )}

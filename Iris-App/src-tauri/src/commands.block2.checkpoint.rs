@@ -11,10 +11,8 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use std::time::Duration;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::collections::hash_map::DefaultHasher;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Emitter};
-use std::hash::{Hash, Hasher};
 
 // Extended ChatMessage with a unix timestamp (defaults to 0 when missing on disk)
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -28,7 +26,7 @@ pub struct ChatMessage {
 
 
 use std::{fs, path::PathBuf};
-use std::io::{Write, BufRead, BufReader};
+use std::io::{Write, Read, BufRead, BufReader};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static OLLAMA_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -37,25 +35,16 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
 const MODEL_TAG: &str = "iris-organizer:latest";
 
-/// Which stdio framing protocol the MCP server speaks.
-/// NDJSON = one JSON object per line (MCP Python SDK 1.x / official spec)
-/// Lsp    = LSP Content-Length header framing (TypeScript MCP SDK / older servers)
-#[derive(Debug, Clone, PartialEq)]
-enum McpProtocol { Ndjson, Lsp }
-
 struct McpStdioSession {
   child: std::process::Child,
   stdin: std::process::ChildStdin,
   stdout: BufReader<std::process::ChildStdout>,
   next_id: u64,
   initialized: bool,
-  protocol: McpProtocol,
 }
 
 static MCP_STDIO_SESSIONS: OnceLock<Mutex<HashMap<String, McpStdioSession>>> = OnceLock::new();
 static MCP_LAUNCHED_PROCS: OnceLock<Mutex<HashMap<String, std::process::Child>>> = OnceLock::new();
-// Separate PID map so the kill-timer can kill a session process without acquiring the session lock.
-static MCP_SESSION_PIDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 
 fn mcp_sessions() -> &'static Mutex<HashMap<String, McpStdioSession>> {
   MCP_STDIO_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -63,40 +52,6 @@ fn mcp_sessions() -> &'static Mutex<HashMap<String, McpStdioSession>> {
 
 fn mcp_launched_procs() -> &'static Mutex<HashMap<String, std::process::Child>> {
   MCP_LAUNCHED_PROCS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn mcp_session_pids() -> &'static Mutex<HashMap<String, u32>> {
-  MCP_SESSION_PIDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Kill a process by PID using the OS.  Does NOT require the mcp_sessions lock.
-fn kill_pid_by_os(pid: u32) {
-  #[cfg(target_os = "windows")]
-  {
-    let _ = Command::new("taskkill")
-      .args(["/PID", &pid.to_string(), "/F"])
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn();
-  }
-  #[cfg(not(target_os = "windows"))]
-  {
-    let _ = Command::new("kill")
-      .args(["-TERM", &pid.to_string()])
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn();
-  }
-}
-
-/// Kill the stdio session process by PID (no sessions lock needed), then clean up the maps.
-fn kill_mcp_by_pid_if_known(mcp_id: &str) {
-  let pid = mcp_session_pids().lock().ok().and_then(|g| g.get(mcp_id).copied());
-  if let Some(p) = pid {
-    kill_pid_by_os(p);
-  }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -114,8 +69,6 @@ pub struct McpToolInfo {
 pub struct McpConnectResult {
   pub connected: bool,
   pub pid: Option<u32>,
-  /// Which stdio framing protocol was auto-detected ("ndjson" or "lsp"), or None for HTTP.
-  pub protocol: Option<String>,
 }
 
 fn parse_mcp_target(raw: &str) -> (String, Option<String>, Vec<String>) {
@@ -159,19 +112,8 @@ fn parse_mcp_target(raw: &str) -> (String, Option<String>, Vec<String>) {
   if parts.is_empty() {
     ("url".to_string(), None, vec![])
   } else {
-    let mut args = parts[1..].to_vec();
-    if parts[0].to_ascii_lowercase().ends_with("uv.exe") || parts[0].eq_ignore_ascii_case("uv") {
-      if args.first().map(|a| a.eq_ignore_ascii_case("uv")).unwrap_or(false) {
-        args = args.into_iter().skip(1).collect();
-      }
-    }
-    ("stdio".to_string(), Some(parts[0].clone()), args)
+    ("stdio".to_string(), Some(parts[0].clone()), parts[1..].to_vec())
   }
-}
-
-fn looks_like_http_url(s: &str) -> bool {
-  let t = s.trim().to_ascii_lowercase();
-  t.starts_with("http://") || t.starts_with("https://") || t.starts_with("ws://") || t.starts_with("wss://") || t.starts_with("local://")
 }
 
 fn resolve_executable(command: &str) -> Option<String> {
@@ -193,23 +135,10 @@ fn resolve_executable(command: &str) -> Option<String> {
         }
       }
     }
-    if c.eq_ignore_ascii_case("uv") || c.eq_ignore_ascii_case("uv.exe") {
+    if c.eq_ignore_ascii_case("uv") {
       let mut candidates: Vec<std::path::PathBuf> = vec![];
       if let Ok(local) = std::env::var("LOCALAPPDATA") {
         candidates.push(std::path::Path::new(&local).join("Programs").join("uv").join("uv.exe"));
-        let winget_packages = std::path::Path::new(&local).join("Microsoft").join("WinGet").join("Packages");
-        if let Ok(rd) = std::fs::read_dir(&winget_packages) {
-          for e in rd.flatten() {
-            let p = e.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.to_ascii_lowercase().starts_with("astral-sh.uv_") {
-              let uv = p.join("uv.exe");
-              if uv.exists() {
-                candidates.push(uv);
-              }
-            }
-          }
-        }
       }
       if let Ok(profile) = std::env::var("USERPROFILE") {
         candidates.push(std::path::Path::new(&profile).join(".local").join("bin").join("uv.exe"));
@@ -225,58 +154,40 @@ fn resolve_executable(command: &str) -> Option<String> {
   Some(c.to_string())
 }
 
-fn write_mcp_framed_json(stdin: &mut std::process::ChildStdin, value: &Value, protocol: &McpProtocol) -> Result<(), String> {
-  match protocol {
-    McpProtocol::Ndjson => {
-      let mut payload = serde_json::to_vec(value).map_err(|e| format!("encode failed: {}", e))?;
-      payload.push(b'\n');
-      stdin.write_all(&payload).and_then(|_| stdin.flush()).map_err(|e| format!("write failed: {}", e))
-    }
-    McpProtocol::Lsp => {
-      let payload = serde_json::to_vec(value).map_err(|e| format!("encode failed: {}", e))?;
-      let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-      stdin.write_all(header.as_bytes())
-        .and_then(|_| stdin.write_all(&payload))
-        .and_then(|_| stdin.flush())
-        .map_err(|e| format!("write failed: {}", e))
-    }
-  }
+fn write_mcp_framed_json(stdin: &mut std::process::ChildStdin, value: &Value) -> Result<(), String> {
+  let payload = serde_json::to_vec(value).map_err(|e| format!("encode failed: {}", e))?;
+  let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+  stdin
+    .write_all(header.as_bytes())
+    .and_then(|_| stdin.write_all(&payload))
+    .and_then(|_| stdin.flush())
+    .map_err(|e| format!("write failed: {}", e))
 }
 
-fn read_mcp_framed_json(stdout: &mut BufReader<std::process::ChildStdout>, protocol: &McpProtocol) -> Result<Value, String> {
-  match protocol {
-    McpProtocol::Ndjson => {
-      loop {
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).map_err(|e| format!("read failed: {}", e))?;
-        if n == 0 { return Err("MCP server closed stdout".to_string()); }
-        let t = line.trim();
-        if t.is_empty() { continue; }
-        return serde_json::from_str(t)
-          .map_err(|e| format!("NDJSON decode failed: {} (line: {})", e, &t[..t.len().min(120)]));
-      }
+fn read_mcp_framed_json(stdout: &mut BufReader<std::process::ChildStdout>) -> Result<Value, String> {
+  let mut content_length: Option<usize> = None;
+  loop {
+    let mut line = String::new();
+    let n = stdout.read_line(&mut line).map_err(|e| format!("read header failed: {}", e))?;
+    if n == 0 {
+      return Err("MCP stream ended while reading headers".to_string());
     }
-    McpProtocol::Lsp => {
-      let mut content_length: Option<usize> = None;
-      loop {
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).map_err(|e| format!("read header failed: {}", e))?;
-        if n == 0 { return Err("MCP server closed stdout while reading LSP headers".to_string()); }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() { break; }
-        if let Some((name, val)) = trimmed.split_once(':') {
-          if name.trim().eq_ignore_ascii_case("Content-Length") {
-            content_length = val.trim().parse::<usize>().ok();
-          }
-        }
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+      break;
+    }
+    if let Some((name, val)) = trimmed.split_once(':') {
+      if name.trim().eq_ignore_ascii_case("Content-Length") {
+        content_length = val.trim().parse::<usize>().ok();
       }
-      let len = content_length.ok_or_else(|| "Missing Content-Length in LSP frame".to_string())?;
-      let mut body = vec![0u8; len];
-      use std::io::Read;
-      stdout.read_exact(&mut body).map_err(|e| format!("LSP body read failed: {}", e))?;
-      serde_json::from_slice::<Value>(&body).map_err(|e| format!("LSP JSON decode failed: {}", e))
     }
   }
+  let len = content_length.ok_or_else(|| "Missing Content-Length in MCP frame".to_string())?;
+  let mut body = vec![0u8; len];
+  stdout
+    .read_exact(&mut body)
+    .map_err(|e| format!("read body failed: {}", e))?;
+  serde_json::from_slice::<Value>(&body).map_err(|e| format!("decode body failed: {}", e))
 }
 
 fn mcp_stdio_request(session: &mut McpStdioSession, method: &str, params: Value) -> Result<Value, String> {
@@ -288,9 +199,9 @@ fn mcp_stdio_request(session: &mut McpStdioSession, method: &str, params: Value)
     "method": method,
     "params": params,
   });
-  write_mcp_framed_json(&mut session.stdin, &req, &session.protocol)?;
+  write_mcp_framed_json(&mut session.stdin, &req)?;
   loop {
-    let msg = read_mcp_framed_json(&mut session.stdout, &session.protocol)?;
+    let msg = read_mcp_framed_json(&mut session.stdout)?;
     let mid = msg.get("id").and_then(|v| v.as_u64());
     if mid != Some(id) {
       continue;
@@ -308,151 +219,73 @@ fn mcp_stdio_notify(session: &mut McpStdioSession, method: &str, params: Value) 
     "method": method,
     "params": params,
   });
-  write_mcp_framed_json(&mut session.stdin, &req, &session.protocol)
-}
-
-/// Probe result: a successfully started + initialize-responded process ready to use as a session.
-struct ProbeSuccess {
-  pid: u32,
-  protocol: McpProtocol,
-  child: std::process::Child,
-  stdin: std::process::ChildStdin,
-  reader: BufReader<std::process::ChildStdout>,
-}
-
-/// Spawn a process, send an MCP `initialize` with the given protocol, wait up to `timeout` for a
-/// JSON-RPC response.  If successful the LIVE process is returned (do not kill it).  If the probe
-/// times-out or receives an error the process is killed and an Err is returned.
-fn try_probe_protocol(
-  command: &str,
-  args: &[String],
-  protocol: McpProtocol,
-  timeout: std::time::Duration,
-) -> Result<ProbeSuccess, String> {
-  let resolved = resolve_executable(command).ok_or_else(|| format!("Command '{}' not found", command))?;
-
-  let mut child = Command::new(&resolved)
-    .args(args)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .map_err(|e| {
-      let is_uv = command.eq_ignore_ascii_case("uv") || command.eq_ignore_ascii_case("uv.exe");
-      if is_uv { format!("Failed to launch '{}': {}. Install uv (https://docs.astral.sh/uv/).", command, e) }
-      else { format!("Failed to launch '{}': {}", command, e) }
-    })?;
-
-  let pid = child.id();
-  let mut stdin = child.stdin.take().ok_or_else(|| "stdin unavailable".to_string())?;
-  let stdout = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
-  let mut reader = BufReader::new(stdout);
-
-  // Send initialize probe.
-  let init_msg = serde_json::json!({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": { "protocolVersion": "2024-11-05", "capabilities": {},
-                 "clientInfo": { "name": "Iris", "version": "0.1.0" } }
-  });
-  if let Err(e) = write_mcp_framed_json(&mut stdin, &init_msg, &protocol) {
-    let _ = child.kill(); let _ = child.wait();
-    return Err(format!("{:?} probe write failed: {}", protocol, e));
-  }
-
-  // Read response with timeout via a thread + channel.
-  // We move `reader` into the thread and get it back through the channel.
-  let proto_t = protocol.clone();
-  let (tx, rx) = std::sync::mpsc::channel::<(Result<Value, String>, BufReader<std::process::ChildStdout>)>();
-  std::thread::spawn(move || {
-    let result = read_mcp_framed_json(&mut reader, &proto_t);
-    let _ = tx.send((result, reader)); // rx dropped on timeout; send error is ignored
-  });
-
-  match rx.recv_timeout(timeout) {
-    Ok((Ok(_response), reader)) => {
-      // Probe succeeded — return the live process for reuse as the real session.
-      Ok(ProbeSuccess { pid, protocol, child, stdin, reader })
-    }
-    _ => {
-      // Timeout or I/O error: kill the probe process and fall back to the next protocol.
-      let _ = child.kill();
-      let _ = child.wait();
-      // Allow the detached reader thread time to see EOF and exit gracefully.
-      std::thread::sleep(std::time::Duration::from_millis(50));
-      Err(format!("{:?} protocol probe did not get a response within {:?}", protocol, timeout))
-    }
-  }
+  write_mcp_framed_json(&mut session.stdin, &req)
 }
 
 fn ensure_stdio_session(mcp_id: &str, command: &str, args: &[String]) -> Result<u32, String> {
-  // Check for an existing live session — release the lock before probing.
-  {
-    let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
-    if let Some(existing) = sessions.get_mut(mcp_id) {
-      if let Ok(None) = existing.child.try_wait() {
-        return Ok(existing.child.id());
-      }
-      sessions.remove(mcp_id); // dead session: clean up
+  let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
+  if let Some(existing) = sessions.get_mut(mcp_id) {
+    if let Ok(None) = existing.child.try_wait() {
+      return Ok(existing.child.id());
     }
   }
 
   let dangerous: &[char] = &[';', '&', '|', '`', '$', '>', '<', '\n', '\r'];
-  if command.chars().any(|c| dangerous.contains(&c)) { return Err("Unsafe characters in command".to_string()); }
-  for arg in args { if arg.chars().any(|c| dangerous.contains(&c)) { return Err("Unsafe characters in args".to_string()); } }
+  if command.chars().any(|c| dangerous.contains(&c)) {
+    return Err("Unsafe characters in command".to_string());
+  }
+  for arg in args {
+    if arg.chars().any(|c| dangerous.contains(&c)) {
+      return Err("Unsafe characters in args".to_string());
+    }
+  }
 
-  // Auto-detect protocol: try NDJSON first (official MCP spec), then LSP framing (TypeScript SDK).
-  // Each probe spawns a short-lived process and sends an `initialize` request with recv_timeout.
-  let probe_timeout = std::time::Duration::from_secs(8);
-  let probe = try_probe_protocol(command, args, McpProtocol::Ndjson, probe_timeout)
-    .or_else(|ndjson_err| {
-      try_probe_protocol(command, args, McpProtocol::Lsp, probe_timeout)
-        .map_err(|lsp_err| format!(
-          "MCP server did not respond to either protocol.\n  NDJSON: {}\n  LSP: {}",
-          ndjson_err, lsp_err
-        ))
+  let resolved = resolve_executable(command).ok_or_else(|| "Missing command".to_string())?;
+  let mut child = Command::new(&resolved)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| {
+      if command.eq_ignore_ascii_case("uv") {
+        format!("Failed to launch '{}': {}. Install uv or set MCP target command to the full uv.exe path.", command, e)
+      } else {
+        format!("Failed to launch '{}': {}", command, e)
+      }
     })?;
 
-  let pid = probe.pid;
-  let protocol = probe.protocol;
+  let pid = child.id();
+  let stdin = child.stdin.take().ok_or_else(|| "Failed to open MCP stdin".to_string())?;
+  let stdout = child.stdout.take().ok_or_else(|| "Failed to open MCP stdout".to_string())?;
 
-  // Store the live probe process as the real session (no second spawn needed).
-  {
-    let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
-    sessions.insert(mcp_id.to_string(), McpStdioSession {
-      child: probe.child,
-      stdin: probe.stdin,
-      stdout: probe.reader,
-      next_id: 2, // probe used id=1 for initialize
+  sessions.insert(
+    mcp_id.to_string(),
+    McpStdioSession {
+      child,
+      stdin,
+      stdout: BufReader::new(stdout),
+      next_id: 1,
       initialized: false,
-      protocol,
-    });
-  }
-  if let Ok(mut pids) = mcp_session_pids().lock() {
-    pids.insert(mcp_id.to_string(), pid);
-  }
+    },
+  );
   Ok(pid)
 }
 
-fn kill_mcp_session_process(mcp_id: &str) {
-  if let Ok(mut sessions) = mcp_sessions().lock() {
-    if let Some(mut sess) = sessions.remove(mcp_id) {
-      let _ = sess.child.kill();
-      let _ = sess.child.wait();
-    }
-  }
-  // Always clean up the pid map too.
-  if let Ok(mut pids) = mcp_session_pids().lock() {
-    pids.remove(mcp_id);
-  }
-}
-
 fn ensure_stdio_initialized(mcp_id: &str, command: &str, args: &[String]) -> Result<u32, String> {
-  // ensure_stdio_session already sent the `initialize` request as part of protocol detection.
-  // We only need to send `notifications/initialized` to complete the handshake.
   let pid = ensure_stdio_session(mcp_id, command, args)?;
   let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
   let session = sessions.get_mut(mcp_id).ok_or_else(|| "MCP session missing".to_string())?;
   if !session.initialized {
+    let _ = mcp_stdio_request(
+      session,
+      "initialize",
+      serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": { "name": "Iris", "version": "0.1.0" }
+      }),
+    )?;
     let _ = mcp_stdio_notify(session, "notifications/initialized", serde_json::json!({}));
     session.initialized = true;
   }
@@ -611,18 +444,6 @@ pub struct SetupFlags {
   #[serde(rename = "networkEnabled")]
   pub network_enabled: bool,
   #[serde(default)]
-  #[serde(rename = "manualDownloadUrl")]
-  pub manual_download_url: String,
-  #[serde(default)]
-  #[serde(rename = "releaseNotesUrl")]
-  pub release_notes_url: String,
-  #[serde(default)]
-  #[serde(rename = "updateFeedUrl")]
-  pub update_feed_url: String,
-  #[serde(default)]
-  #[serde(rename = "autoUpdatesEnabled")]
-  pub auto_updates_enabled: bool,
-  #[serde(default)]
   #[serde(rename = "reposEnabled")]
   pub repos_enabled: bool,
   #[serde(default)]
@@ -652,10 +473,6 @@ impl Default for SetupFlags {
       theme_color: "#232323".to_string(),
       theme_preset: "Black".to_string(),
       network_enabled: false,
-      manual_download_url: "".to_string(),
-      release_notes_url: "".to_string(),
-      update_feed_url: "".to_string(),
-      auto_updates_enabled: false,
       repos_enabled: true,
       mcp_enabled: true,
       desktop_tools_enabled: false,
@@ -683,14 +500,6 @@ pub struct SetupFlagsArgs {
   pub theme_preset: Option<String>,
   #[serde(default, alias = "networkEnabled")]
   pub network_enabled: Option<bool>,
-  #[serde(default, alias = "manualDownloadUrl")]
-  pub manual_download_url: Option<String>,
-  #[serde(default, alias = "releaseNotesUrl")]
-  pub release_notes_url: Option<String>,
-  #[serde(default, alias = "updateFeedUrl")]
-  pub update_feed_url: Option<String>,
-  #[serde(default, alias = "autoUpdatesEnabled")]
-  pub auto_updates_enabled: Option<bool>,
   #[serde(default, alias = "reposEnabled")]
   pub repos_enabled: Option<bool>,
   #[serde(default, alias = "mcpEnabled")]
@@ -1577,314 +1386,6 @@ pub struct RepoProjectStore {
   #[serde(default)]
   pub sshs: Vec<SshConnection>,
   pub projects: Vec<ProjectDef>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectCheckpointMeta {
-  pub id: String,
-  pub label: String,
-  pub project_id: String,
-  pub root_path: String,
-  pub created_at: i64,
-  pub file_count: usize,
-  pub total_bytes: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectCheckpointFile {
-  pub path: String,
-  pub size_bytes: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectCheckpointManifest {
-  pub meta: ProjectCheckpointMeta,
-  pub files: Vec<ProjectCheckpointFile>,
-}
-
-fn checkpoint_store_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-  let base = app
-    .path()
-    .app_data_dir()
-    .map_err(|e| e.to_string())?
-    .join("project_checkpoints");
-  create_dir_all(&base).map_err(|e| e.to_string())?;
-  Ok(base)
-}
-
-fn sanitize_checkpoint_component(value: &str) -> String {
-  let mut out = String::with_capacity(value.len());
-  for ch in value.chars() {
-    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-      out.push(ch);
-    } else {
-      out.push('_');
-    }
-  }
-  let trimmed = out.trim_matches('_');
-  if trimmed.is_empty() {
-    "project".to_string()
-  } else {
-    trimmed.to_string()
-  }
-}
-
-fn checkpoint_bucket_id(project_id: &str, root: &str) -> String {
-  let pid = project_id.trim();
-  if !pid.is_empty() {
-    return sanitize_checkpoint_component(pid);
-  }
-  let mut hasher = DefaultHasher::new();
-  root.hash(&mut hasher);
-  format!("root_{:x}", hasher.finish())
-}
-
-fn should_skip_checkpoint_dir(name: &str) -> bool {
-  matches!(
-    name,
-    ".git" | "node_modules" | "target" | "dist" | "build" | ".idea" | ".vs" | ".vscode" | ".venv" | "venv"
-  )
-}
-
-fn collect_checkpoint_files(root: &PathBuf, max_files: usize) -> Vec<PathBuf> {
-  let mut out: Vec<PathBuf> = Vec::new();
-  let mut queue: VecDeque<PathBuf> = VecDeque::new();
-  queue.push_back(root.clone());
-
-  while let Some(dir) = queue.pop_front() {
-    if out.len() >= max_files {
-      break;
-    }
-    let rd = match read_dir(&dir) {
-      Ok(v) => v,
-      Err(_) => continue,
-    };
-    for entry in rd.flatten() {
-      if out.len() >= max_files {
-        break;
-      }
-      let p = entry.path();
-      let meta = match entry.metadata() {
-        Ok(m) => m,
-        Err(_) => continue,
-      };
-      if meta.is_dir() {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if should_skip_checkpoint_dir(name) {
-          continue;
-        }
-        queue.push_back(p);
-        continue;
-      }
-      if !meta.is_file() {
-        continue;
-      }
-      if !is_text_like_file(&p) {
-        continue;
-      }
-      if meta.len() > 1_000_000 {
-        continue;
-      }
-      out.push(p);
-    }
-  }
-
-  out
-}
-
-fn checkpoint_manifest_path(checkpoint_dir: &PathBuf) -> PathBuf {
-  checkpoint_dir.join("manifest.json")
-}
-
-fn read_checkpoint_manifest(path: &PathBuf) -> Result<ProjectCheckpointManifest, String> {
-  let raw = fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-  serde_json::from_str::<ProjectCheckpointManifest>(&raw)
-    .map_err(|e| format!("Failed to parse checkpoint manifest {}: {}", path.display(), e))
-}
-
-#[tauri::command]
-pub fn capture_project_checkpoint(
-  app: tauri::AppHandle,
-  project_id: String,
-  root: String,
-  label: Option<String>,
-) -> Result<ProjectCheckpointMeta, String> {
-  let root_path = PathBuf::from(root.trim());
-  if !root_path.exists() || !root_path.is_dir() {
-    return Err("Project manipulation root is invalid".to_string());
-  }
-  let root_canon = fs::canonicalize(&root_path).map_err(|e| format!("Invalid project root: {}", e))?;
-
-  let bucket = checkpoint_bucket_id(&project_id, &root_canon.to_string_lossy());
-  let bucket_dir = checkpoint_store_root(&app)?.join(bucket);
-  create_dir_all(&bucket_dir).map_err(|e| e.to_string())?;
-
-  let checkpoint_id = format!("cp_{}", now_ts());
-  let checkpoint_dir = bucket_dir.join(&checkpoint_id);
-  let files_dir = checkpoint_dir.join("files");
-  create_dir_all(&files_dir).map_err(|e| e.to_string())?;
-
-  let mut file_records: Vec<ProjectCheckpointFile> = Vec::new();
-  let mut total_bytes: u64 = 0;
-  for src in collect_checkpoint_files(&root_canon, 4000) {
-    let rel = match src.strip_prefix(&root_canon) {
-      Ok(v) => v,
-      Err(_) => continue,
-    };
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    if rel_str.is_empty() {
-      continue;
-    }
-    let dst = files_dir.join(rel);
-    if let Some(parent) = dst.parent() {
-      create_dir_all(parent).map_err(|e| format!("Failed creating checkpoint directory: {}", e))?;
-    }
-    fs::copy(&src, &dst).map_err(|e| format!("Failed checkpointing {}: {}", src.display(), e))?;
-    let size = src.metadata().map(|m| m.len()).unwrap_or(0);
-    total_bytes = total_bytes.saturating_add(size);
-    file_records.push(ProjectCheckpointFile { path: rel_str, size_bytes: size });
-  }
-
-  let meta = ProjectCheckpointMeta {
-    id: checkpoint_id.clone(),
-    label: label.unwrap_or_default().trim().to_string(),
-    project_id: project_id.trim().to_string(),
-    root_path: root_canon.to_string_lossy().to_string(),
-    created_at: now_ts(),
-    file_count: file_records.len(),
-    total_bytes,
-  };
-  let manifest = ProjectCheckpointManifest {
-    meta: meta.clone(),
-    files: file_records,
-  };
-  let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-  atomic_write_json(&checkpoint_manifest_path(&checkpoint_dir), &manifest_json)?;
-
-  let mut checkpoints: Vec<(i64, PathBuf)> = Vec::new();
-  if let Ok(rd) = read_dir(&bucket_dir) {
-    for entry in rd.flatten() {
-      let dir = entry.path();
-      if !dir.is_dir() {
-        continue;
-      }
-      let manifest_path = checkpoint_manifest_path(&dir);
-      if !manifest_path.exists() {
-        continue;
-      }
-      if let Ok(parsed) = read_checkpoint_manifest(&manifest_path) {
-        checkpoints.push((parsed.meta.created_at, dir));
-      }
-    }
-  }
-  checkpoints.sort_by(|a, b| b.0.cmp(&a.0));
-  for (_, stale_dir) in checkpoints.into_iter().skip(8) {
-    let _ = fs::remove_dir_all(stale_dir);
-  }
-
-  Ok(meta)
-}
-
-#[tauri::command]
-pub fn list_project_checkpoints(
-  app: tauri::AppHandle,
-  project_id: String,
-  root: String,
-) -> Result<Vec<ProjectCheckpointMeta>, String> {
-  let bucket = checkpoint_bucket_id(&project_id, root.trim());
-  let bucket_dir = checkpoint_store_root(&app)?.join(bucket);
-  if !bucket_dir.exists() || !bucket_dir.is_dir() {
-    return Ok(Vec::new());
-  }
-
-  let mut out: Vec<ProjectCheckpointMeta> = Vec::new();
-  if let Ok(rd) = read_dir(&bucket_dir) {
-    for entry in rd.flatten() {
-      let dir = entry.path();
-      if !dir.is_dir() {
-        continue;
-      }
-      let manifest_path = checkpoint_manifest_path(&dir);
-      if !manifest_path.exists() {
-        continue;
-      }
-      if let Ok(parsed) = read_checkpoint_manifest(&manifest_path) {
-        out.push(parsed.meta);
-      }
-    }
-  }
-  out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-  Ok(out)
-}
-
-#[tauri::command]
-pub fn restore_project_checkpoint(
-  app: tauri::AppHandle,
-  project_id: String,
-  root: String,
-  checkpoint_id: String,
-  clean: Option<bool>,
-) -> Result<String, String> {
-  let root_path = PathBuf::from(root.trim());
-  if !root_path.exists() || !root_path.is_dir() {
-    return Err("Project manipulation root is invalid".to_string());
-  }
-  let root_canon = fs::canonicalize(&root_path).map_err(|e| format!("Invalid project root: {}", e))?;
-  let bucket = checkpoint_bucket_id(&project_id, &root_canon.to_string_lossy());
-  let checkpoint_dir = checkpoint_store_root(&app)?.join(bucket).join(checkpoint_id.trim());
-  let manifest_path = checkpoint_manifest_path(&checkpoint_dir);
-  if !manifest_path.exists() {
-    return Err("Checkpoint not found".to_string());
-  }
-  let manifest = read_checkpoint_manifest(&manifest_path)?;
-  let files_dir = checkpoint_dir.join("files");
-
-  let mut restored = 0usize;
-  let mut allowed: HashSet<String> = HashSet::new();
-  for item in &manifest.files {
-    let rel = item.path.replace('\\', "/").trim_matches('/').to_string();
-    if rel.is_empty() {
-      continue;
-    }
-    allowed.insert(rel.clone());
-    let src = files_dir.join(&rel);
-    if !src.exists() || !src.is_file() {
-      continue;
-    }
-    let dst = root_canon.join(&rel);
-    if let Some(parent) = dst.parent() {
-      create_dir_all(parent).map_err(|e| format!("Failed creating restore directory: {}", e))?;
-    }
-    fs::copy(&src, &dst).map_err(|e| format!("Failed restoring {}: {}", rel, e))?;
-    restored += 1;
-  }
-
-  let mut removed = 0usize;
-  if clean.unwrap_or(false) {
-    for existing in collect_checkpoint_files(&root_canon, 10000) {
-      let rel = match existing.strip_prefix(&root_canon) {
-        Ok(v) => v.to_string_lossy().replace('\\', "/"),
-        Err(_) => continue,
-      };
-      if rel.is_empty() || allowed.contains(&rel) {
-        continue;
-      }
-      if fs::remove_file(&existing).is_ok() {
-        removed += 1;
-      }
-    }
-  }
-
-  Ok(format!(
-    "Restored checkpoint {} to {} ({} files restored{}).",
-    manifest.meta.id,
-    root_canon.display(),
-    restored,
-    if clean.unwrap_or(false) { format!(", {} extra text files removed", removed) } else { String::new() }
-  ))
 }
 
 fn shell_single_quote(s: &str) -> String {
@@ -5400,38 +4901,14 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
 }
 
 #[tauri::command]
-pub fn get_system_stats() -> Result<serde_json::Value, String> {
-  let mut sys = System::new();
-  sys.refresh_cpu_usage();
-  // A second refresh after a brief sleep gives a more accurate delta-based CPU %
-  std::thread::sleep(std::time::Duration::from_millis(150));
-  sys.refresh_cpu_usage();
-  sys.refresh_memory();
-  let cpus = sys.cpus();
-  let cpu = if cpus.is_empty() {
-    0.0_f32
-  } else {
-    let total: f32 = cpus.iter().map(|c| c.cpu_usage()).sum();
-    ((total / cpus.len() as f32) * 10.0).round() / 10.0
-  };
-  let mem_used_mb = sys.used_memory() / 1_048_576;
-  let mem_total_mb = sys.total_memory() / 1_048_576;
-  Ok(serde_json::json!({
-    "cpuPercent": cpu,
-    "memUsedMb": mem_used_mb,
-    "memTotalMb": mem_total_mb,
-  }))
-}
-
-#[tauri::command]
 pub fn take_screenshot() -> Result<String, String> {
   let script = r#"
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 try {
-  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
   $bmp = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+  $g.CopyFromScreen([System.Drawing.Point]::Empty, [System.Drawing.Point]::Empty, $bounds.Size)
   $ms = [System.IO.MemoryStream]::new()
   $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   [Convert]::ToBase64String($ms.ToArray())
@@ -5464,37 +4941,19 @@ using System.Runtime.InteropServices;
 public static class Win32 {{
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT {{
-    public int Left;
-    public int Top;
-    public int Right;
-    public int Bottom;
-  }}
 }}
 "@
 try {{
   $p = Get-Process -Id {window_id} -ErrorAction Stop
-  if (-not $p -or $p.MainWindowHandle -eq 0) {{
-    throw "Target process has no visible main window"
+  if ($p -and $p.MainWindowHandle -ne 0) {{
+    [Win32]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+    [Win32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+    Start-Sleep -Milliseconds 220
   }}
-  $handle = $p.MainWindowHandle
-  [Win32]::ShowWindow($handle, 9) | Out-Null
-  [Win32]::SetForegroundWindow($handle) | Out-Null
-  Start-Sleep -Milliseconds 220
-
-  $rect = New-Object Win32+RECT
-  $ok = [Win32]::GetWindowRect($handle, [ref]$rect)
-  if (-not $ok) {{
-    throw "Unable to read target window bounds"
-  }}
-  $width = [Math]::Max(1, $rect.Right - $rect.Left)
-  $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
-
-  $bmp = [System.Drawing.Bitmap]::new($width, $height)
+  $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $bmp = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, [System.Drawing.Size]::new($width, $height))
+  $g.CopyFromScreen([System.Drawing.Point]::Empty, [System.Drawing.Point]::Empty, $bounds.Size)
   $ms = [System.IO.MemoryStream]::new()
   $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   [Convert]::ToBase64String($ms.ToArray())
@@ -5537,8 +4996,8 @@ pub fn launch_mcp_server(mcp_id: Option<String>, command: String, args: Vec<Stri
     .stderr(Stdio::null())
     .spawn()
     .map_err(|e| {
-      if command.eq_ignore_ascii_case("uv") || command.eq_ignore_ascii_case("uv.exe") {
-        format!("Failed to launch '{}': {}. Install uv (https://docs.astral.sh/uv/) or use the full path to uv.exe.", command, e)
+      if command.eq_ignore_ascii_case("uv") {
+        format!("Failed to launch '{}': {}. Install uv or set MCP target to the full uv.exe path.", command, e)
       } else {
         format!("Failed to launch '{}': {}", command, e)
       }
@@ -5572,7 +5031,8 @@ pub fn stop_mcp_server(mcp_id: String) -> Result<bool, String> {
   Ok(false)
 }
 
-fn connect_mcp_server_inner(
+#[tauri::command]
+pub fn connect_mcp_server(
   mcp_id: String,
   target: String,
   connection_type: Option<String>,
@@ -5580,11 +5040,7 @@ fn connect_mcp_server_inner(
   args: Option<Vec<String>>,
 ) -> Result<McpConnectResult, String> {
   let (parsed_type, parsed_cmd, parsed_args) = parse_mcp_target(&target);
-  let mut ctype = connection_type.unwrap_or(parsed_type.clone());
-  let hinted = command.clone().or(parsed_cmd.clone()).unwrap_or_else(|| target.trim().to_string());
-  if ctype == "url" && !looks_like_http_url(&hinted) {
-    ctype = "stdio".to_string();
-  }
+  let ctype = connection_type.unwrap_or(parsed_type);
 
   if ctype == "url" {
     let target_url = command.or(parsed_cmd).unwrap_or_else(|| target.trim().to_string());
@@ -5600,45 +5056,17 @@ fn connect_mcp_server_inner(
         "clientInfo": { "name": "Iris", "version": "0.1.0" }
       }),
     )?;
-    return Ok(McpConnectResult { connected: true, pid: None, protocol: Some("http".to_string()) });
+    return Ok(McpConnectResult { connected: true, pid: None });
   }
 
   let cmd = command.or(parsed_cmd).ok_or_else(|| "MCP command is required for stdio connections".to_string())?;
   let argv = args.unwrap_or(parsed_args);
   let pid = ensure_stdio_initialized(&mcp_id, &cmd, &argv)?;
-  // Retrieve the detected protocol so we can report it to the frontend.
-  let protocol_str = mcp_sessions().lock().ok()
-    .and_then(|s| s.get(&mcp_id).map(|sess| match sess.protocol { McpProtocol::Ndjson => "ndjson".to_string(), McpProtocol::Lsp => "lsp".to_string() }));
-  Ok(McpConnectResult { connected: true, pid: Some(pid), protocol: protocol_str })
+  Ok(McpConnectResult { connected: true, pid: Some(pid) })
 }
 
 #[tauri::command]
-pub async fn connect_mcp_server(
-  mcp_id: String,
-  target: String,
-  connection_type: Option<String>,
-  command: Option<String>,
-  args: Option<Vec<String>>,
-) -> Result<McpConnectResult, String> {
-  let mcp_id_for_kill = mcp_id.clone();
-  // Kill-timer: after 60 s kill the process by PID (no sessions lock needed).
-  // This makes the blocked read_line return EOF, unblocking the spawn_blocking thread.
-  let kill_handle = tokio::spawn(async move {
-    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    kill_mcp_by_pid_if_known(&mcp_id_for_kill);
-    // Give the blocking thread 1 s to see EOF and exit, then clean up the dead entry.
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    kill_mcp_session_process(&mcp_id_for_kill);
-  });
-  let task = tokio::task::spawn_blocking(move || {
-    connect_mcp_server_inner(mcp_id, target, connection_type, command, args)
-  });
-  let result = task.await.unwrap_or_else(|e| Err(format!("MCP connect task panicked: {}", e)));
-  kill_handle.abort();
-  result
-}
-
-fn mcp_list_tools_inner(
+pub fn mcp_list_tools(
   mcp_id: String,
   target: String,
   connection_type: Option<String>,
@@ -5646,11 +5074,7 @@ fn mcp_list_tools_inner(
   args: Option<Vec<String>>,
 ) -> Result<Vec<McpToolInfo>, String> {
   let (parsed_type, parsed_cmd, parsed_args) = parse_mcp_target(&target);
-  let mut ctype = connection_type.unwrap_or(parsed_type.clone());
-  let hinted = command.clone().or(parsed_cmd.clone()).unwrap_or_else(|| target.trim().to_string());
-  if ctype == "url" && !looks_like_http_url(&hinted) {
-    ctype = "stdio".to_string();
-  }
+  let ctype = connection_type.unwrap_or(parsed_type);
 
   let raw_tools = if ctype == "url" {
     let target_url = command.or(parsed_cmd).unwrap_or_else(|| target.trim().to_string());
@@ -5692,30 +5116,6 @@ fn mcp_list_tools_inner(
 }
 
 #[tauri::command]
-pub async fn mcp_list_tools(
-  mcp_id: String,
-  target: String,
-  connection_type: Option<String>,
-  command: Option<String>,
-  args: Option<Vec<String>>,
-) -> Result<Vec<McpToolInfo>, String> {
-  let mcp_id_for_kill = mcp_id.clone();
-  // Kill-timer: after 30 s, kill by PID (no sessions lock) to unblock the blocked read.
-  let kill_handle = tokio::spawn(async move {
-    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-    kill_mcp_by_pid_if_known(&mcp_id_for_kill);
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    kill_mcp_session_process(&mcp_id_for_kill);
-  });
-  let task = tokio::task::spawn_blocking(move || {
-    mcp_list_tools_inner(mcp_id, target, connection_type, command, args)
-  });
-  let result = task.await.unwrap_or_else(|e| Err(format!("MCP list_tools task panicked: {}", e)));
-  kill_handle.abort();
-  result
-}
-
-#[tauri::command]
 pub fn mcp_call_tool(
   mcp_id: String,
   target: String,
@@ -5726,11 +5126,7 @@ pub fn mcp_call_tool(
   arguments: Value,
 ) -> Result<Value, String> {
   let (parsed_type, parsed_cmd, parsed_args) = parse_mcp_target(&target);
-  let mut ctype = connection_type.unwrap_or(parsed_type.clone());
-  let hinted = command.clone().or(parsed_cmd.clone()).unwrap_or_else(|| target.trim().to_string());
-  if ctype == "url" && !looks_like_http_url(&hinted) {
-    ctype = "stdio".to_string();
-  }
+  let ctype = connection_type.unwrap_or(parsed_type);
 
   if ctype == "url" {
     let target_url = command.or(parsed_cmd).unwrap_or_else(|| target.trim().to_string());
@@ -5791,18 +5187,6 @@ pub fn set_setup_flags(app: tauri::AppHandle, args: SetupFlagsArgs) -> Result<Se
   }
   if let Some(v) = args.network_enabled {
     flags.network_enabled = v;
-  }
-  if let Some(v) = args.manual_download_url {
-    flags.manual_download_url = v.trim().to_string();
-  }
-  if let Some(v) = args.release_notes_url {
-    flags.release_notes_url = v.trim().to_string();
-  }
-  if let Some(v) = args.update_feed_url {
-    flags.update_feed_url = v.trim().to_string();
-  }
-  if let Some(v) = args.auto_updates_enabled {
-    flags.auto_updates_enabled = v;
   }
   if let Some(v) = args.repos_enabled {
     flags.repos_enabled = v;

@@ -64,6 +64,9 @@ fn main() {
             commands::weather_lookup,
             commands::get_repo_project_store,
             commands::save_repo_project_store,
+            commands::capture_project_checkpoint,
+            commands::list_project_checkpoints,
+            commands::restore_project_checkpoint,
             commands::read_project_dataweb,
             commands::write_project_dataweb,
             commands::open_project_dataweb,
@@ -79,6 +82,7 @@ fn main() {
                     commands::create_custom_modelfile,
                     commands::delete_custom_modelfile,
                     commands::list_windows,
+                    commands::get_system_stats,
                     commands::take_screenshot,
                     commands::take_window_screenshot,
                     commands::launch_mcp_server,
@@ -86,6 +90,7 @@ fn main() {
                     commands::connect_mcp_server,
                     commands::mcp_list_tools,
                     commands::mcp_call_tool,
+                    commands::ssh_tool_call,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -562,6 +562,11 @@ button {
   padding: 8px 16px;
   cursor: pointer;
   color: #e0e0e0;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .dropdown-item:hover {

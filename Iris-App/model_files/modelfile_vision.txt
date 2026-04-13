@@ -1,4 +1,3 @@
-# NICKNAME: Vision
 FROM qwen2-vl:2b-instruct
 
 SYSTEM """
