@@ -5342,6 +5342,120 @@ pub fn get_setup_flags(app: tauri::AppHandle) -> SetupFlags {
   read_setup_flags(&app)
 }
 
+#[tauri::command]
+pub fn resolve_github_release_asset(
+  repo: String,
+  prefer_msi: Option<bool>,
+  include_prerelease: Option<bool>,
+) -> Result<serde_json::Value, String> {
+  let raw_repo = repo.trim();
+  let repo_slug = if raw_repo.starts_with("http://") || raw_repo.starts_with("https://") {
+    let normalized = raw_repo.replace("github.com/", "github.com/");
+    if let Some(idx) = normalized.find("github.com/") {
+      let tail = &normalized[idx + "github.com/".len()..];
+      let parts: Vec<&str> = tail.split('/').filter(|p| !p.is_empty()).collect();
+      if parts.len() >= 2 {
+        format!("{}/{}", parts[0], parts[1])
+      } else {
+        return Err("GitHub URL must include owner/repo".to_string());
+      }
+    } else {
+      return Err("Invalid GitHub URL format".to_string());
+    }
+  } else {
+    raw_repo.to_string()
+  };
+
+  let parts: Vec<&str> = repo_slug.split('/').collect();
+  if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+    return Err("Repo must be in owner/repo format".to_string());
+  }
+
+  let prefer_msi = prefer_msi.unwrap_or(false);
+  let include_prerelease = include_prerelease.unwrap_or(true);
+  let api_url = format!("https://api.github.com/repos/{}/releases?per_page=20", repo_slug);
+  let client = Client::builder()
+    .timeout(Duration::from_secs(12))
+    .build()
+    .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+  let res = client
+    .get(&api_url)
+    .header("User-Agent", "iris-app-updater/1.0")
+    .header("Accept", "application/vnd.github+json")
+    .send()
+    .map_err(|e| format!("GitHub request failed: {}", e))?;
+  if !res.status().is_success() {
+    return Err(format!("GitHub API returned status {}", res.status()));
+  }
+  let releases: Value = res
+    .json()
+    .map_err(|e| format!("Failed to parse GitHub response: {}", e))?;
+  let arr = releases
+    .as_array()
+    .ok_or_else(|| "GitHub response was not a release list".to_string())?;
+
+  for release in arr {
+    let is_draft = release.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_prerelease = release.get("prerelease").and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_draft {
+      continue;
+    }
+    if !include_prerelease && is_prerelease {
+      continue;
+    }
+
+    let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or("(unknown)").to_string();
+    let release_url = release.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let assets = release.get("assets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let pick_asset = |is_msi: bool| -> Option<(String, String)> {
+      let mut best_setup: Option<(String, String)> = None;
+      let mut fallback: Option<(String, String)> = None;
+      for a in &assets {
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let dl = a
+          .get("browser_download_url")
+          .and_then(|v| v.as_str())
+          .unwrap_or("")
+          .to_string();
+        if name.is_empty() || dl.is_empty() {
+          continue;
+        }
+        let lower = name.to_lowercase();
+        if is_msi {
+          if lower.ends_with(".msi") {
+            return Some((name, dl));
+          }
+        } else if lower.ends_with("setup.exe") {
+          best_setup = Some((name, dl));
+        } else if lower.ends_with(".exe") {
+          fallback = Some((name, dl));
+        }
+      }
+      best_setup.or(fallback)
+    };
+
+    let picked = if prefer_msi {
+      pick_asset(true).or_else(|| pick_asset(false))
+    } else {
+      pick_asset(false).or_else(|| pick_asset(true))
+    };
+
+    if let Some((asset_name, download_url)) = picked {
+      return Ok(serde_json::json!({
+        "repo": repo_slug,
+        "tag": tag,
+        "prerelease": is_prerelease,
+        "releaseUrl": release_url,
+        "assetName": asset_name,
+        "downloadUrl": download_url,
+      }));
+    }
+  }
+
+  Err("No matching .exe/.msi asset found in recent releases".to_string())
+}
+
 // ========== routine plan types ==========
 
 #[derive(Serialize, Deserialize, Clone, Default)]

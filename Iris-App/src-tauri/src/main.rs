@@ -37,6 +37,7 @@ fn main() {
             commands::sanitize_tab_titles,
             commands::check_ollama_installed,
             commands::get_setup_flags,
+            commands::resolve_github_release_asset,
             commands::set_setup_flags,
             commands::download_and_install_ollama,
             commands::check_models_ready,

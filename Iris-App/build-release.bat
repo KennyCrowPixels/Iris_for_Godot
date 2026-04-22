@@ -9,9 +9,19 @@ set "NPM_CLI_JS="
 
 if not exist "%BUILD_OUT_DIR%" mkdir "%BUILD_OUT_DIR%"
 
+if exist "%BUILD_OUT_DIR%\*.exe" del /Q "%BUILD_OUT_DIR%\*.exe" >nul 2>nul
+if exist "%BUILD_OUT_DIR%\*.msi" del /Q "%BUILD_OUT_DIR%\*.msi" >nul 2>nul
+
+if exist "src-tauri\target\release\bundle\nsis\*.exe" del /Q "src-tauri\target\release\bundle\nsis\*.exe" >nul 2>nul
+if exist "src-tauri\target\release\bundle\msi\*.msi" del /Q "src-tauri\target\release\bundle\msi\*.msi" >nul 2>nul
+
 if exist "C:\Program Files\nodejs\node.exe" (
   set "NODE_EXE=C:\Program Files\nodejs\node.exe"
   set "PATH=C:\Program Files\nodejs;%PATH%"
+)
+
+if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
+  set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 )
 
 if exist "C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js" (

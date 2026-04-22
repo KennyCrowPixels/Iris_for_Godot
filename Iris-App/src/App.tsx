@@ -1188,6 +1188,9 @@ function App() {
   const [releaseNotesUrl, setReleaseNotesUrl] = useState("");
   const [updateFeedUrl, setUpdateFeedUrl] = useState("");
   const [autoUpdatesEnabled, setAutoUpdatesEnabled] = useState(false);
+  const [githubReleaseRepo, setGithubReleaseRepo] = useState("KennyCrowPixels/Iris_for_Godot");
+  const [preferMsiInstaller, setPreferMsiInstaller] = useState(false);
+  const [includePrereleaseInstaller, setIncludePrereleaseInstaller] = useState(true);
   // MCP draft: buffered edits, only saved to repoStore on "Save MCPs" button
   const [mcpDraft, setMcpDraft] = useState<McpConnection[]>([]);
   const [sshDraft, setSshDraft] = useState<SshConnection[]>([]);
@@ -4514,6 +4517,31 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     }
   }
 
+  async function resolveGithubReleaseInstaller() {
+    try {
+      const resolved = await invoke("resolve_github_release_asset", {
+        repo: githubReleaseRepo.trim(),
+        preferMsi: preferMsiInstaller,
+        includePrerelease: includePrereleaseInstaller,
+      }) as {
+        repo?: string;
+        tag?: string;
+        prerelease?: boolean;
+        releaseUrl?: string;
+        assetName?: string;
+        downloadUrl?: string;
+      };
+      const dl = String(resolved?.downloadUrl || "").trim();
+      const rel = String(resolved?.releaseUrl || "").trim();
+      if (dl) setManualDownloadUrl(dl);
+      if (rel) setReleaseNotesUrl(rel);
+      setUpdateFeedUrl(`https://api.github.com/repos/${String(resolved?.repo || githubReleaseRepo).trim()}/releases`);
+      alert(`Resolved latest installer: ${String(resolved?.assetName || "(unknown)")} (${String(resolved?.tag || "")})`);
+    } catch (e: any) {
+      alert("Could not resolve GitHub release installer: " + (e?.message || e));
+    }
+  }
+
   async function persistRepoStore(next: RepoProjectStore) {
     setRepoStore(next);
     try {
@@ -6831,6 +6859,32 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <p style={{ marginTop: 0, fontSize: 12, color: isLightMode ? "#4c6074" : "#b1b1b1", lineHeight: 1.45 }}>
                   Host your installer on your Google Site, then paste those links here. Users can install/update by downloading the latest installer manually.
                 </p>
+
+                <div style={{ marginBottom: 10, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10 }}>
+                  <div style={{ marginBottom: 6, fontSize: 12, color: "var(--app-text)", fontWeight: 700 }}>GitHub release source</div>
+                  <div style={{ marginBottom: 8 }}>
+                    <label style={{ display: "block", marginBottom: 4, fontSize: 12, color: "var(--app-text)" }}>GitHub repo (owner/repo or release URL)</label>
+                    <input
+                      value={githubReleaseRepo}
+                      onChange={(e) => setGithubReleaseRepo(e.target.value)}
+                      placeholder="KennyCrowPixels/Iris_for_Godot"
+                      style={{ width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                    />
+                  </div>
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 8 }}>
+                    <label style={{ fontSize: 12, color: "var(--app-text)", display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="checkbox" checked={preferMsiInstaller} onChange={(e) => setPreferMsiInstaller(e.target.checked)} />
+                      Prefer MSI (enterprise)
+                    </label>
+                    <label style={{ fontSize: 12, color: "var(--app-text)", display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="checkbox" checked={includePrereleaseInstaller} onChange={(e) => setIncludePrereleaseInstaller(e.target.checked)} />
+                      Include pre-releases
+                    </label>
+                  </div>
+                  <button className="setup-btn" onClick={() => void resolveGithubReleaseInstaller()}>
+                    Resolve Latest Installer From GitHub
+                  </button>
+                </div>
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ display: "block", marginBottom: 4, fontSize: 12, color: "var(--app-text)" }}>Installer download URL</label>
