@@ -1,8 +1,9 @@
-use std::process::{Command, Stdio};
+﻿use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use sysinfo::System;
+use regex::Regex;
 
 
 use reqwest;
@@ -370,7 +371,7 @@ fn try_probe_protocol(
 
   match rx.recv_timeout(timeout) {
     Ok((Ok(_response), reader)) => {
-      // Probe succeeded — return the live process for reuse as the real session.
+      // Probe succeeded â€” return the live process for reuse as the real session.
       Ok(ProbeSuccess { pid, protocol, child, stdin, reader })
     }
     _ => {
@@ -385,7 +386,7 @@ fn try_probe_protocol(
 }
 
 fn ensure_stdio_session(mcp_id: &str, command: &str, args: &[String]) -> Result<u32, String> {
-  // Check for an existing live session — release the lock before probing.
+  // Check for an existing live session â€” release the lock before probing.
   {
     let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
     if let Some(existing) = sessions.get_mut(mcp_id) {
@@ -746,6 +747,8 @@ pub struct InterpretTurnArgs {
   pub coder_enabled: Option<bool>,
   #[serde(default, alias = "vision_enabled", alias = "visionEnabled")]
   pub vision_enabled: Option<bool>,
+  #[serde(default, alias = "summarizer_enabled", alias = "summarizerEnabled")]
+  pub summarizer_enabled: Option<bool>,
   #[serde(default, alias = "custom_enabled_models", alias = "customEnabledModels")]
   pub custom_enabled_models: Option<Vec<String>>,
   #[serde(default, alias = "organizer_dispatch_note", alias = "organizerDispatchNote")]
@@ -843,22 +846,20 @@ fn write_setup_flags(app: &tauri::AppHandle, flags: &SetupFlags) -> Result<(), S
 }
 
 
-fn atomic_write_json(path: &PathBuf, json: &str) -> Result<(), String> {
+fn atomic_write_text(path: &PathBuf, content: &str) -> Result<(), String> {
     let mut tmp = path.clone();
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    tmp.set_extension(format!("json.tmp.{nanos}"));
+    tmp.set_extension(format!("tmp.{nanos}"));
 
     {
         let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
         f.sync_all().ok();
     }
 
     match fs::rename(&tmp, path) {
       Ok(_) => {}
       Err(rename_err) => {
-        // Windows can fail rename when destination is briefly locked.
-        // Fallback to copy+remove to keep writes resilient.
         fs::copy(&tmp, path).map_err(|copy_err| {
           format!("rename failed: {}; copy fallback failed: {}", rename_err, copy_err)
         })?;
@@ -866,6 +867,11 @@ fn atomic_write_json(path: &PathBuf, json: &str) -> Result<(), String> {
       }
     }
     Ok(())
+}
+
+
+fn atomic_write_json(path: &PathBuf, json: &str) -> Result<(), String> {
+    atomic_write_text(path, json)
 }
 
 fn now_ts() -> i64 {
@@ -925,7 +931,7 @@ fn compact_text(s: &str, max: usize) -> String {
   if collapsed.len() <= max {
     return collapsed;
   }
-  format!("{}…", &collapsed[..max.saturating_sub(1)])
+  format!("{}â€¦", &collapsed[..max.saturating_sub(1)])
 }
 
 fn contains_any(hay: &str, needles: &[&str]) -> bool {
@@ -1256,12 +1262,37 @@ fn bridge_interval(mem: &TabMemory) -> usize {
   2 + ((mem.tab_id as usize + mem.messages.len()) % 3)
 }
 
+fn explicitly_requests_long_term_memory(user_text: &str) -> bool {
+  let t = user_text.to_lowercase();
+  contains_any(&t, &[
+    "earlier in our chats",
+    "past session",
+    "last session",
+    "our notes",
+    "project notes",
+    "what did we decide",
+    "where did we leave off",
+  ])
+}
+
+fn transcript_insufficient_for_long_term(transcript: &str, user_text: &str) -> bool {
+  let chars = transcript.trim().chars().count();
+  if chars < 180 {
+    return true;
+  }
+  let t = user_text.to_lowercase();
+  let recallish = contains_any(&t, &[
+    "status", "todo", "next step", "summary", "continue", "as discussed", "from earlier",
+  ]);
+  recallish && chars < 520
+}
+
 fn should_emit_bridge(primary_intent: &str, pressure: f32, mem: &TabMemory) -> bool {
-  if primary_intent != "banter_roleplay" || pressure <= 0.58 {
+  if primary_intent != "banter_roleplay" || pressure <= 0.52 {
     return false;
   }
   let streak = banter_streak(mem);
-  if streak < 3 {
+  if streak < 2 {
     return false;
   }
   let since_last = turns_since_last_project_bridge(mem);
@@ -2104,7 +2135,7 @@ else:
 }
 
 fn ps_single_quote(s: &str) -> String {
-  s.replace('"', "''")
+  format!("'{}'", s.replace("'", "''"))
 }
 
 fn ssh_remote_powershell_with(conn: &SshConnection, payload: Value, shell: &str) -> Result<Value, String> {
@@ -2729,6 +2760,62 @@ pub fn clone_repo_into_folder(repo_url: String, destination_root: String) -> Res
 }
 
 #[tauri::command]
+pub fn update_repo_from_remote(repo_path: String) -> Result<String, String> {
+  let git_exec = resolve_git_executable().ok_or_else(|| {
+    "Git is not installed (or not discoverable yet). Install Git for Windows and restart Iris before updating repos.".to_string()
+  })?;
+
+  let root = PathBuf::from(repo_path.trim());
+  if !root.exists() || !root.is_dir() {
+    return Err("Repository folder is invalid".to_string());
+  }
+  if !root.join(".git").exists() {
+    return Err("Selected folder is not a git repository (.git missing)".to_string());
+  }
+
+  let fetch = Command::new(&git_exec)
+    .arg("-C")
+    .arg(&root)
+    .arg("fetch")
+    .arg("--all")
+    .arg("--prune")
+    .output()
+    .map_err(|e| format!("Failed to run git fetch: {}", e))?;
+  if !fetch.status.success() {
+    let stderr = String::from_utf8_lossy(&fetch.stderr).trim().to_string();
+    return Err(if stderr.is_empty() {
+      "git fetch failed".to_string()
+    } else {
+      format!("git fetch failed: {}", stderr)
+    });
+  }
+
+  let pull = Command::new(&git_exec)
+    .arg("-C")
+    .arg(&root)
+    .arg("pull")
+    .arg("--ff-only")
+    .output()
+    .map_err(|e| format!("Failed to run git pull: {}", e))?;
+  if !pull.status.success() {
+    let stderr = String::from_utf8_lossy(&pull.stderr).trim().to_string();
+    return Err(if stderr.is_empty() {
+      "git pull failed".to_string()
+    } else {
+      format!("git pull failed: {}", stderr)
+    });
+  }
+
+  let output = String::from_utf8_lossy(&pull.stdout).trim().to_string();
+  let final_msg = if output.is_empty() {
+    format!("Repository updated: {}", root.display())
+  } else {
+    format!("{}\n({})", output, root.display())
+  };
+  Ok(final_msg)
+ }
+
+#[tauri::command]
 pub fn install_repo_dependencies() -> Result<String, String> {
   // If Git is already present, no work needed.
   if resolve_git_executable().is_some() {
@@ -2860,6 +2947,30 @@ pub struct WeatherLookupResponse {
   pub source_url: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UvLookupResponse {
+  pub location: String,
+  pub uv_index: f64,
+  pub category: String,
+  pub observed_at: String,
+  pub source_url: String,
+}
+
+fn uv_index_category(value: f64) -> &'static str {
+  if value < 3.0 {
+    "low"
+  } else if value < 6.0 {
+    "moderate"
+  } else if value < 8.0 {
+    "high"
+  } else if value < 11.0 {
+    "very high"
+  } else {
+    "extreme"
+  }
+}
+
 fn weather_code_label(code: i64) -> &'static str {
   match code {
     0 => "clear sky",
@@ -2877,6 +2988,55 @@ fn weather_code_label(code: i64) -> &'static str {
     96 | 99 => "thunderstorms with hail",
     _ => "mixed conditions",
   }
+}
+
+fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
+  let raw_lower = raw_location.trim().to_lowercase();
+  let query_tokens = keyword_set(&raw_lower)
+    .into_iter()
+    .filter(|token| token.len() > 1)
+    .collect::<HashSet<_>>();
+  let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+  let admin1 = result.get("admin1").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+  let country = result.get("country").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+  let postcode = result.get("postcode").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+  let feature_code = result.get("feature_code").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+  let label = format!("{} {} {} {}", name, admin1, country, postcode);
+  let label_tokens = keyword_set(&label);
+
+  let overlap = query_tokens.iter().filter(|token| label_tokens.contains(*token)).count() as f64;
+  let mut score = overlap * 1.35;
+
+  if !name.is_empty() && (raw_lower == name || raw_lower.starts_with(&(name.clone() + ","))) {
+    score += 3.2;
+  }
+  if !admin1.is_empty() && raw_lower.contains(&admin1) {
+    score += 1.2;
+  }
+  if !postcode.is_empty() && raw_lower.contains(&postcode) {
+    score += 4.0;
+  }
+
+  if feature_code.starts_with("PPL") || feature_code.starts_with("ADM") {
+    score += 3.0;
+  }
+  if feature_code == "PPLA" || feature_code == "PPLA2" || feature_code == "PPLC" {
+    score += 1.5;
+  }
+
+  if name.chars().any(|c| c.is_ascii_digit()) {
+    score -= 3.0;
+  }
+
+  let population = result
+    .get("population")
+    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+    .unwrap_or(0.0);
+  if population > 0.0 {
+    score += (population.max(1.0).log10() - 3.0).clamp(0.0, 2.5);
+  }
+
+  score
 }
 
 async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) -> Result<(f64, f64, String), String> {
@@ -2902,7 +3062,7 @@ async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) 
   for query in query_variants {
     let geo_resp = client
       .get("https://geocoding-api.open-meteo.com/v1/search")
-      .query(&[("name", query.as_str()), ("count", "1"), ("language", "en"), ("format", "json")])
+      .query(&[("name", query.as_str()), ("count", "8"), ("language", "en"), ("format", "json")])
       .send()
       .await
       .map_err(|e| format!("Weather geocoding failed: {}", e))?;
@@ -2911,7 +3071,13 @@ async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) 
     if let Some(result) = geo_json
       .get("results")
       .and_then(|v| v.as_array())
-      .and_then(|arr| arr.first())
+      .and_then(|arr| {
+        arr.iter().max_by(|a, b| {
+          score_geocode_result(a, trimmed)
+            .partial_cmp(&score_geocode_result(b, trimmed))
+            .unwrap_or(std::cmp::Ordering::Equal)
+        })
+      })
     {
       let lat = result.get("latitude").and_then(|v| v.as_f64()).ok_or_else(|| "Missing latitude".to_string())?;
       let lon = result.get("longitude").and_then(|v| v.as_f64()).ok_or_else(|| "Missing longitude".to_string())?;
@@ -3020,6 +3186,61 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
     location: location_label,
     day_label: day_label.to_string(),
     summary,
+    source_url: "https://open-meteo.com/".to_string(),
+  })
+}
+
+#[tauri::command]
+pub async fn uv_lookup(location: String) -> Result<UvLookupResponse, String> {
+  let q = location.trim();
+  if q.is_empty() {
+    return Err("Location is required".to_string());
+  }
+
+  let client = reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(3))
+    .timeout(Duration::from_secs(8))
+    .build()
+    .map_err(|e| e.to_string())?;
+
+  let (lat, lon, location_label) = geocode_weather_location(&client, q).await?;
+
+  let resp = client
+    .get("https://api.open-meteo.com/v1/forecast")
+    .query(&[
+      ("latitude", lat.to_string()),
+      ("longitude", lon.to_string()),
+      ("current", "uv_index".to_string()),
+      ("hourly", "uv_index".to_string()),
+      ("timezone", "auto".to_string()),
+      ("forecast_days", "1".to_string()),
+    ])
+    .send()
+    .await
+    .map_err(|e| format!("UV lookup failed: {}", e))?;
+
+  let json: Value = resp.json().await.map_err(|e| format!("Invalid UV response: {}", e))?;
+  let current = json.get("current");
+  let current_uv = current.and_then(|v| v.get("uv_index")).and_then(|v| v.as_f64());
+  let current_time = current.and_then(|v| v.get("time")).and_then(|v| v.as_str()).unwrap_or("");
+
+  let (uv_index, observed_at) = if let Some(value) = current_uv {
+    (value, current_time.to_string())
+  } else {
+    let hourly = json.get("hourly").ok_or_else(|| "UV data missing".to_string())?;
+    let times = hourly.get("time").and_then(|v| v.as_array()).ok_or_else(|| "Hourly UV times missing".to_string())?;
+    let values = hourly.get("uv_index").and_then(|v| v.as_array()).ok_or_else(|| "Hourly UV index missing".to_string())?;
+    let idx = values.iter().position(|v| v.is_number()).ok_or_else(|| "No hourly UV values available".to_string())?;
+    let value = values[idx].as_f64().ok_or_else(|| "Invalid hourly UV value".to_string())?;
+    let observed = times.get(idx).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    (value, observed)
+  };
+
+  Ok(UvLookupResponse {
+    location: location_label,
+    uv_index,
+    category: uv_index_category(uv_index).to_string(),
+    observed_at,
     source_url: "https://open-meteo.com/".to_string(),
   })
 }
@@ -3190,7 +3411,7 @@ fn load_tab(app: &tauri::AppHandle, tab_id: u32) -> Result<TabMemory, String> {
 
   match iris_read_snapshot_file(&p) {
     Ok(snap) => {
-      // Convert Snapshot → TabMemory for callers that expect TabMemory
+      // Convert Snapshot â†’ TabMemory for callers that expect TabMemory
       let mut mem = TabMemory {
         tab_id,
         title: snap.title,
@@ -3298,19 +3519,20 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let use_coder_force = args.use_coder.unwrap_or(false);
   let coder_enabled = args.coder_enabled.unwrap_or(true);
   let vision_enabled = args.vision_enabled.unwrap_or(true);
+  let summarizer_enabled = args.summarizer_enabled.unwrap_or(true);
   let custom_enabled_models = args.custom_enabled_models.clone().unwrap_or_default();
   let should_use_coder = coder_enabled && (use_coder_force
     || is_coder_intent_text(&args.user_text)
     || (has_active_artifact && is_edit_followup_text(&args.user_text)));
   let model = if should_use_coder { "iris-coder:latest".to_string() } else { "iris-organizer:latest".to_string() };
-  let strategy = resolve_primary_strategy(&primary_intent, &deterministic_reply);
+  let mut strategy = resolve_primary_strategy(&primary_intent, &deterministic_reply);
 
   let lower_text = args.user_text.to_lowercase();
   let needs_vision = vision_enabled && contains_any(&lower_text, &[
     "image", "screenshot", "ui", "vision", "photo", "picture", "diagram", "look at this"
   ]);
 
-  // Planner route always starts with organizer and ends with summarizer; middle stages are capability-driven.
+  // Planner route always starts with organizer; middle stages are capability-driven.
   let mut routed_models: Vec<String> = vec!["iris-organizer".to_string()];
   if should_use_coder {
     routed_models.push("iris-coder".to_string());
@@ -3325,7 +3547,9 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       routed_models.push(trimmed.to_string());
     }
   }
-  routed_models.push("iris-summarizer".to_string());
+  if summarizer_enabled {
+    routed_models.push("iris-summarizer".to_string());
+  }
   let route_summary = format!("Planner route: {}", routed_models.join(" -> "));
   let status_hint = if should_use_coder {
     "coding".to_string()
@@ -3369,9 +3593,16 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     .map(|v| v.trim())
     .filter(|v| !v.is_empty())
     .unwrap_or(flags.model_profile.as_str());
+  let model_profile_lc = model_profile.to_ascii_lowercase();
+  let constrained_profile = model_profile_lc == "low" || model_profile_lc == "minimal";
   let network_enabled = args.network_enabled.unwrap_or(flags.network_enabled);
-  let repos_enabled = args.repos_enabled.unwrap_or(flags.repos_enabled);
-  let mcp_enabled = args.mcp_enabled.unwrap_or(flags.mcp_enabled);
+  let mut repos_enabled = args.repos_enabled.unwrap_or(flags.repos_enabled);
+  let mut mcp_enabled = args.mcp_enabled.unwrap_or(flags.mcp_enabled);
+  if constrained_profile {
+    repos_enabled = false;
+    mcp_enabled = false;
+    strategy = "latency_guard".to_string();
+  }
   let desktop_tools_enabled = args.desktop_tools_enabled.unwrap_or(flags.desktop_tools_enabled);
   let selected_project_name = args.selected_project_name.as_deref()
     .map(str::trim)
@@ -3380,6 +3611,8 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let project_context = args.project_context.as_deref().unwrap_or("").trim();
   let project_dataweb = args.project_dataweb.as_deref().unwrap_or("").trim();
   let universal_dataweb = args.universal_dataweb.as_deref().unwrap_or("").trim();
+  let allow_long_term_dataweb = explicitly_requests_long_term_memory(&args.user_text)
+    || transcript_insufficient_for_long_term(&compiled.recent_transcript, &args.user_text);
   let system_state_block = format!(
     "System state:\n- Assistant name: {}\n- Model profile: {}\n- Network: {}\n- Repos context: {}\n- MCP context: {}\n- Desktop tools: {}\n- Selected project: {}",
     assistant_name,
@@ -3394,10 +3627,10 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   if !project_context.is_empty() {
     injected_context_parts.push(format!("Project context:\n{}", project_context));
   }
-  if !project_dataweb.is_empty() {
+  if allow_long_term_dataweb && !project_dataweb.is_empty() {
     injected_context_parts.push(format!("Project dataweb memory:\n{}", project_dataweb));
   }
-  if !universal_dataweb.is_empty() {
+  if allow_long_term_dataweb && !universal_dataweb.is_empty() {
     injected_context_parts.push(format!("Universal dataweb memory:\n{}", universal_dataweb));
   }
   let injected_context_block = if injected_context_parts.is_empty() {
@@ -3462,6 +3695,46 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       goal: args.user_text.clone(),
       steps,
       is_long_running: is_action_routine,
+    })
+  } else if contains_any(&lower_text, &[
+    "keep going", "repeat", "loop", "continuously", "until done", "until complete",
+    "iterate", "step by step", "go through each", "process all", "one by one",
+    "do each", "fix all", "go through all", "complete all",
+  ]) {
+    // User wants a multi-step iterative routine defined by the LLM.
+    // Generate a plan_routine + iterate + verify + complete cycle.
+    let ts = now_ts();
+    let steps = vec![
+      RoutineStep {
+        id: format!("rs_{}_1", ts),
+        step_type: "plan".to_string(),
+        label: "Plan steps".to_string(),
+        params: Default::default(),
+      },
+      RoutineStep {
+        id: format!("rs_{}_2", ts),
+        step_type: "iterate".to_string(),
+        label: "Execute steps".to_string(),
+        params: Default::default(),
+      },
+      RoutineStep {
+        id: format!("rs_{}_3", ts),
+        step_type: "verify".to_string(),
+        label: "Self-check results".to_string(),
+        params: Default::default(),
+      },
+      RoutineStep {
+        id: format!("rs_{}_4", ts),
+        step_type: "llm_reply".to_string(),
+        label: "Summarize outcome".to_string(),
+        params: Default::default(),
+      },
+    ];
+    Some(RoutinePlan {
+      id: format!("routine_{}", ts),
+      goal: args.user_text.clone(),
+      steps,
+      is_long_running: true,
     })
   } else {
     None
@@ -3652,7 +3925,7 @@ pub async fn ensure_coder_lite_model() -> Result<String, String> {
             "prompt": " ",
             "stream": false,
             "options": { "num_predict": 1 },
-            "keep_alive": "90s"   // ← unload after 90s of inactivity
+            "keep_alive": "90s"   // â† unload after 90s of inactivity
         }))
         .send();
 
@@ -4168,7 +4441,7 @@ fn iris_read_snapshot_file(path: &std::path::Path) -> Result<Snapshot, String> {
     return Ok(snap);
   }
 
-  // Fallback: older TabMemory format — convert into Snapshot (and rewrite file)
+  // Fallback: older TabMemory format â€” convert into Snapshot (and rewrite file)
   let mres: Result<TabMemory, serde_json::Error> = from_slice(&bytes);
   if let Ok(mem) = mres {
     let now = now_ts();
@@ -4191,7 +4464,7 @@ fn iris_read_snapshot_file(path: &std::path::Path) -> Result<Snapshot, String> {
     return Ok(snap);
   }
 
-  // Neither format parsed — return combined error messages for debugging
+  // Neither format parsed â€” return combined error messages for debugging
   let s_err = sres.err().map(|e| e.to_string()).unwrap_or_else(|| "no snapshot error".into());
   let m_err = mres.err().map(|e| e.to_string()).unwrap_or_else(|| "no tabmem error".into());
   Err(format!("failed to parse snapshot: snapshot_err: {}; tabmem_err: {}", s_err, m_err))
@@ -4546,7 +4819,7 @@ fn profile_params(profile: ModelProfile, role: &str) -> (usize, usize, usize, f3
     (ModelProfile::High, "summarizer") => (1536, 24, 220, 0.09, 0.60, 24, 1.10, 128),
     (ModelProfile::High, "vision") => (2048, 48, 1100, 0.32, 0.90, 40, 1.07, 192),
 
-    // MediumHigh: 8 GB VRAM + 32 GB RAM — Developer Baseline (7B models, 3-4K context)
+    // MediumHigh: 8 GB VRAM + 32 GB RAM â€” Developer Baseline (7B models, 3-4K context)
     (ModelProfile::MediumHigh, "organizer") => (4096, 48, 1100, 0.24, 0.90, 40, 1.06, 160),
     (ModelProfile::MediumHigh, "coder") => (3072, 48, 896, 0.20, 0.90, 40, 1.06, 160),
     (ModelProfile::MediumHigh, "summarizer") => (1536, 24, 200, 0.09, 0.60, 24, 1.10, 128),
@@ -4584,7 +4857,7 @@ fn build_modelfile(custom_name: &str, from_model: &str, profile: ModelProfile) -
   let (num_ctx, num_keep, num_predict, temperature, top_p, top_k, repeat_penalty, repeat_last_n) = profile_params(profile, role);
 
   let system = match role {
-    "coder" => "You are Iris-Coder. Produce correct, minimal, runnable code.\n- Default to the shown language/framework.\n- When the user asks for code, output ONLY one fenced code block with the correct language tag. No plans or extra text.\n- For edits, return the full revised file inside the single code fence.\n- Validation first: imports, paths, interfaces.\n- No chain-of-thought.",
+    "coder" => "You are Iris-Coder. Produce correct, minimal, runnable code.\n- Default to the shown language/framework.\n- When the user asks for code, output ONLY one fenced code block with the correct language tag. No plans or extra text.\n- For edits, return the full revised file inside the single code fence.\n- Validation first: imports, paths, interfaces.\n- For Godot scene drafting, generate clean .tscn structures that can scale from simple primitives to multi-node compositions (buildings, cloud clusters, environment blocks).\n- Prefer reusable node hierarchies and clear naming so future procedural expansion is possible.\n- No chain-of-thought.",
     "summarizer" => "You are Iris-Summarizer. Output <=6 tight bullets or <=90 words.\nFacts only; preserve names, numbers, file/function ids, decisions.\nFor code/logs: extract key errors, likely causes, next actions.\nNo advice unless asked. No fluff. No chain-of-thought.",
     "vision" => "You are Iris-Vision. Analyze images and UI captures with clear, grounded observations.\nCall out uncertainty when image evidence is weak.\nPrefer concise, actionable findings over speculation.",
     _ => "You are Iris, a helpful assistant that uses provided context.\nIf context is missing, state uncertainty briefly and ask one concise clarifying question.\nNever invent project facts, files, features, or previous decisions.",
@@ -4702,51 +4975,50 @@ pub fn detect_hardware_profile() -> Result<HardwareProfile, String> {
   let cpu_cores = sys.cpus().len();
 
   let (vram_gb, gpu_name, probe_source) = probe_vram();
-
   let (detected_profile, detection_note) = if vram_gb == 0.0 {
     (
       "Minimal",
       format!("No dedicated GPU detected via {}. CPU-only inference.", probe_source),
     )
-  } else if vram_gb >= 15.5 {
+  } else if vram_gb >= 16.0 {
     (
       "Ultra",
-      format!("{:.1} GB VRAM (via {}) ≥ 16 GB — Ultra tier.", vram_gb, probe_source),
+      format!("{:.1} GB VRAM (via {}) >= 16 GB - Ultra tier.", vram_gb, probe_source),
     )
-  } else if vram_gb >= 11.5 {
+  } else if vram_gb >= 12.0 {
     (
       "High",
-      format!("{:.1} GB VRAM (via {}) ≥ 12 GB — High tier.", vram_gb, probe_source),
+      format!("{:.1} GB VRAM (via {}) >= 12 GB - High tier.", vram_gb, probe_source),
     )
   } else if vram_gb >= 7.5 && ram_gb >= 31.0 {
     (
       "MediumHigh",
       format!(
-        "{:.1} GB VRAM + {:.1} GB RAM (via {}) — Developer Baseline (Medium-High).",
+        "{:.1} GB VRAM + {:.1} GB RAM (via {}) - Developer Baseline (MediumHigh).",
         vram_gb, ram_gb, probe_source
       ),
     )
-  } else if vram_gb >= 5.5 && ram_gb >= 15.0 {
+  } else if vram_gb >= 6.0 && vram_gb <= 8.99 && ram_gb >= 16.0 {
     (
       "Medium",
       format!(
-        "{:.1} GB VRAM + {:.1} GB RAM (via {}) — Medium tier.",
+        "{:.1} GB VRAM + {:.1} GB RAM (via {}) - Medium tier.",
         vram_gb, ram_gb, probe_source
       ),
     )
-  } else if vram_gb <= 4.5 || ram_gb < 15.0 {
+  } else if vram_gb <= 4.0 || ram_gb < 16.0 {
     (
       "Low",
       format!(
-        "{:.1} GB VRAM, {:.1} GB RAM (via {}) — Low tier.",
+        "{:.1} GB VRAM, {:.1} GB RAM (via {}) - Low tier.",
         vram_gb, ram_gb, probe_source
       ),
     )
   } else {
     (
-      "Medium",
+      "Low",
       format!(
-        "{:.1} GB VRAM, {:.1} GB RAM (via {}) — defaulting to Medium.",
+        "{:.1} GB VRAM, {:.1} GB RAM (via {}) - defaulting to Low for stability.",
         vram_gb, ram_gb, probe_source
       ),
     )
@@ -4785,6 +5057,14 @@ pub struct ModelfileData {
   pub params: Vec<ModelfileParam>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelfileParamsData {
+  pub filename: String,
+  pub from_model: String,
+  pub params: Vec<ModelfileParam>,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveModelfileArgs {
@@ -4797,6 +5077,15 @@ pub struct SaveModelfileArgs {
   pub nickname: Option<String>,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveModelfileParamsArgs {
+  pub filename: String,
+  #[serde(default)]
+  pub from_model: Option<String>,
+  pub params: Vec<ModelfileParam>,
+}
+
 fn modelfile_display_name(filename: &str) -> &'static str {
   if filename.contains("organizer") { "Organizer" }
   else if filename.contains("coder") { "Coder" }
@@ -4805,8 +5094,42 @@ fn modelfile_display_name(filename: &str) -> &'static str {
   else { "" }
 }
 
+fn parse_modelfile_from_model(raw: &str) -> String {
+  let from_re = match Regex::new(r"(?im)^\s*FROM\s+(.+?)\s*$") {
+    Ok(r) => r,
+    Err(_) => return String::new(),
+  };
+  from_re
+    .captures(raw)
+    .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
+    .unwrap_or_default()
+}
+
+fn parse_modelfile_params(raw: &str) -> Vec<ModelfileParam> {
+  let param_re = match Regex::new(r"(?im)^\s*PARAMETER\s+([A-Za-z0-9_.-]+)\s+(.+?)\s*$") {
+    Ok(r) => r,
+    Err(_) => return Vec::new(),
+  };
+
+  param_re
+    .captures_iter(raw)
+    .filter_map(|caps| {
+      let key = caps.get(1)?.as_str().trim();
+      let value = caps.get(2)?.as_str().trim();
+      if key.is_empty() || value.is_empty() {
+        None
+      } else {
+        Some(ModelfileParam {
+          key: key.to_string(),
+          value: value.to_string(),
+        })
+      }
+    })
+    .collect()
+}
+
 // ---------------------------------------------------------------------------
-// ModelConfig — per-model enable flags, custom models, and organizer notes
+// ModelConfig â€” per-model enable flags, custom models, and organizer notes
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -4826,6 +5149,8 @@ pub struct ModelConfig {
   pub coder_enabled: bool,
   #[serde(default = "default_true")]
   pub vision_enabled: bool,
+  #[serde(default = "default_true")]
+  pub summarizer_enabled: bool,
   #[serde(default)]
   pub custom_models: Vec<CustomModelDef>,
   #[serde(default)]
@@ -4841,6 +5166,7 @@ impl Default for ModelConfig {
     Self {
       coder_enabled: true,
       vision_enabled: true,
+      summarizer_enabled: true,
       custom_models: Vec::new(),
       model_notes: std::collections::HashMap::new(),
       status_verbs: std::collections::HashMap::new(),
@@ -4881,16 +5207,17 @@ pub fn create_custom_modelfile(app: tauri::AppHandle, filename: String, nickname
   if !fname.ends_with(".txt") && !fname.ends_with(".modelfile") {
     return Err("Filename must end with .txt or .modelfile".to_string());
   }
-  let path = modelfile_path(Some(&app), fname)?;
+  let dir = locate_modelfiles_dir(Some(&app))?;
+  let path = dir.join(fname);
   if path.exists() {
     return Err(format!("File {} already exists", fname));
   }
   let safe_nick = nickname.trim();
   let content = format!(
-    "# NICKNAME: {}\nFROM llama3.2:3b\n\nSYSTEM \"\"\"\nYou are a helpful assistant.\n\"\"\"\n\nPARAMETER num_ctx 2048\nPARAMETER num_keep 24\nPARAMETER num_predict 512\nPARAMETER temperature 0.3\n",
+    "# NICKNAME: {}\nFROM llama3\n\nSYSTEM \"\"\"\nYou are a helpful assistant.\n\"\"\"\n\nPARAMETER num_ctx 4096\nPARAMETER temperature 0.7\n",
     safe_nick
   );
-  fs::write(&path, content).map_err(|e| format!("Failed to create {}: {}", fname, e))
+  atomic_write_text(&path, &content).map_err(|e| format!("Failed to create {}: {}", fname, e))
 }
 
 #[tauri::command]
@@ -4903,7 +5230,8 @@ pub fn delete_custom_modelfile(app: tauri::AppHandle, filename: String) -> Resul
   if defaults.contains(&fname) {
     return Err("Cannot delete a default modelfile".to_string());
   }
-  let path = modelfile_path(Some(&app), fname)?;
+  let dir = locate_modelfiles_dir(Some(&app))?;
+  let path = dir.join(fname);
   if path.exists() {
     fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", fname, e))?;
   }
@@ -4917,7 +5245,7 @@ pub fn list_modelfiles(app: tauri::AppHandle) -> Result<Vec<String>, String> {
   let entries = fs::read_dir(&dir).map_err(|e| format!("Cannot read model_files dir: {}", e))?;
   for entry in entries.flatten() {
     let name = entry.file_name().to_string_lossy().to_string();
-    if name.ends_with(".txt") || name.ends_with(".modelfile") {
+    if name.ends_with(".txt") {
       names.push(name);
     }
   }
@@ -4926,13 +5254,26 @@ pub fn list_modelfiles(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+pub fn read_modelfile_params(app: tauri::AppHandle, filename: String) -> Result<ModelfileParamsData, String> {
+  let path = modelfile_path(Some(&app), &filename)?;
+  let raw = fs::read_to_string(&path)
+    .map_err(|e| format!("Cannot read {}: {}", filename, e))?;
+
+  Ok(ModelfileParamsData {
+    filename,
+    from_model: parse_modelfile_from_model(&raw),
+    params: parse_modelfile_params(&raw),
+  })
+}
+
+#[tauri::command]
 pub fn read_modelfile_data(app: tauri::AppHandle, filename: String) -> Result<ModelfileData, String> {
   let path = modelfile_path(Some(&app), &filename)?;
   let raw = fs::read_to_string(&path)
     .map_err(|e| format!("Cannot read {}: {}", filename, e))?;
 
-  let mut from_model = String::new();
-  let mut params: Vec<ModelfileParam> = Vec::new();
+  let from_model = parse_modelfile_from_model(&raw);
+  let params = parse_modelfile_params(&raw);
   let mut system_lines: Vec<String> = Vec::new();
   let mut in_system = false;
   let mut nickname = String::new();
@@ -4943,9 +5284,7 @@ pub fn read_modelfile_data(app: tauri::AppHandle, filename: String) -> Result<Mo
       nickname = trimmed.trim_start_matches("# NICKNAME:").trim().to_string();
       continue;
     }
-    if trimmed.starts_with("FROM ") && from_model.is_empty() {
-      from_model = trimmed.trim_start_matches("FROM ").trim().to_string();
-    } else if trimmed.starts_with("SYSTEM \"\"\"") {
+    if trimmed.starts_with("SYSTEM \"\"\"") {
       in_system = true;
       let after_tag = trimmed.trim_start_matches("SYSTEM").trim().trim_start_matches("\"\"\"");
       let closes_inline = after_tag.ends_with("\"\"\"") && after_tag.len() > 3;
@@ -4960,13 +5299,6 @@ pub fn read_modelfile_data(app: tauri::AppHandle, filename: String) -> Result<Mo
         in_system = false;
       } else {
         system_lines.push(line.to_string());
-      }
-    } else if trimmed.starts_with("PARAMETER ") {
-      let rest = trimmed.trim_start_matches("PARAMETER ").trim();
-      if let Some(space_pos) = rest.find(' ') {
-        let key = rest[..space_pos].trim().to_string();
-        let value = rest[space_pos..].trim().to_string();
-        params.push(ModelfileParam { key, value });
       }
     }
   }
@@ -5094,18 +5426,73 @@ pub fn save_modelfile_data(app: tauri::AppHandle, args: SaveModelfileArgs) -> Re
     }
   }
 
-  let dir = path.parent().ok_or_else(|| "No parent dir".to_string())?;
-  let nanos = std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .unwrap_or_default()
-    .as_nanos();
-  let tmp_path = dir.join(format!(".iris_tmp_{}.txt", nanos));
-  fs::write(&tmp_path, out_lines.join("\n"))
-    .map_err(|e| format!("Failed to write temp file: {}", e))?;
-  fs::rename(&tmp_path, &path).map_err(|e| {
-    let _ = fs::remove_file(&tmp_path);
-    format!("Failed to rename to {}: {}", path.display(), e)
-  })?;
+  atomic_write_text(&path, &out_lines.join("\n"))?;
+
+  Ok(())
+}
+
+#[tauri::command]
+pub fn save_modelfile_params(app: tauri::AppHandle, args: SaveModelfileParamsArgs) -> Result<(), String> {
+  let fname = args.filename.trim();
+  if fname.contains("..") || fname.contains("/") || fname.contains("\\") {
+    return Err("Invalid filename: must not contain path separators or '..'".to_string());
+  }
+  if !fname.ends_with(".txt") && !fname.ends_with(".modelfile") {
+    return Err("Invalid filename: must end with .txt or .modelfile".to_string());
+  }
+
+  let path = modelfile_path(Some(&app), fname)?;
+  let raw = fs::read_to_string(&path)
+    .map_err(|e| format!("Cannot read {}: {}", fname, e))?;
+  let fallback_from = parse_modelfile_from_model(&raw);
+  let from_model = args
+    .from_model
+    .as_deref()
+    .map(str::trim)
+    .filter(|v| !v.is_empty())
+    .unwrap_or(fallback_from.as_str())
+    .to_string();
+
+  let mut out_lines: Vec<String> = Vec::new();
+  let mut from_replaced = false;
+  let mut params_written = false;
+  let mut in_params_section = false;
+
+  for line in raw.lines() {
+    let trimmed = line.trim();
+    if trimmed.starts_with("FROM ") && !from_replaced {
+      out_lines.push(format!("FROM {}", from_model));
+      from_replaced = true;
+      continue;
+    }
+    if trimmed.starts_with("PARAMETER ") {
+      in_params_section = true;
+      continue;
+    }
+    if in_params_section && !trimmed.starts_with("PARAMETER ") && !params_written {
+      for p in &args.params {
+        out_lines.push(format!("PARAMETER {} {}", p.key, p.value));
+      }
+      params_written = true;
+      in_params_section = false;
+    }
+    out_lines.push(line.to_string());
+  }
+
+  if !from_replaced {
+    out_lines.insert(0, format!("FROM {}", from_model));
+  }
+
+  if !params_written {
+    if out_lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+      out_lines.push(String::new());
+    }
+    for p in &args.params {
+      out_lines.push(format!("PARAMETER {} {}", p.key, p.value));
+    }
+  }
+
+  atomic_write_text(&path, &out_lines.join("\n"))?;
 
   Ok(())
 }
@@ -5629,6 +6016,161 @@ try {{
     return Err("Window screenshot returned empty data".to_string());
   }
   Ok(raw)
+}
+
+fn resolve_desktop_launch_target(target: &str) -> String {
+  let normalized = target.trim().to_lowercase();
+  match normalized.as_str() {
+    "ms project" | "microsoft project" | "project professional" | "project standard" => "WINPROJ.EXE".to_string(),
+    "visual studio code" | "vs code" | "vscode" => "code".to_string(),
+    "file explorer" | "windows explorer" | "explorer" => "explorer.exe".to_string(),
+    "calculator" => "calc.exe".to_string(),
+    "notepad" => "notepad.exe".to_string(),
+    "paint" | "mspaint" => "mspaint.exe".to_string(),
+    "command prompt" | "cmd" => "cmd.exe".to_string(),
+    "powershell" => "powershell.exe".to_string(),
+    _ => target.trim().to_string(),
+  }
+}
+
+#[tauri::command]
+pub fn launch_desktop_item(target: String, args: Option<Vec<String>>) -> Result<String, String> {
+  let trimmed = target.trim();
+  if trimmed.is_empty() {
+    return Err("Desktop launch target is required".to_string());
+  }
+
+  let resolved = resolve_desktop_launch_target(trimmed);
+  let arg_items = args
+    .unwrap_or_default()
+    .into_iter()
+    .map(|arg| ps_single_quote(&arg))
+    .collect::<Vec<_>>();
+  let script = if arg_items.is_empty() {
+    format!(
+      "$ErrorActionPreference='Stop'; Start-Process -FilePath {} | Out-Null; Write-Output {}",
+      ps_single_quote(&resolved),
+      ps_single_quote(&format!("Opened {}", trimmed))
+    )
+  } else {
+    format!(
+      "$ErrorActionPreference='Stop'; $irisArgs = @({}); Start-Process -FilePath {} -ArgumentList $irisArgs | Out-Null; Write-Output {}",
+      arg_items.join(", "),
+      ps_single_quote(&resolved),
+      ps_single_quote(&format!("Opened {}", trimmed))
+    )
+  };
+
+  let output = Command::new("powershell")
+    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+    .output()
+    .map_err(|e| format!("Failed to launch desktop item: {}", e))?;
+  if !output.status.success() {
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    return Err(if err.is_empty() {
+      format!("Failed to launch {}", trimmed)
+    } else {
+      format!("Failed to launch {}: {}", trimmed, err)
+    });
+  }
+
+  let message = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  Ok(if message.is_empty() {
+    format!("Opened {}", trimmed)
+  } else {
+    message
+  })
+}
+
+// GPU detection struct
+#[derive(serde::Serialize)]
+pub struct GpuInfo {
+  pub available: bool,
+  pub name: Option<String>,
+}
+
+#[tauri::command]
+pub fn check_gpu_available() -> Result<GpuInfo, String> {
+  // Try nvidia-smi first
+  let nvidia = std::process::Command::new("nvidia-smi")
+    .args(["--query-gpu=name", "--format=csv,noheader"])
+    .output();
+  if let Ok(out) = nvidia {
+    if out.status.success() {
+      let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+      if !name.is_empty() {
+        return Ok(GpuInfo { available: true, name: Some(name) });
+      }
+    }
+  }
+  // Fallback: PowerShell WMI check for non-virtual GPU
+  let ps = std::process::Command::new("powershell")
+    .args(["-Command", "Get-WmiObject Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic|Virtual|Remote|Microsoft' } | Select-Object -First 1 -ExpandProperty Name"])
+    .output();
+  if let Ok(out) = ps {
+    if out.status.success() {
+      let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+      if !name.is_empty() {
+        return Ok(GpuInfo { available: true, name: Some(name) });
+      }
+    }
+  }
+  Ok(GpuInfo { available: false, name: None })
+}
+
+#[tauri::command]
+pub fn focus_window_by_title(query: String) -> Result<String, String> {
+  let trimmed = query.trim();
+  if trimmed.is_empty() {
+    return Err("Window title or process name is required".to_string());
+  }
+
+  let script = format!(r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win32Focus {{
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}}
+"@
+$ErrorActionPreference = 'Stop'
+$q = {query}
+$windows = Get-Process | Where-Object {{ $_.MainWindowTitle -ne '' }} | Where-Object {{ $_.MainWindowTitle -like ('*' + $q + '*') -or $_.ProcessName -like ('*' + $q + '*') }}
+$picked = $windows |
+  Sort-Object `
+    @{{ Expression = {{ if ($_.MainWindowTitle -ieq $q) {{ 0 }} elseif ($_.ProcessName -ieq $q) {{ 1 }} else {{ 2 }} }} }},
+    @{{ Expression = {{ $_.MainWindowTitle.Length }} }} |
+  Select-Object -First 1
+if (-not $picked -or $picked.MainWindowHandle -eq 0) {{
+  throw "No visible window matched '$q'"
+}}
+[Win32Focus]::ShowWindow($picked.MainWindowHandle, 9) | Out-Null
+if (-not [Win32Focus]::SetForegroundWindow($picked.MainWindowHandle)) {{
+  throw "Failed to focus matched window"
+}}
+Write-Output ($picked.ProcessName + ' :: ' + $picked.MainWindowTitle)
+"#, query = ps_single_quote(trimmed));
+
+  let output = Command::new("powershell")
+    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+    .output()
+    .map_err(|e| format!("Failed to focus window: {}", e))?;
+  if !output.status.success() {
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    return Err(if err.is_empty() {
+      format!("Failed to focus a window matching {}", trimmed)
+    } else {
+      format!("Failed to focus {}: {}", trimmed, err)
+    });
+  }
+
+  let matched = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  Ok(if matched.is_empty() {
+    format!("Focused {}", trimmed)
+  } else {
+    format!("Focused {}", matched)
+  })
 }
 
 #[tauri::command]

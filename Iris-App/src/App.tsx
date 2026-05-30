@@ -37,7 +37,7 @@ const SUMMARY_MODEL = "iris-summarizer:latest";
 const DEBUG_MEMORY = false;
 
 type ModelStatus = "checking" | "ready" | "loading" | "error";
-type Message = { role: "user" | "llm"; text: string; images?: string[] };
+type Message = { role: "user" | "llm"; text: string; images?: string[]; time?: number };
 type StartupStatus = {
   active: boolean;
   step: string;
@@ -52,6 +52,31 @@ type CenterDialogState = {
   cancelLabel: string;
 };
 
+type PermissionMode = "balanced" | "always_ask" | "testing";
+type ActionRisk = "low" | "medium" | "high";
+
+type PermissionSettings = {
+  mode: PermissionMode;
+  alwaysAllowLowRisk: boolean;
+  allowIterationWithoutPrompt: boolean;
+  testingConfidenceThreshold: number;
+};
+
+type InlinePermissionRequest = {
+  id: string;
+  title: string;
+  message: string;
+  actionKey: string;
+  risk: ActionRisk;
+  confidence: number;
+};
+
+type AgentProficiency = {
+  id: string;
+  name: string;
+  score: number;
+};
+
 function normalizeMessages(raw: any[] | undefined): Message[] {
   const out: Message[] = [];
   for (const m of raw || []) {
@@ -61,7 +86,8 @@ function normalizeMessages(raw: any[] | undefined): Message[] {
       const images = Array.isArray((m as any).images)
         ? (m as any).images.filter((v: any) => typeof v === "string")
         : undefined;
-      out.push({ role, text, ...(images && images.length ? { images } : {}) });
+      const time = Number.isFinite((m as any).time) ? Number((m as any).time) : undefined;
+      out.push({ role, text, ...(images && images.length ? { images } : {}), ...(time ? { time } : {}) });
       continue;
     }
     // Legacy transcript that merges both speakers into one block:
@@ -80,13 +106,74 @@ function normalizeMessages(raw: any[] | undefined): Message[] {
   return out;
 }
 
+function buildConversationMessages(
+  chatHistory: Message[] | undefined,
+  systemPrompt: string,
+  currentUserMessage: string
+): Array<{ role: "user" | "assistant"; content: string }> {
+  const result: Array<{ role: "user" | "assistant"; content: string }> = [];
+  
+  // Add system prompt as first message if provided
+  if (systemPrompt && systemPrompt.trim()) {
+    result.push({ role: "user", content: systemPrompt });
+    result.push({ role: "assistant", content: "Understood. I'm ready to assist with your request." });
+  }
+  
+  // Add chat history, converting "user"/"llm" to "user"/"assistant"
+  if (Array.isArray(chatHistory)) {
+    for (const msg of chatHistory) {
+      if (msg.role === "user") {
+        result.push({ role: "user", content: msg.text });
+      } else if (msg.role === "llm") {
+        result.push({ role: "assistant", content: msg.text });
+      }
+    }
+  }
+  
+  // Add current user message
+  if (currentUserMessage && currentUserMessage.trim()) {
+    result.push({ role: "user", content: currentUserMessage });
+  }
+  
+  // Diagnostic logging
+  if (result.length > 0) {
+    const summary = result
+      .slice(0, 6)
+      .map((m, i) => `${i + 1}. [${m.role.toUpperCase()}]: ${m.content.substring(0, 80)}${m.content.length > 80 ? "..." : ""}`)
+      .join("\n");
+    console.log(`[Iris Memory] Conversation context (${result.length} total messages):\n${summary}${result.length > 6 ? `\n... and ${result.length - 6} more` : ""}`);
+  }
+  
+  return result;
+}
+
 type Tab = {
   id: number;
   title: string;
-  type: "chat" | "settings";
+  type: "chat" | "settings" | "tools" | "agent-stats";
   messages?: Message[];
   promptHistory?: string[];
 };
+
+const DEFAULT_PERMISSION_SETTINGS: PermissionSettings = {
+  mode: "balanced",
+  alwaysAllowLowRisk: true,
+  allowIterationWithoutPrompt: false,
+  testingConfidenceThreshold: 50,
+};
+
+const DEFAULT_AGENT_PROFICIENCIES: AgentProficiency[] = [
+  { id: "prof_filesystem", name: "Filesystem", score: 82 },
+  { id: "prof_mcp", name: "MCP Bridges", score: 70 },
+  { id: "prof_ssh", name: "SSH Bridges", score: 68 },
+  { id: "prof_desktop", name: "Desktop Tools", score: 58 },
+  { id: "prof_memory", name: "Project Memory", score: 76 },
+  { id: "prof_network", name: "Network Lookup", score: 72 },
+  { id: "prof_coding", name: "Coding", score: 80 },
+  { id: "prof_planning", name: "Planning", score: 78 },
+  { id: "prof_debugging", name: "Debugging", score: 77 },
+  { id: "prof_modeling", name: "3D Modeling", score: 42 },
+];
 type TestModelResult = { ok: boolean; error: string | null; response?: string };
 type Snapshot = {
   tab_id?: number;
@@ -224,6 +311,109 @@ type IrisActionTrace = {
   argsSummary: string;
   outcome: string;
 };
+
+type IrisToolScope = "internal" | "custom";
+
+type IrisToolDef = {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  enabled: boolean;
+  scope: IrisToolScope;
+};
+
+const INTERNAL_IRIS_TOOLS: IrisToolDef[] = [
+  {
+    id: "tool_filesystem",
+    name: "Filesystem",
+    description: "Direct local project file operations through the manipulation root.",
+    instructions: "Use fs_list_dir, fs_read_text, fs_write_text, fs_move_path, fs_delete_path, and fs_make_dir for concrete local edits. Prefer this route when the target file path is known and the task is a straightforward local project change.",
+    enabled: true,
+    scope: "internal",
+  },
+  {
+    id: "tool_mcp",
+    name: "MCP Bridges",
+    description: "Project-specific external tools exposed by connected MCP servers.",
+    instructions: "Use connect_mcp_server, mcp_list_tools, and mcp_call_tool when the task benefits from engine-aware or integration-specific operations, or when the bridge clearly provides the best source of truth.",
+    enabled: true,
+    scope: "internal",
+  },
+  {
+    id: "tool_ssh",
+    name: "SSH Bridges",
+    description: "Remote project access and execution on connected SSH targets.",
+    instructions: "Use ssh_tool_call when the project lives on a remote host or the task is more efficient to run on the remote machine than locally.",
+    enabled: true,
+    scope: "internal",
+  },
+  {
+    id: "tool_desktop",
+    name: "Desktop Tools",
+    description: "Local desktop inspection and interaction, including screenshots and window data.",
+    instructions: "Use desktop capture and window tools only when visual confirmation or local desktop control is needed.",
+    enabled: true,
+    scope: "internal",
+  },
+  {
+    id: "tool_memory",
+    name: "Project Memory",
+    description: "Project dataweb, universal dataweb, and chat transcript context.",
+    instructions: "Use cached project notes and memory first, refresh them when a bridge opens or the user asks for a fresh project pull, and avoid re-fetching full project state unless necessary.",
+    enabled: true,
+    scope: "internal",
+  },
+  {
+    id: "tool_network",
+    name: "Network Lookup",
+    description: "Optional network search and weather/UV lookups.",
+    instructions: "Use network_search, weather_lookup, and related lookups only when the task clearly benefits from internet freshness or live information.",
+    enabled: true,
+    scope: "internal",
+  },
+];
+
+function createBlankCustomTool(): IrisToolDef {
+  return {
+    id: makeId("tool"),
+    name: "New Instruction Tool",
+    description: "Guidance-only tool that tells Iris how to use its existing capabilities.",
+    instructions: "Describe the decision procedure Iris should follow, the tools it should prefer, and any project-specific guardrails. Do not ask Iris to add code or new runtime functions.",
+    enabled: true,
+    scope: "custom",
+  };
+}
+
+function normalizeToolDef(raw: any, fallbackName = "Instruction Tool"): IrisToolDef {
+  return {
+    id: String(raw?.id ?? makeId("tool")),
+    name: String(raw?.name ?? fallbackName).trim() || fallbackName,
+    description: String(raw?.description ?? raw?.summary ?? "").trim(),
+    instructions: String(raw?.instructions ?? raw?.howItWorks ?? raw?.notes ?? "").trim(),
+    enabled: raw?.enabled == null ? true : !!raw.enabled,
+    scope: raw?.scope === "internal" ? "internal" : "custom",
+  };
+}
+
+function buildToolCatalogPrompt(customTools: IrisToolDef[]): string {
+  const enabledCustomTools = (Array.isArray(customTools) ? customTools : [])
+    .filter((tool) => tool.enabled)
+    .map((tool) => `- ${tool.name}: ${tool.description || "(no description)"}\n  How it works: ${tool.instructions || "(no instructions)"}`);
+  const internalBlocks = INTERNAL_IRIS_TOOLS.map((tool) => `- ${tool.name}: ${tool.description}\n  How it works: ${tool.instructions}`);
+  return [
+    "Iris tool catalog:",
+    "- The tool catalog is a planning aid, not a keyword trigger list.",
+    "- Choose the cheapest correct route for the task.",
+    "- Default to local filesystem for direct project edits when the path is known and the task is simple.",
+    "- Prefer MCP, SSH, or Desktop only when they are the better source of truth or clearly more efficient.",
+    "- Custom tools are instruction-only; they do not add new runtime code or new functions.",
+    "",
+    "Built-in tools:",
+    ...internalBlocks,
+    enabledCustomTools.length ? ["", "Enabled custom instructional tools:", ...enabledCustomTools] : ["", "Enabled custom instructional tools: (none)"]
+  ].join("\n");
+}
 
 const IRIS_ACTION_REPOSITORY = [
   "filesystem.list/read/write/delete/move/mkdir",
@@ -498,6 +688,737 @@ function normalizeConversationalQuery(text: string): string {
     .trim();
 }
 
+function referencesPastSessionMemory(text: string): boolean {
+  const t = text.toLowerCase();
+  return [
+    "earlier in our chats",
+    "earlier chat",
+    "past session",
+    "last session",
+    "our notes",
+    "project notes",
+    "from memory",
+    "what did we decide",
+    "where did we leave off",
+  ].some((k) => t.includes(k));
+}
+
+function buildTranscriptTailFromSnapshot(snapshot: Snapshot | null, maxTurns = 16): string {
+  if (!snapshot?.messages?.length) return "";
+  return snapshot.messages
+    .slice(-maxTurns)
+    .map((m: any) => `${m.role === "user" ? "User" : "Iris"}: ${String(m.text ?? "")}`)
+    .join("\n")
+    .trim();
+}
+
+function transcriptSeemsInsufficient(userText: string, transcript: string): boolean {
+  const transcriptChars = transcript.trim().length;
+  if (transcriptChars < 180) return true;
+
+  const lower = userText.toLowerCase();
+  const recallish = /(what did we|where did we|continue from|as discussed|from earlier|status|todo|next steps|project overview|summary)/i.test(lower);
+  if (recallish && transcriptChars < 520) return true;
+  return false;
+}
+
+function shouldUseLongTermDataweb(userText: string, transcript: string): boolean {
+  if (referencesPastSessionMemory(userText)) return true;
+  return transcriptSeemsInsufficient(userText, transcript);
+}
+
+type SceneDraftIntent = {
+  shape: string;
+  filenameStem: string;
+  sphereRadius: number | null;
+  cubeSize: [number, number, number] | null;
+  cloudPieceCount?: number;
+  cloudScale?: number;
+  skyscraperFloors?: number;
+  windowColumns?: number;
+};
+
+type SceneEditIntent = {
+  shape: string;
+  cubeSize: [number, number, number] | null;
+  relPathHint: string | null;
+  targetAxis: "x" | "y" | "z" | null;
+  scaleFactor: number | null;
+};
+
+type RecentSceneFact = {
+  path: string;
+  rootPath: string;
+  note: string;
+  turn: number;
+  expiresAtTurn: number;
+};
+
+function extractScenePathHint(text: string): string | null {
+  const source = String(text || "");
+
+  const strict = Array.from(source.matchAll(/(?:res:\/\/|user:\/\/)?[A-Za-z0-9_.\-\/\\]+\.tscn/gi))
+    .map((m) => String(m[0] || "").trim())
+    .filter(Boolean);
+  if (strict.length) {
+    return sanitizeGeneratedSceneRelativePath(strict[strict.length - 1], "Scene.tscn");
+  }
+
+  const quoted = source.match(/["']([^"'\n\r]+\.tscn)["']/i)?.[1];
+  if (quoted) {
+    return sanitizeGeneratedSceneRelativePath(quoted, "Scene.tscn");
+  }
+
+  const relaxed = Array.from(source.matchAll(/(?:res:\/\/|user:\/\/)?[a-z0-9_\-./\\ ]+\.tscn/gi))
+    .map((m) => String(m[0] || "").trim())
+    .filter(Boolean);
+  if (!relaxed.length) return null;
+
+  const scored = relaxed
+    .map((raw) => {
+      const value = raw.replace(/^\s*(?:the\s+)?(?:location|name|path|file)\s*(?:\/\s*name)?\s*(?:is|=|:)\s*/i, "").trim();
+      const hasSlash = /[\\/]/.test(value);
+      const hasSpace = /\s/.test(value);
+      const rooted = /^(assets|scenes|levels|world)\//i.test(value);
+      let score = 0;
+      if (hasSlash) score += 2;
+      if (rooted) score += 2;
+      if (hasSpace) score -= 2;
+      if (value.length > 90) score -= 3;
+      return { value, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.length ? sanitizeGeneratedSceneRelativePath(scored[0].value, "Scene.tscn") : null;
+}
+
+function parseSceneDraftIntent(text: string): SceneDraftIntent | null {
+  const lower = text.toLowerCase();
+  if (!/(create|add|build|make|making|generate|draft|construct|whitebox)\b/.test(lower)) return null;
+  if (!/(scene|godot|mesh|shape|cube|box|sphere|cloud|building|tower|house|shop|garage|store|skyscraper|high[\s-]*rise)/.test(lower)) return null;
+
+  let rawShape = "shape";
+  if (/\b(skyscraper|high[\s-]*rise|highrise)\b/.test(lower)) {
+    rawShape = "skyscraper";
+  } else if (/\b(garage|shop|storefront|store)\b/.test(lower)) {
+    rawShape = "shop";
+  } else {
+    const shapeMatch = lower.match(/\b(cube|box|sphere|cloud|building|tower|house|shop|garage|store|capsule|cylinder|cone|plane)\b/);
+    rawShape = shapeMatch?.[1] || "shape";
+  }
+  const shape = rawShape === "box" ? "cube" : (rawShape === "garage" || rawShape === "store" ? "shop" : rawShape);
+  const filenameStem = `${shape}_${Date.now().toString().slice(-6)}`;
+
+  let sphereRadius: number | null = null;
+  const radiusMatch = lower.match(/\bradius\s*(?:of|=)?\s*(\d+(?:\.\d+)?)/i);
+  if (radiusMatch?.[1]) {
+    const n = Number(radiusMatch[1]);
+    if (Number.isFinite(n) && n > 0) sphereRadius = n;
+  }
+
+  let cubeSize: [number, number, number] | null = null;
+  const tripleSize = lower.match(/\b(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)/);
+  if (tripleSize?.[1] && tripleSize?.[2] && tripleSize?.[3]) {
+    const sx = Number(tripleSize[1]);
+    const sy = Number(tripleSize[2]);
+    const sz = Number(tripleSize[3]);
+    if ([sx, sy, sz].every((v) => Number.isFinite(v) && v > 0)) {
+      cubeSize = [sx, sy, sz];
+    }
+  }
+
+  const asksBiggerCloud = /\b(more volume|more cloud pieces|more pieces|bigger|larger|fuller|denser)\b/.test(lower);
+  let cloudPieceCount: number | undefined = undefined;
+  let cloudScale: number | undefined = undefined;
+  if (shape === "cloud") {
+    if (cubeSize) {
+      const maxDim = Math.max(cubeSize[0], cubeSize[1], cubeSize[2]);
+      cloudPieceCount = Math.min(Math.ceil(maxDim * maxDim / 2), 16);
+      cloudScale = maxDim / 2;
+    } else {
+      cloudPieceCount = asksBiggerCloud ? 7 : 4;
+      cloudScale = asksBiggerCloud ? 1.55 : 1.0;
+    }
+  }
+
+  const floorsMatch = lower.match(/\b(\d{1,2})\s*(?:floors?|stories?)\b/i);
+  const inferredFloors = floorsMatch?.[1] ? Number(floorsMatch[1]) : (shape === "skyscraper" ? 18 : (shape === "building" ? 10 : undefined));
+  const skyscraperFloors = typeof inferredFloors === "number" ? Math.max(6, Math.min(40, inferredFloors)) : undefined;
+  const windowColumns = shape === "skyscraper" || shape === "building" ? 4 : undefined;
+
+  return { shape, filenameStem, sphereRadius, cubeSize, cloudPieceCount, cloudScale, skyscraperFloors, windowColumns };
+}
+
+function parseSceneEditIntent(text: string): SceneEditIntent | null {
+  const lower = text.toLowerCase();
+  if (!/(edit|modify|change|resize|scale|expand|stretch|enlarge|shrink|adjust|update|fix|redo|remake|rework)\b/.test(lower)) return null;
+  if (!/(scene|godot|cube|box|sphere|mesh|node3d|meshinstance|building|tower|skyscraper|shop|garage|store)/.test(lower)) return null;
+
+  const shapeMatch = lower.match(/\b(cube|box|sphere|capsule|cylinder|cone|plane|building|tower|skyscraper|shop|garage|store)\b/);
+  const shape = shapeMatch?.[1] === "box" ? "cube" : (shapeMatch?.[1] || "cube");
+
+  let cubeSize: [number, number, number] | null = null;
+  const tripleSize = lower.match(/\b(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)/);
+  if (tripleSize?.[1] && tripleSize?.[2] && tripleSize?.[3]) {
+    const sx = Number(tripleSize[1]);
+    const sy = Number(tripleSize[2]);
+    const sz = Number(tripleSize[3]);
+    if ([sx, sy, sz].every((v) => Number.isFinite(v) && v > 0)) {
+      cubeSize = [sx, sy, sz];
+    }
+  }
+
+  let targetAxis: "x" | "y" | "z" | null = null;
+  if (/\b(height|tall|taller|shorter|vertical|y\b)\b/.test(lower)) targetAxis = "y";
+  else if (/\b(width|wider|narrow|x\b)\b/.test(lower)) targetAxis = "x";
+  else if (/\b(depth|deeper|shallow|z\b)\b/.test(lower)) targetAxis = "z";
+
+  let scaleFactor: number | null = null;
+  if (/\bhalf\b|50\s*%/.test(lower)) scaleFactor = 0.5;
+  else if (/\bdouble\b|twice|2x|200\s*%/.test(lower)) scaleFactor = 2;
+  else {
+    const percentMatch = lower.match(/\b(\d{1,3})\s*%/);
+    if (percentMatch?.[1]) {
+      const pct = Number(percentMatch[1]);
+      if (Number.isFinite(pct) && pct > 0) scaleFactor = pct / 100;
+    }
+  }
+
+  const pathHint = extractScenePathHint(text);
+  return {
+    shape,
+    cubeSize,
+    relPathHint: pathHint,
+    targetAxis,
+    scaleFactor,
+  };
+}
+
+function isSceneRetryRequest(text: string): boolean {
+  const t = normalizeConversationalQuery(text).toLowerCase();
+  if (!t) return false;
+  return /\b(try again|retry|again|recreate|re-create|rebuild|please try again|please retry|another one|make another|one more)\b/.test(t);
+}
+
+function recoverRecentSceneIntent(messages: Message[] | undefined, currentUserText: string): SceneDraftIntent | null {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const current = normalizeConversationalQuery(currentUserText).trim().toLowerCase();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    const candidate = normalizeConversationalQuery(String(m.text || "")).trim();
+    if (!candidate) continue;
+    if (candidate.toLowerCase() === current) continue;
+    const parsed = parseSceneDraftIntent(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function recoverLastScenePathFromMessages(messages: Message[] | undefined): string | null {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "llm") continue;
+    const t = String(m.text || "");
+    const savedMatch = t.match(/Scene saved as\s+([^\s]+\.tscn)\s+in your project/i);
+    if (savedMatch?.[1]) {
+      const p = sanitizeGeneratedSceneRelativePath(savedMatch[1], "Scene.tscn");
+      if (p) return p;
+    }
+    const wroteMatch = t.match(/Wrote\s+.+?[\\/](?:\?\\)?(.+?\.tscn)/i);
+    if (wroteMatch?.[1]) {
+      const p = sanitizeGeneratedSceneRelativePath(wroteMatch[1], "Scene.tscn");
+      if (p) return p;
+    }
+  }
+  return null;
+}
+
+function parseLastScenePathFromProjectDataweb(text: string): string | null {
+  const t = String(text || "");
+  const match = t.match(/-\s*Last scene path:\s*(.+)$/im);
+  if (match?.[1]) {
+    const cleaned = sanitizeGeneratedSceneRelativePath(match[1], "Scene.tscn");
+    return cleaned || null;
+  }
+  return null;
+}
+
+function buildSceneEditCandidatePaths(intent: SceneEditIntent, cachedLastScenePath?: string | null, recentPaths?: string[]): string[] {
+  const explicit = intent.relPathHint ? sanitizeGeneratedSceneRelativePath(intent.relPathHint, "Scene.tscn") : null;
+  const inferred = cachedLastScenePath ? sanitizeGeneratedSceneRelativePath(cachedLastScenePath, "Scene.tscn") : null;
+  const recent = (recentPaths || [])
+    .map((p) => sanitizeGeneratedSceneRelativePath(p, "Scene.tscn"))
+    .filter(Boolean);
+  const basename = (explicit || inferred || "CubeScene.tscn").split("/").pop() || "CubeScene.tscn";
+  const preferredRoots = ["", "Assets", "assets", "Scenes", "scenes", "Levels", "levels"];
+  const candidates = [
+    explicit,
+    inferred,
+    ...recent,
+    basename,
+    ...preferredRoots.map((root) => (root ? `${root}/${basename}` : basename)),
+    "Assets/CubeScene.tscn",
+    "Scenes/CubeScene.tscn",
+    "CubeScene.tscn",
+  ].filter(Boolean) as string[];
+  return Array.from(new Set(candidates.map((p) => p.replace(/^\/+/, ""))));
+}
+
+function parseSceneRepairIntent(text: string): { relPathHint: string } | null {
+  const lower = text.toLowerCase();
+  if (!/(fix|repair|correct|cleanup|clean up|parse error|won't open|cannot open|can't open|invalid)/.test(lower)) return null;
+  const pathHint = extractScenePathHint(text);
+  if (!pathHint) return null;
+  return {
+    relPathHint: sanitizeGeneratedSceneRelativePath(pathHint, "Scene.tscn"),
+  };
+}
+
+function extractFirstCodeFence(text: string): string | null {
+  const match = text.match(/```(?:tscn|ini|text|gdscript|\w+)?\s*\n([\s\S]*?)```/i);
+  if (!match?.[1]) return null;
+  return match[1].trim();
+}
+
+function extractScenePathFromModelResponse(raw: string, fallbackFile: string): string {
+  const text = String(raw || "");
+  const pathMatch = text.match(/^PATH:\s*(.+)$/im);
+  const hinted = pathMatch?.[1] || extractScenePathHint(text) || fallbackFile;
+  return sanitizeGeneratedSceneRelativePath(String(hinted || fallbackFile).trim(), fallbackFile);
+}
+
+function extractSceneContentFromModelResponse(raw: string): string | null {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+
+  const fenced = extractFirstCodeFence(text);
+  if (fenced && /\[gd_scene\b/i.test(fenced)) {
+    return normalizeSceneText(fenced);
+  }
+
+  const gdStart = text.search(/\[gd_scene\b/i);
+  if (gdStart >= 0) {
+    const tail = text.slice(gdStart);
+    const withoutTrailingFence = tail.replace(/\n```[\s\S]*$/m, "").trim();
+    if (withoutTrailingFence) {
+      return normalizeSceneText(withoutTrailingFence);
+    }
+  }
+
+  return null;
+}
+
+function sanitizeGeneratedSceneRelativePath(rawPath: string, fallbackFile: string): string {
+  let p = String(rawPath || "").trim();
+  if (!p) return fallbackFile;
+
+  // Strip Godot URI prefixes and quotes often produced by model output.
+  p = p.replace(/^['"]+|['"]+$/g, "");
+  p = p.replace(/^res:\/\//i, "").replace(/^user:\/\//i, "");
+
+  // Normalize separators and remove obvious traversal/absolute roots.
+  p = p.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\.\.+/g, "");
+
+  // Remove Windows-invalid characters and control chars from each segment.
+  const cleaned = p
+    .split("/")
+    .map((seg) => seg.replace(/[<>:"|?*\x00-\x1f]/g, "").trim())
+    .filter(Boolean)
+    .join("/");
+
+  const safe = cleaned || fallbackFile;
+  if (/\.(tscn)$/i.test(safe)) return safe;
+  return `${safe}.tscn`;
+}
+
+function pickSceneDestinationPath(rootEntries: RepoEntry[], proposedFile: string): string {
+  const dirs = new Set(
+    (rootEntries || [])
+      .filter((e) => e.isDir)
+      .map((e) => String(e.name || e.path || "").toLowerCase())
+  );
+  const preferred = ["scenes", "scene", "levels", "maps", "world", "environment"];
+  const folder = preferred.find((k) => dirs.has(k));
+  return folder ? `${folder}/${proposedFile}` : proposedFile;
+}
+
+function normalizeSceneText(content: string): string {
+  return String(content || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+function looksLikeGodotScene(content: string): boolean {
+  const c = normalizeSceneText(content);
+  if (!c.startsWith("[gd_scene")) return false;
+  if (!/\n\[node\s+name=/i.test(c)) return false;
+  if (/```/.test(c)) return false;
+  const lines = c.split("\n");
+  const sectionHeaders = lines.filter((line) => line.trim().startsWith("["));
+  if (sectionHeaders.some((line) => !line.includes("]"))) return false;
+
+  // Godot section headers must not be indented.
+  if (sectionHeaders.some((line) => /^\s+\[/.test(line))) return false;
+
+  const nodeHeaders = lines
+    .map((line) => line.trim())
+    .filter((line) => /^\[node\s+/i.test(line));
+  if (!nodeHeaders.length) return false;
+
+  // Reject Godot 3-style root types in a Godot 4 scene and require child parent links.
+  if (/\btype="Spatial"\b/i.test(nodeHeaders[0])) return false;
+  for (let i = 0; i < nodeHeaders.length; i++) {
+    const header = nodeHeaders[i];
+    if (!/\bname="[^"]+"/i.test(header)) return false;
+    if (!/\btype="[^"]+"/i.test(header)) return false;
+    if (i > 0 && !/\bparent="[^"]+"/i.test(header)) return false;
+  }
+
+  const subIds = new Set(
+    lines
+      .map((line) => line.trim().match(/^\[sub_resource\b[\s\S]*\bid="([^"]+)"\]/i)?.[1])
+      .filter((v): v is string => !!v)
+  );
+  const refs = Array.from(c.matchAll(/SubResource\(([^\)]+)\)/g));
+  for (const ref of refs) {
+    const raw = String(ref[1] || "").trim();
+    if (!raw) return false;
+    if (/^\d+$/.test(raw)) return false;
+    const quoted = raw.match(/^"([^"]+)"$/)?.[1] || "";
+    if (quoted && subIds.size && !subIds.has(quoted)) return false;
+  }
+
+  // Resource properties cannot use scene-tree shortcuts like $NodePath.
+  if (/\b(?:mesh|material_override|shape)\s*=\s*\$/i.test(c)) return false;
+
+  return true;
+}
+
+function inferShapeFromScenePath(path: string): string {
+  const p = String(path || "").toLowerCase();
+  const shapes = ["skyscraper", "building", "tower", "cube", "box", "sphere", "cloud", "capsule", "cylinder", "cone", "plane"];
+  const found = shapes.find((shape) => p.includes(shape));
+  if (!found) return "cube";
+  return found === "box" ? "cube" : found;
+}
+
+function buildMinimalValidGodotScene(shape: string): string {
+  const normalized = (shape || "cube").toLowerCase() === "box" ? "cube" : (shape || "cube").toLowerCase();
+  const normalized2 = normalized === "garage" || normalized === "store" ? "shop" : normalized;
+  
+  if (normalized2 === "shop") {
+    return `[gd_scene format=3]
+
+[sub_resource type="BoxMesh" id="WallMesh_1"]
+size = Vector3(8, 6, 0.5)
+
+[sub_resource type="BoxMesh" id="RoofMesh_1"]
+size = Vector3(8.5, 0.5, 8.5)
+
+[node name="ShopScene" type="Node3D"]
+
+[node name="LeftWall" type="MeshInstance3D" parent="."]
+mesh = SubResource("WallMesh_1")
+position = Vector3(-4, 0, 0)
+
+[node name="RightWall" type="MeshInstance3D" parent="."]
+mesh = SubResource("WallMesh_1")
+position = Vector3(4, 0, 0)
+
+[node name="BackWall" type="MeshInstance3D" parent="."]
+mesh = SubResource("WallMesh_1")
+position = Vector3(0, 0, 4)
+
+[node name="Roof" type="MeshInstance3D" parent="."]
+mesh = SubResource("RoofMesh_1")
+position = Vector3(0, 6, 0)`;
+  }
+
+  if (normalized2 === "skyscraper" || normalized2 === "building" || normalized2 === "tower") {
+    return `[gd_scene format=3]
+
+[sub_resource type="BoxMesh" id="BuildingBodyMesh_1"]
+size = Vector3(10, 20, 12)
+
+[sub_resource type="BoxMesh" id="WindowMesh_1"]
+size = Vector3(0.8, 0.55, 0.2)
+
+[node name="SkyscraperScene" type="Node3D"]
+
+[node name="BuildingBody" type="MeshInstance3D" parent="."]
+mesh = SubResource("BuildingBodyMesh_1")
+position = Vector3(0, 10, 0)
+
+[node name="Window_1" type="MeshInstance3D" parent="."]
+mesh = SubResource("WindowMesh_1")
+position = Vector3(-3, 8, 6.2)
+
+[node name="Window_2" type="MeshInstance3D" parent="."]
+mesh = SubResource("WindowMesh_1")
+position = Vector3(0, 8, 6.2)
+
+[node name="Window_3" type="MeshInstance3D" parent="."]
+mesh = SubResource("WindowMesh_1")
+position = Vector3(3, 8, 6.2)`;
+  }
+
+  const meshTypeByShape: Record<string, string> = {
+    cube: "BoxMesh",
+    sphere: "SphereMesh",
+    capsule: "CapsuleMesh",
+    cylinder: "CylinderMesh",
+    cone: "CylinderMesh",
+    plane: "PlaneMesh",
+    cloud: "BoxMesh",
+  };
+  const meshType = meshTypeByShape[normalized2] || "BoxMesh";
+  const shapeLabel = normalized2.charAt(0).toUpperCase() + normalized2.slice(1);
+  const sizeParam = normalized2 === "sphere" ? "radius = 1.0" : (normalized2 === "cube" ? "size = Vector3(1, 1, 1)" : "");
+  
+  const lines = [
+    "[gd_scene format=3]",
+    "",
+    `[sub_resource type=\"${meshType}\" id=\"${shapeLabel}Mesh_1\"]`,
+  ];
+  if (sizeParam) lines.push(sizeParam);
+  lines.push(
+    "",
+    `[node name=\"${shapeLabel}Scene\" type=\"Node3D\"]`,
+    "",
+    `[node name=\"${shapeLabel}\" type=\"MeshInstance3D\" parent=\".\"]`,
+    `mesh = SubResource(\"${shapeLabel}Mesh_1\")`
+  );
+  
+  return lines.join("\n");
+}
+
+function buildPrimitiveSceneFallback(shape: string): string {
+  return buildMinimalValidGodotScene(shape);
+}
+
+function buildPrimitiveSceneFromIntent(intent: SceneDraftIntent): string {
+  const shape = intent.shape || "cube";
+  const normalized = shape.toLowerCase() === "box" ? "cube" : shape.toLowerCase();
+  const shapeLabel = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+  if (normalized === "sphere") {
+    const r = Number.isFinite(intent.sphereRadius as number) && (intent.sphereRadius as number) > 0
+      ? Number(intent.sphereRadius)
+      : 1;
+    return [
+      "[gd_scene format=3]",
+      "",
+      `[sub_resource type=\"SphereMesh\" id=\"${shapeLabel}Mesh_1\"]`,
+      `radius = ${r}`,
+      "",
+      `[node name=\"${shapeLabel}Scene\" type=\"Node3D\"]`,
+      "",
+      `[node name=\"${shapeLabel}\" type=\"MeshInstance3D\" parent=\".\"]`,
+      `mesh = SubResource(\"${shapeLabel}Mesh_1\")`,
+    ].join("\n");
+  }
+  if (normalized === "cube") {
+    const size = intent.cubeSize && intent.cubeSize.every((v) => Number.isFinite(v) && v > 0)
+      ? intent.cubeSize
+      : [1, 1, 1] as [number, number, number];
+    return [
+      "[gd_scene format=3]",
+      "",
+      `[sub_resource type=\"BoxMesh\" id=\"${shapeLabel}Mesh_1\"]`,
+      `size = Vector3(${size[0]}, ${size[1]}, ${size[2]})`,
+      "",
+      `[node name=\"${shapeLabel}Scene\" type=\"Node3D\"]`,
+      "",
+      `[node name=\"${shapeLabel}\" type=\"MeshInstance3D\" parent=\".\"]`,
+      `mesh = SubResource(\"${shapeLabel}Mesh_1\")`,
+    ].join("\n");
+  }
+  if (normalized === "cloud") {
+    const pieceCount = Math.max(4, Math.min(10, Math.round(intent.cloudPieceCount || 4)));
+    const scale = Math.max(0.7, Math.min(2.2, Number(intent.cloudScale || 1)));
+    const baseSizes: Array<[number, number, number]> = [
+      [1.6, 0.7, 1.0],
+      [1.0, 0.5, 0.8],
+      [0.9, 0.4, 0.9],
+      [1.2, 0.55, 0.85],
+      [1.4, 0.6, 0.95],
+      [1.1, 0.45, 0.8],
+      [0.95, 0.42, 0.75],
+      [1.5, 0.65, 1.05],
+      [1.2, 0.5, 0.9],
+      [1.0, 0.45, 0.72],
+    ];
+    const positions: Array<[number, number, number]> = [
+      [0, 0, 0],
+      [-0.9, 0.1, -0.2],
+      [0.85, 0.12, 0.1],
+      [0.2, 0.2, -0.35],
+      [-0.15, 0.16, 0.32],
+      [1.2, 0.09, -0.1],
+      [-1.15, 0.08, 0.15],
+      [0.45, 0.24, 0.38],
+      [-0.55, 0.2, -0.42],
+      [1.45, 0.06, 0.18],
+    ];
+    const lines: string[] = [
+      "[gd_scene format=3]",
+      "",
+      "[sub_resource type=\"StandardMaterial3D\" id=\"CloudMat_1\"]",
+      "albedo_color = Color(1, 1, 1, 0.5)",
+      "transparency = 1",
+    ];
+
+    for (let i = 0; i < pieceCount; i++) {
+      const mId = `CloudMesh_${i + 1}`;
+      const raw = baseSizes[i] || baseSizes[baseSizes.length - 1];
+      const sx = (raw[0] * scale).toFixed(3).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+      const sy = (raw[1] * scale).toFixed(3).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+      const sz = (raw[2] * scale).toFixed(3).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+      lines.push("", `[sub_resource type=\"BoxMesh\" id=\"${mId}\"]`, `size = Vector3(${sx}, ${sy}, ${sz})`);
+    }
+
+    lines.push("", "[node name=\"CloudScene\" type=\"Node3D\"]");
+    for (let i = 0; i < pieceCount; i++) {
+      const pos = positions[i] || positions[positions.length - 1];
+      lines.push(
+        "",
+        `[node name=\"CloudPart_${i + 1}\" type=\"MeshInstance3D\" parent=\".\"]`,
+        `mesh = SubResource(\"CloudMesh_${i + 1}\")`,
+        "material_override = SubResource(\"CloudMat_1\")",
+        `position = Vector3(${pos[0]}, ${pos[1]}, ${pos[2]})`
+      );
+    }
+    return lines.join("\n");
+  }
+  if (normalized === "building" || normalized === "skyscraper" || normalized === "tower") {
+    const floors = Math.max(6, Math.min(40, Math.round(intent.skyscraperFloors || (normalized === "building" ? 10 : 18))));
+    const cols = Math.max(2, Math.min(8, Math.round(intent.windowColumns || 4)));
+    const height = Math.max(10, floors * 1.8);
+    const bodyWidth = normalized === "building" ? 8 : 10;
+    const bodyDepth = normalized === "building" ? 8 : 12;
+    const bodyY = Number((height / 2).toFixed(2));
+    const windowRows = Math.max(4, Math.min(24, floors - 2));
+
+    const lines: string[] = [
+      "[gd_scene format=3]",
+      "",
+      "[sub_resource type=\"StandardMaterial3D\" id=\"BuildingMat_1\"]",
+      "albedo_color = Color(0.82, 0.84, 0.9, 1)",
+      "",
+      "[sub_resource type=\"StandardMaterial3D\" id=\"WindowMat_1\"]",
+      "albedo_color = Color(0.65, 0.78, 0.95, 1)",
+      "emission_enabled = true",
+      "emission = Color(0.18, 0.24, 0.3, 1)",
+      "",
+      "[sub_resource type=\"BoxMesh\" id=\"BuildingBodyMesh_1\"]",
+      `size = Vector3(${bodyWidth}, ${height}, ${bodyDepth})`,
+      "",
+      "[sub_resource type=\"BoxMesh\" id=\"WindowMesh_1\"]",
+      "size = Vector3(0.8, 0.55, 0.2)",
+      "",
+      "[node name=\"SkyscraperScene\" type=\"Node3D\"]",
+      "",
+      "[node name=\"BuildingBody\" type=\"MeshInstance3D\" parent=\".\"]",
+      "mesh = SubResource(\"BuildingBodyMesh_1\")",
+      "material_override = SubResource(\"BuildingMat_1\")",
+      `position = Vector3(0, ${bodyY}, 0)`,
+    ];
+
+    const startY = 2.2;
+    const rowGap = Math.max(0.9, (height - 4) / windowRows);
+    const colGap = bodyWidth / (cols + 1);
+    let windowIdx = 1;
+    for (let r = 0; r < windowRows; r++) {
+      const y = Number((startY + r * rowGap).toFixed(2));
+      for (let c = 0; c < cols; c++) {
+        const x = Number((-bodyWidth / 2 + colGap * (c + 1)).toFixed(2));
+        const zFront = Number((bodyDepth / 2 + 0.12).toFixed(2));
+        const zBack = Number((-bodyDepth / 2 - 0.12).toFixed(2));
+        lines.push(
+          "",
+          `[node name=\"Window_${windowIdx}\" type=\"MeshInstance3D\" parent=\".\"]`,
+          "mesh = SubResource(\"WindowMesh_1\")",
+          "material_override = SubResource(\"WindowMat_1\")",
+          `position = Vector3(${x}, ${y}, ${zFront})`
+        );
+        windowIdx++;
+        lines.push(
+          "",
+          `[node name=\"Window_${windowIdx}\" type=\"MeshInstance3D\" parent=\".\"]`,
+          "mesh = SubResource(\"WindowMesh_1\")",
+          "material_override = SubResource(\"WindowMat_1\")",
+          `position = Vector3(${x}, ${y}, ${zBack})`
+        );
+        windowIdx++;
+      }
+    }
+
+    return lines.join("\n");
+  }
+  return buildPrimitiveSceneFallback(normalized);
+}
+
+function buildSceneRepairCandidatePaths(pathHint: string): string[] {
+  const normalized = sanitizeGeneratedSceneRelativePath(pathHint, "Scene.tscn");
+  const basename = normalized.split("/").pop() || normalized;
+  const preferredRoots = ["", "Assets", "assets", "Scenes", "scenes", "Levels", "levels", "World", "world"];
+  const out = [normalized, basename, ...preferredRoots.map((root) => (root ? `${root}/${basename}` : basename))];
+  return Array.from(new Set(out.map((p) => p.replace(/^\/+/, "")))).filter(Boolean);
+}
+
+function parseGodotVersionFromProjectFile(text: string): string | null {
+  const t = String(text || "");
+  if (!t.trim()) return null;
+  const section = t.match(/^\[application\][\s\S]*?(?=^\[[^\]]+\]|\Z)/m)?.[0] || "";
+  const valueMatch = section.match(/config\/features\s*=\s*PackedStringArray\(([^\)]*)\)/i);
+  const payload = valueMatch?.[1] || t;
+  const versionMatch = payload.match(/\b(\d+\.\d+(?:\.\d+)?(?:\.[a-z0-9_]+)?(?:\.[a-z0-9_]+)?)\b/i);
+  return versionMatch?.[1] || null;
+}
+
+function extractGodotVersionFromUnknown(payload: any): string | null {
+  if (payload == null) return null;
+  if (typeof payload === "string") {
+    const m = payload.match(/\bgodot\s*(?:engine)?\s*(?:version)?\s*[:=]?\s*(\d+\.\d+(?:\.\d+)?(?:\.[a-z0-9_]+)?)/i)
+      || payload.match(/\b(\d+\.\d+(?:\.\d+)?(?:\.[a-z0-9_]+)?)\b/i);
+    return m?.[1] || null;
+  }
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const found = extractGodotVersionFromUnknown(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof payload === "object") {
+    const directCandidates = [
+      payload.godotVersion,
+      payload.godot_version,
+      payload.engineVersion,
+      payload.engine_version,
+      payload.version,
+      payload.projectVersion,
+      payload.project_version,
+      payload.content,
+      payload.text,
+      payload.result,
+      payload.data,
+      payload.metadata,
+    ];
+    for (const candidate of directCandidates) {
+      const found = extractGodotVersionFromUnknown(candidate);
+      if (found) return found;
+    }
+    for (const v of Object.values(payload)) {
+      const found = extractGodotVersionFromUnknown(v);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function isProjectIdeationRequest(text: string): boolean {
   const t = text.trim().toLowerCase();
   if (!t) return false;
@@ -556,6 +1477,91 @@ function parseWeatherRequest(text: string): { location: string; dayOffset: numbe
   if (!location) return null;
 
   return { location, dayOffset };
+}
+
+function parseUvIndexRequest(text: string): { location: string | null } | null {
+  const raw = normalizeConversationalQuery(text.trim());
+  const lower = raw.toLowerCase();
+  if (!(/\buv\b/.test(lower) || lower.includes("uv index"))) return null;
+
+  const inMatch = raw.match(/\b(?:in|for|at)\s+(.+)$/i);
+  if (inMatch?.[1]) {
+    const loc = inMatch[1]
+      .replace(/\b(?:today|tonight|tomorrow|now|right now|currently|there)\b/gi, "")
+      .replace(/^[\s,.-]+|[\s,.-]+$/g, "")
+      .trim();
+    return { location: loc || null };
+  }
+
+  if (/\bthere\b/i.test(raw)) return { location: null };
+
+  const stripped = raw
+    .replace(/\b(?:what(?:'s| is)?|tell me|give me|the|current|today(?:'s)?|uv|index)\b/gi, "")
+    .replace(/^[\s,.-]+|[\s,.-]+$/g, "")
+    .trim();
+  return { location: stripped || null };
+}
+
+function isBridgeResyncRequest(text: string): boolean {
+  const t = normalizeConversationalQuery(text).toLowerCase();
+  if (!t) return false;
+  if (!/(refresh|resync|sync|re-sync|reconnect|re-open|reopen|get project|full pull|pull project)/.test(t)) return false;
+  return /(bridge|mcp|project)/.test(t);
+}
+
+function extractLastWeatherLocation(messages: Message[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "llm") continue;
+    const match = m.text.match(/forecast I found for\s+(.+?)\s+(?:today|tomorrow|on\s+\w+)/i);
+    if (match?.[1]) return match[1].trim();
+  }
+  return null;
+}
+
+function extractUvFromWeatherPayload(payload: any): number | null {
+  const candidates = [
+    payload?.uvIndex,
+    payload?.uv_index,
+    payload?.current?.uv_index,
+    payload?.current?.uvIndex,
+    payload?.daily?.uv_index_max?.[0],
+  ];
+  for (const val of candidates) {
+    const n = Number(val);
+    if (Number.isFinite(n)) return n;
+  }
+  const summary = String(payload?.summary || "");
+  const m = summary.match(/uv\s*(?:index)?\s*[:=]?\s*(\d+(?:\.\d+)?)/i);
+  if (m?.[1]) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function extractUvFromNetworkHits(hits: NetworkHit[]): { value: number | null; sourceUrl: string | null } {
+  for (const hit of hits || []) {
+    const text = `${hit.title || ""} ${hit.snippet || ""}`;
+    const m = text.match(/uv\s*(?:index)?\s*[:=]?\s*(\d+(?:\.\d+)?)/i);
+    if (m?.[1]) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) return { value: n, sourceUrl: hit.url || null };
+    }
+  }
+  return { value: null, sourceUrl: null };
+}
+
+function formatMessageTimestamp(ts?: number): string {
+  if (!Number.isFinite(ts)) return "";
+  const d = new Date((ts as number) * 1000);
+  return d.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function buildWeatherReply(payload: any): string {
@@ -686,6 +1692,9 @@ type ProjectDef = {
   description: string;
   manipulationRootPath: string;
   datawebEnabled: boolean;
+  godotVersionCached?: string;
+  lastBridgeSyncAt?: number;
+  lastFullProjectPullAt?: number;
   repoIds: string[];
   entryIds: string[];
   mcpIds: string[];
@@ -697,6 +1706,7 @@ type RepoProjectStore = {
   mcps: McpConnection[];
   sshs: SshConnection[];
   projects: ProjectDef[];
+  tools: IrisToolDef[];
 };
 
 type RepoAssistantMessage = {
@@ -754,6 +1764,7 @@ type CustomModelDef = { id: string; filename: string; nickname: string; enabled:
 type ModelConfigFE = {
   coderEnabled: boolean;
   visionEnabled: boolean;
+  summarizerEnabled: boolean;
   customModels: CustomModelDef[];
   modelNotes: Record<string, string>;
   statusVerbs: Record<string, string>;
@@ -773,16 +1784,25 @@ function profileCapabilities(profile: LlmProfile) {
     profile === "High" ? 3 :
     profile === "MediumHigh" ? 2 :
     profile === "Medium" ? 1 : 0; // Low and Minimal = 0
+  const constrained = profile === "Low" || profile === "Minimal";
 
   return {
-    // Repos/MCP are available on all tiers; users can toggle them for speed/cognitive bandwidth.
-    reposAvailable: true,
-    mcpAvailable: true,
+    reposAvailable: !constrained,
+    mcpAvailable: !constrained,
     fullRagEnabled: tier >= 2,     // MediumHigh and above
     multiMcpEnabled: tier >= 2,    // MediumHigh and above
     deepReasoningEnabled: tier >= 2,
     tokenBudget: tier >= 3 ? 3600 : tier === 2 ? 2400 : 1200,
   };
+}
+
+function isBooleanParamValue(value: string): boolean {
+  const v = String(value || "").trim().toLowerCase();
+  return v === "true" || v === "false";
+}
+
+function boolParamChecked(value: string): boolean {
+  return String(value || "").trim().toLowerCase() === "true";
 }
 
 function iterationBudgetForProfile(profile: LlmProfile): number {
@@ -800,6 +1820,34 @@ function iterationBudgetForProfile(profile: LlmProfile): number {
     default:
       return 1;
   }
+}
+
+function adaptiveResponseTokenBudget(params: {
+  userText: string;
+  quickMode: boolean;
+  hasImages: boolean;
+  engineeringTask: boolean;
+  profile: LlmProfile;
+}): number {
+  const { userText, quickMode, hasImages, engineeringTask, profile } = params;
+  if (quickMode) return 320;
+
+  const words = String(userText || "").trim().split(/\s+/).filter(Boolean).length;
+  const complexSignals = /(implement|build|create|scene|godot|plan|architecture|debug|fix|refactor|multi-step|iterate|tool|mcp|bridge|skyscraper|cloud)/i.test(userText);
+
+  let budget = 700;
+  if (words > 30) budget += 180;
+  if (words > 70) budget += 220;
+  if (complexSignals) budget += 220;
+  if (engineeringTask) budget += 300;
+  if (hasImages) budget += 120;
+
+  if (profile === "Ultra") budget += 220;
+  if (profile === "High") budget += 140;
+  if (profile === "Low") budget -= 80;
+  if (profile === "Minimal") budget -= 120;
+
+  return Math.max(360, Math.min(2200, budget));
 }
 
 type FootprintLevel = "Very Light" | "Light" | "Balanced" | "Heavy" | "Very Heavy";
@@ -893,6 +1941,48 @@ function mixHex(a: string, b: string, ratio: number): string {
 
 function makeId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function clampScore(value: number, min = 0, max = 100): number {
+  return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
+}
+
+function normalizeProficiencyName(value: string): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function detectTaskTags(text: string): string[] {
+  const t = String(text || "").toLowerCase();
+  const tags = new Set<string>();
+  if (/(file|folder|directory|path|write|read|rename|delete|move)/.test(t)) tags.add("filesystem");
+  if (/(mcp|bridge|tool call|call tool)/.test(t)) tags.add("mcp bridges");
+  if (/(ssh|remote|host|server|deploy)/.test(t)) tags.add("ssh bridges");
+  if (/(window|screenshot|desktop|ui capture)/.test(t)) tags.add("desktop tools");
+  if (/(memory|recall|summary|context|history)/.test(t)) tags.add("project memory");
+  if (/(network|internet|latest|news|weather|release)/.test(t)) tags.add("network lookup");
+  if (/(code|script|gdscript|typescript|bug|fix|compile|refactor)/.test(t)) tags.add("coding");
+  if (/(plan|organize|strategy|route|workflow)/.test(t)) tags.add("planning");
+  if (/(debug|error|trace|stack|parse)/.test(t)) tags.add("debugging");
+  if (/(model|mesh|scene|3d|blender)/.test(t)) tags.add("3d modeling");
+  return Array.from(tags);
+}
+
+function detectFeedbackDelta(text: string): number {
+  const t = String(text || "").toLowerCase();
+  if (/(great|awesome|perfect|exactly|thanks|thank you|nice work|works now)/.test(t)) return 1.2;
+  if (/(wrong|failed|broken|error|didn't work|does not work|parse error|bad output)/.test(t)) return -1.8;
+  return 0;
+}
+
+function computeConfidenceForTags(stats: AgentProficiency[], tags: string[]): number {
+  if (!tags.length) return 50;
+  const byName = new Map(stats.map((s) => [normalizeProficiencyName(s.name), s.score]));
+  const scores = tags
+    .map((tag) => byName.get(normalizeProficiencyName(tag)))
+    .filter((v): v is number => typeof v === "number");
+  if (!scores.length) return 50;
+  const avg = scores.reduce((sum, v) => sum + v, 0) / scores.length;
+  return Math.round(clampScore(avg));
 }
 
 function formatBytes(bytes: number): string {
@@ -1138,6 +2228,9 @@ function App() {
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [chatDragActive, setChatDragActive] = useState(false);
+  const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
+  const [editingLastUserMsgIdx, setEditingLastUserMsgIdx] = useState<number | null>(null);
+  const [editingLastUserMsgDraft, setEditingLastUserMsgDraft] = useState("");
   const [thinking, setThinking] = useState(false);
   const [ellipsis, setEllipsis] = useState(".");
   const [isGenerating, setIsGenerating] = useState(false);
@@ -1154,19 +2247,24 @@ function App() {
   const abortController = useRef<AbortController | null>(null);
   const mcpProbeAbortedRef = useRef<Set<string>>(new Set());
   const historyRef = useRef<HTMLDivElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
   const taskbarRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const chatFormRef = useRef<HTMLFormElement>(null);
   const promptHistoryIndexRef = useRef<number>(-1);
   const promptHistoryDraftRef = useRef<string>("");
   const projectDraftSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const mcpToolCacheRef = useRef<Record<string, { tools: McpToolDescriptor[]; ts: number }>>({});
+  const bridgeMetaRefreshRef = useRef<Record<string, number>>({});
+  const tabTurnCounterRef = useRef<Record<number, number>>({});
+  const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
   const isMounted = useRef(true);
 
   const [useCoder, setUseCoder] = useState(false);
   const [setupResult, setSetupResult] = useState<"ready" | "missing-ollama" | "missing-models" | null>(null);
 
   // Model config (loaded from model_config.json on startup)
-  const [modelConfig, setModelConfig] = useState<ModelConfigFE>({ coderEnabled: true, visionEnabled: true, customModels: [], modelNotes: {}, statusVerbs: {} });
+  const [modelConfig, setModelConfig] = useState<ModelConfigFE>({ coderEnabled: true, visionEnabled: true, summarizerEnabled: true, customModels: [], modelNotes: {}, statusVerbs: {} });
   const [modelConfigDirty, setModelConfigDirty] = useState(false);
 
   const [interpretV2Enabled, setInterpretV2Enabled] = useState(true);
@@ -1175,9 +2273,27 @@ function App() {
   const [mcpEnabled, setMcpEnabled] = useState(true);
   const [desktopToolsEnabled, setDesktopToolsEnabled] = useState(false);
   const [desktopDashboardEnabled, setDesktopDashboardEnabled] = useState(false);
+  const [visionTimeoutMinutes, setVisionTimeoutMinutes] = useState(1.5);
+  const [detailedProgressEnabled, setDetailedProgressEnabled] = useState(true);
+  
+  // Auto-adjust vision timeout based on profile
+  const effectiveVisionTimeout = 
+    llmProfile === "Ultra" ? 1.0 :
+    llmProfile === "High" ? 1.2 :
+    llmProfile === "MediumHigh" ? 1.5 :
+    llmProfile === "Medium" ? 1.5 :
+    llmProfile === "Low" ? 2.5 : 3.5; // Minimal gets longest timeout
   const [hwToast, setHwToast] = useState<string | null>(null);
   const hwToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [assistantName, setAssistantName] = useState("Iris");
+  const [permissionSettings, setPermissionSettings] = useState<PermissionSettings>(DEFAULT_PERMISSION_SETTINGS);
+  const [inlinePermissionQueue, setInlinePermissionQueue] = useState<InlinePermissionRequest[]>([]);
+  const inlinePermissionResolverRef = useRef<Record<string, (value: boolean) => void>>({});
+  const [agentProficiencies, setAgentProficiencies] = useState<AgentProficiency[]>(DEFAULT_AGENT_PROFICIENCIES);
+  const [agentStatsDraftName, setAgentStatsDraftName] = useState("");
+  const [lastTaskTags, setLastTaskTags] = useState<string[]>([]);
+  const [lastTaskConfidence, setLastTaskConfidence] = useState<number>(50);
+  const agentStatsHydratedRef = useRef(false);
   const [themePreset, setThemePreset] = useState<ThemePreset>("Black");
   const [customThemeColor, setCustomThemeColor] = useState("#232323");
   const [colorMode, setColorMode] = useState<"dark" | "light">("dark");
@@ -1194,6 +2310,7 @@ function App() {
   // MCP draft: buffered edits, only saved to repoStore on "Save MCPs" button
   const [mcpDraft, setMcpDraft] = useState<McpConnection[]>([]);
   const [sshDraft, setSshDraft] = useState<SshConnection[]>([]);
+  const [toolDraft, setToolDraft] = useState<IrisToolDef[]>([]);
   const [mcpLaunchStatus, setMcpLaunchStatus] = useState<Record<string, { pid: number; launched: boolean }>>({});
   const [mcpHealthStatus, setMcpHealthStatus] = useState<Record<string, { state: "stopped" | "launching" | "bridge_up" | "connected" | "error"; message: string; toolCount?: number }>>({});
   const [sshConnectStatus, setSshConnectStatus] = useState<Record<string, { connected: boolean; checking: boolean; message?: string }>>({});
@@ -1211,7 +2328,7 @@ function App() {
   const [userPersonaPrompt, setUserPersonaPrompt] = useState("");
   const [userPersonaSavedPrompt, setUserPersonaSavedPrompt] = useState("");
   const [userPersonaDirty, setUserPersonaDirty] = useState(false);
-  const [repoStore, setRepoStore] = useState<RepoProjectStore>({ repos: [], mcps: [], sshs: [], projects: [] });
+  const [repoStore, setRepoStore] = useState<RepoProjectStore>({ repos: [], mcps: [], sshs: [], projects: [], tools: [] });
   const [projectDescriptionDrafts, setProjectDescriptionDrafts] = useState<Record<string, string>>({});
   const [projectManipulationRootDrafts, setProjectManipulationRootDrafts] = useState<Record<string, string>>({});
   const [projectDescriptionDirty, setProjectDescriptionDirty] = useState<Record<string, boolean>>({});
@@ -1284,6 +2401,77 @@ function App() {
     if (resolver) resolver(value);
   }
 
+  function askInlinePermission(args: Omit<InlinePermissionRequest, "id">): Promise<boolean> {
+    return new Promise((resolve) => {
+      const id = makeId("perm");
+      inlinePermissionResolverRef.current[id] = resolve;
+      setInlinePermissionQueue((prev) => [...prev, { id, ...args }]);
+    });
+  }
+
+  function resolveInlinePermission(id: string, value: boolean) {
+    const resolver = inlinePermissionResolverRef.current[id];
+    if (resolver) {
+      delete inlinePermissionResolverRef.current[id];
+      resolver(value);
+    }
+    setInlinePermissionQueue((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  async function persistPermissionSettings(next: PermissionSettings) {
+    setPermissionSettings(next);
+    try {
+      await invoke("set_setup_flags", {
+        args: {
+          permissionMode: next.mode,
+          alwaysAllowLowRisk: next.alwaysAllowLowRisk,
+          allowIterationWithoutPrompt: next.allowIterationWithoutPrompt,
+          testingConfidenceThreshold: next.testingConfidenceThreshold,
+        },
+      });
+    } catch (e) {
+      console.warn("Failed to persist permission settings", e);
+    }
+  }
+
+  async function persistAgentProficiencies(next: AgentProficiency[]) {
+    const normalized = next.map((item) => ({
+      ...item,
+      name: String(item.name || "").trim() || "Untitled Skill",
+      score: Number(clampScore(item.score)),
+    }));
+    setAgentProficiencies(normalized);
+    try {
+      await invoke("set_setup_flags", {
+        args: {
+          agentProficienciesJson: JSON.stringify(normalized),
+        },
+      });
+    } catch (e) {
+      console.warn("Failed to persist agent proficiencies", e);
+    }
+  }
+
+  function applyProficiencyDelta(tags: string[], delta: number) {
+    if (!tags.length || !delta) return;
+    setAgentProficiencies((prev) => {
+      const normalizedTags = tags.map(normalizeProficiencyName);
+      const touched = new Set<string>();
+      const next = prev.map((item) => {
+        const k = normalizeProficiencyName(item.name);
+        if (!normalizedTags.includes(k)) return item;
+        touched.add(k);
+        return { ...item, score: clampScore(item.score + delta) };
+      });
+      for (const tag of normalizedTags) {
+        if (!touched.has(tag)) {
+          next.push({ id: makeId("prof"), name: tag.replace(/\b\w/g, (m) => m.toUpperCase()), score: clampScore(50 + delta) });
+        }
+      }
+      return next;
+    });
+  }
+
   useEffect(() => {
     if (setupResult === "ready") {
       setCoderReady(true);
@@ -1317,9 +2505,17 @@ function App() {
   const appTabActiveBgColor = isLightMode ? mixHex(activeThemeColor, "#e7ebf0", 0.82) : mixHex(activeThemeColor, "#0e0e0e", 0.52);
   const appInputBgColor = isLightMode ? "rgba(235, 239, 244, 0.84)" : mixHex(activeThemeColor, "#141414", 0.68);
   const appPanelBgColor = isLightMode ? "rgba(208, 214, 223, 0.72)" : mixHex(activeThemeColor, "#0d0d0d", 0.55);
+  const appUserBubbleColor = isLightMode ? mixHex(activeThemeColor, "#d8e2ef", 0.78) : mixHex(activeThemeColor, "#0a0a0a", 0.58);
   const appTextColor = isLightMode ? "#1a1a1a" : "#e8e8e8";
   const assistantLabel = assistantName.trim() || "Iris";
   const activeProjectId = tabProjectMap[activeTab] ?? null;
+  const chatMessages = currentTab?.messages || [];
+  const lastUserMessageIdx = (() => {
+    for (let i = chatMessages.length - 1; i >= 0; i--) {
+      if (chatMessages[i]?.role === "user") return i;
+    }
+    return -1;
+  })();
 
   function updateTabPromptHistory(tabId: number, prompt: string) {
     const normalized = prompt.trim();
@@ -1373,13 +2569,172 @@ function App() {
     ? repoStore.sshs.filter((s) => s.enabled && !!s.host.trim() && activeProjectSshIds.has(String(s.id)))
     : [];
   const showChatBridgeControls = currentTab?.type === "chat" && (launchableProjectMcps.length > 0 || launchableProjectSsh.length > 0);
+
+  function isProjectBridgeConnected(project: ProjectDef | null): boolean {
+    if (!project) return false;
+    const mcpConnected = (project.mcpIds || []).some((id) => {
+      const st = mcpHealthStatus[String(id)];
+      const launched = !!mcpLaunchStatus[String(id)]?.launched;
+      return launched && (st?.state === "connected" || st?.state === "bridge_up");
+    });
+    if (mcpConnected) return true;
+    return (project.sshIds || []).some((id) => !!sshConnectStatus[String(id)]?.connected);
+  }
+
+  async function refreshProjectBridgeMetadata(project: ProjectDef, options?: { forceFullPull?: boolean; reason?: string }) {
+    if (!project?.enabled) return;
+    if (!isProjectBridgeConnected(project)) return;
+
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    const forceFullPull = !!options?.forceFullPull;
+    const reason = String(options?.reason || "bridge_sync");
+    const throttleMs = forceFullPull ? 0 : 4 * 60 * 1000;
+    const lastAttempt = bridgeMetaRefreshRef.current[project.id] || 0;
+    if (!forceFullPull && nowMs - lastAttempt < throttleMs) return;
+    bridgeMetaRefreshRef.current[project.id] = nowMs;
+
+    const rootPath = String(project.manipulationRootPath || "").trim();
+    const connectedMcps = repoStore.mcps.filter((m) =>
+      m.enabled &&
+      (project.mcpIds || []).includes(m.id) &&
+      !!mcpLaunchStatus[m.id]?.launched &&
+      ["connected", "bridge_up"].includes(mcpHealthStatus[m.id]?.state || "")
+    );
+
+    let detectedVersion = "";
+    for (const mcp of connectedMcps) {
+      const parsed = parseMcpTarget(mcp.target);
+      const connectionType = parsed.type;
+      const command = mcp.launchCommand || parsed.command;
+      const args = Array.isArray(mcp.launchArgs) ? mcp.launchArgs.map(String) : (parsed.args ?? []);
+      const target = typeof mcp.target === "string" ? mcp.target : "";
+      try {
+        const tools = await withTimeout(invoke("mcp_list_tools", {
+          mcpId: mcp.id,
+          target,
+          connectionType,
+          command: connectionType === "stdio" ? command : (parsed.url || target),
+          args,
+        }) as Promise<Array<{ name: string }>>, 2200, `mcp_list_tools:meta:${mcp.name}`);
+        const names = (Array.isArray(tools) ? tools : [])
+          .map((t) => String(t?.name || "").trim())
+          .filter(Boolean);
+        const preferred = names.filter((n) => /(version|project|engine|godot)/i.test(n));
+        const candidates = [...preferred, ...names].slice(0, 12);
+        for (const toolName of candidates) {
+          try {
+            const raw = await withTimeout(invoke("mcp_call_tool", {
+              mcpId: mcp.id,
+              target,
+              connectionType,
+              command: connectionType === "stdio" ? command : (parsed.url || target),
+              args,
+              toolName,
+              arguments: {},
+            }), 2600, `mcp_call_tool:meta:${toolName}`);
+            const parsedVersion = extractGodotVersionFromUnknown(raw);
+            if (parsedVersion) {
+              detectedVersion = parsedVersion;
+              break;
+            }
+          } catch {}
+        }
+      } catch {}
+      if (detectedVersion) break;
+    }
+
+    if (!detectedVersion && rootPath) {
+      try {
+        const projectFile = await withTimeout(
+          invoke("fs_read_text", { root: rootPath, path: "project.godot", maxChars: 12000 }) as Promise<string>,
+          1600,
+          "fs_read_text(project.godot)"
+        );
+        detectedVersion = parseGodotVersionFromProjectFile(projectFile) || "";
+      } catch {}
+    }
+
+    const fullPullDue = forceFullPull || !project.lastFullProjectPullAt || (nowSec - Number(project.lastFullProjectPullAt || 0) > 6 * 60 * 60);
+    let projectLayoutNote = "";
+    if (fullPullDue && rootPath) {
+      try {
+        const entries = await withTimeout(
+          invoke("fs_list_dir", { root: rootPath, path: "." }) as Promise<RepoEntry[]>,
+          1800,
+          "fs_list_dir(bridge_sync)"
+        );
+        projectLayoutNote = (Array.isArray(entries) ? entries : [])
+          .slice(0, 80)
+          .map((e) => `${e.isDir ? "[DIR]" : "[FILE]"} ${e.path}`)
+          .join("\n");
+      } catch {}
+    }
+
+    const nextVersion = String(detectedVersion || project.godotVersionCached || "").trim();
+    const nextProject: ProjectDef = {
+      ...project,
+      godotVersionCached: nextVersion,
+      lastBridgeSyncAt: nowSec,
+      lastFullProjectPullAt: fullPullDue ? nowSec : Number(project.lastFullProjectPullAt || 0),
+    };
+    const hasProjectChange =
+      String(project.godotVersionCached || "") !== String(nextProject.godotVersionCached || "") ||
+      Number(project.lastBridgeSyncAt || 0) !== Number(nextProject.lastBridgeSyncAt || 0) ||
+      Number(project.lastFullProjectPullAt || 0) !== Number(nextProject.lastFullProjectPullAt || 0);
+    if (hasProjectChange) {
+      const nextStore: RepoProjectStore = {
+        ...repoStore,
+        projects: repoStore.projects.map((p) => (p.id === project.id ? nextProject : p)),
+      };
+      await persistRepoStore(nextStore);
+    }
+
+    if (project.datawebEnabled) {
+      try {
+        const existing = await withTimeout(
+          invoke("read_project_dataweb", { projectId: project.id }) as Promise<string>,
+          1000,
+          "read_project_dataweb(bridge_sync)"
+        );
+        const marker = "## Bridge Sync Metadata";
+        const snapshot = [
+          marker,
+          `- Updated: ${new Date(nowMs).toISOString()}`,
+          `- Reason: ${reason}`,
+          `- Godot version: ${nextVersion || "unknown"}`,
+          `- Full pull refreshed: ${fullPullDue ? "yes" : "no"}`,
+          `- Manipulation root: ${rootPath || "(none)"}`,
+          projectLayoutNote ? `Layout snapshot:\n${projectLayoutNote}` : "",
+        ].filter(Boolean).join("\n");
+        const next = existing.includes(marker)
+          ? existing.replace(new RegExp(`${marker}[\\s\\S]*?(?=\\n## |$)`, "m"), snapshot)
+          : `${existing.trim()}\n\n${snapshot}`.trim();
+        await withTimeout(
+          invoke("write_project_dataweb", { projectId: project.id, content: next }) as Promise<any>,
+          1300,
+          "write_project_dataweb(bridge_sync)"
+        );
+      } catch {}
+    }
+  }
+
+  async function refreshProjectsForBridgeOpen(mcpId: string, reason: string) {
+    const targets = repoStore.projects.filter((p) => p.enabled && (p.mcpIds || []).includes(mcpId));
+    for (const p of targets) {
+      try {
+        await refreshProjectBridgeMetadata(p, { forceFullPull: true, reason });
+      } catch {}
+    }
+  }
   const llmCapabilities = profileCapabilities(llmProfile);
+  const lowPowerProfile = llmProfile === "Low" || llmProfile === "Minimal";
   const configuredRouteModels = [
     "iris-organizer",
     ...(modelConfig.coderEnabled ? ["iris-coder"] : []),
     ...(modelConfig.visionEnabled ? ["iris-vision"] : []),
     ...modelConfig.customModels.filter((m) => m.enabled).map((m) => m.filename.replace(/\.txt$/i, "")),
-    "iris-summarizer",
+    ...(modelConfig.summarizerEnabled ? ["iris-summarizer"] : []),
   ];
   const configuredRouteSummary = `Configured route: ${configuredRouteModels.join(" -> ")}`;
   const organizerFilename = modelfileFilenames.find((name) => name.toLowerCase().includes("organizer")) || "modelfile_organizer.txt";
@@ -1396,6 +2751,8 @@ function App() {
   };
   const mcpDirty = safeStringify(mcpDraft) !== safeStringify(repoStore.mcps);
   const sshDirty = safeStringify(sshDraft) !== safeStringify(repoStore.sshs);
+  const toolDirty = safeStringify(toolDraft) !== safeStringify(repoStore.tools);
+  const activeInlinePermission = inlinePermissionQueue.length ? inlinePermissionQueue[0] : null;
   const effectiveFootprint = computeEffectiveContextFootprint({
     profile: llmProfile,
     tokenBudget: liveTokenBudget,
@@ -1408,11 +2765,59 @@ function App() {
     interpretV2On: interpretV2Enabled,
   });
 
+  function shouldAskPermissionForAction(risk: ActionRisk, confidence: number): boolean {
+    if (permissionSettings.alwaysAllowLowRisk && risk === "low") return false;
+    if (permissionSettings.mode === "always_ask") return true;
+    if (permissionSettings.mode === "testing" && confidence < permissionSettings.testingConfidenceThreshold) return true;
+    if (risk === "high") return true;
+    if (risk === "medium" && !permissionSettings.allowIterationWithoutPrompt) return true;
+    return false;
+  }
+
+  async function requestActionPermission(args: {
+    title: string;
+    message: string;
+    actionKey: string;
+    risk: ActionRisk;
+    confidence: number;
+  }): Promise<boolean> {
+    const ask = shouldAskPermissionForAction(args.risk, args.confidence);
+    if (!ask) return true;
+    return askInlinePermission({
+      title: args.title,
+      message: args.message,
+      actionKey: args.actionKey,
+      risk: args.risk,
+      confidence: args.confidence,
+    });
+  }
+
   useEffect(() => {
     return () => {
       if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!lowPowerProfile) return;
+    const args: Record<string, boolean> = {};
+    let changed = false;
+    if (reposEnabled) {
+      setReposEnabled(false);
+      args.reposEnabled = false;
+      changed = true;
+    }
+    if (mcpEnabled) {
+      setMcpEnabled(false);
+      args.mcpEnabled = false;
+      changed = true;
+    }
+    if (changed) {
+      invoke("set_setup_flags", { args }).catch((e) => {
+        console.warn("Failed to persist low-power feature gating", e);
+      });
+    }
+  }, [lowPowerProfile, reposEnabled, mcpEnabled]);
 
   // helper: retry listOpenTabs a few times to be resilient to late Tauri injection
   async function tryListOpenTabs(retries = 4) {
@@ -1475,6 +2880,34 @@ function App() {
           if (typeof flags?.assistantName === "string" && String(flags.assistantName).trim()) {
             setAssistantName(String(flags.assistantName));
           }
+          if (typeof flags?.permissionMode === "string") {
+            const mode = String(flags.permissionMode);
+            if (mode === "balanced" || mode === "always_ask" || mode === "testing") {
+              setPermissionSettings((prev) => ({ ...prev, mode: mode as PermissionMode }));
+            }
+          }
+          if (typeof flags?.alwaysAllowLowRisk === "boolean") {
+            setPermissionSettings((prev) => ({ ...prev, alwaysAllowLowRisk: !!flags.alwaysAllowLowRisk }));
+          }
+          if (typeof flags?.allowIterationWithoutPrompt === "boolean") {
+            setPermissionSettings((prev) => ({ ...prev, allowIterationWithoutPrompt: !!flags.allowIterationWithoutPrompt }));
+          }
+          if (Number.isFinite(flags?.testingConfidenceThreshold)) {
+            setPermissionSettings((prev) => ({ ...prev, testingConfidenceThreshold: clampScore(Number(flags.testingConfidenceThreshold)) }));
+          }
+          if (typeof flags?.agentProficienciesJson === "string" && flags.agentProficienciesJson.trim()) {
+            try {
+              const parsed = JSON.parse(flags.agentProficienciesJson);
+              if (Array.isArray(parsed) && parsed.length) {
+                const normalized = parsed.map((item: any) => ({
+                  id: String(item?.id || makeId("prof")),
+                  name: String(item?.name || "Untitled Skill").trim() || "Untitled Skill",
+                  score: clampScore(Number(item?.score ?? 50)),
+                }));
+                setAgentProficiencies(normalized);
+              }
+            } catch {}
+          }
           if (typeof flags?.themeColor === "string" && String(flags.themeColor).trim()) {
             setCustomThemeColor(String(flags.themeColor));
           }
@@ -1506,7 +2939,10 @@ function App() {
           if (flags?.colorMode === "light") {
             setColorMode("light");
           }
-        } catch {}
+          agentStatsHydratedRef.current = true;
+        } catch {
+          agentStatsHydratedRef.current = true;
+        }
 
         try {
           setStartupStatus({ active: true, step: "Loading core persona prompt...", progress: 18 });
@@ -1566,11 +3002,17 @@ function App() {
                     description: String(p?.description ?? ""),
                     manipulationRootPath: String(p?.manipulationRootPath ?? p?.manipulation_root_path ?? ""),
                     datawebEnabled: p?.datawebEnabled == null ? true : !!p.datawebEnabled,
+                    godotVersionCached: String(p?.godotVersionCached ?? p?.godot_version_cached ?? ""),
+                    lastBridgeSyncAt: Number(p?.lastBridgeSyncAt ?? p?.last_bridge_sync_at ?? 0) || 0,
+                    lastFullProjectPullAt: Number(p?.lastFullProjectPullAt ?? p?.last_full_project_pull_at ?? 0) || 0,
                     repoIds: Array.isArray(p?.repoIds) ? p.repoIds.map(String) : [],
                     entryIds: Array.isArray(p?.entryIds) ? p.entryIds.map(String) : [],
                     mcpIds: Array.isArray(p?.mcpIds) ? p.mcpIds.map(String) : [],
                     sshIds: Array.isArray(p?.sshIds) ? p.sshIds.map(String) : [],
                   }))
+                : [],
+              tools: Array.isArray((store as any).tools)
+                ? (store as any).tools.map((t: any) => normalizeToolDef(t))
                 : [],
             });
           }
@@ -1581,6 +3023,7 @@ function App() {
           setModelConfig({
             coderEnabled: cfg?.coderEnabled ?? cfg?.coder_enabled ?? true,
             visionEnabled: cfg?.visionEnabled ?? cfg?.vision_enabled ?? true,
+            summarizerEnabled: cfg?.summarizerEnabled ?? cfg?.summarizer_enabled ?? true,
             customModels: Array.isArray(cfg?.customModels ?? cfg?.custom_models)
               ? (cfg.customModels ?? cfg.custom_models).map((m: any) => ({
                   id: String(m?.id ?? ""),
@@ -1718,10 +3161,16 @@ function App() {
 
 
   useEffect(() => {
-    if (historyRef.current) {
-      historyRef.current.scrollTop = historyRef.current.scrollHeight;
-    }
-  }, [currentTab?.messages]);
+    const historyEl = historyRef.current;
+    if (!historyEl) return;
+    const raf = requestAnimationFrame(() => {
+      if (chatEndRef.current) {
+        chatEndRef.current.scrollIntoView({ block: "end" });
+      }
+      historyEl.scrollTop = historyEl.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [activeTab, currentTab?.messages, thinking, isGenerating]);
 
   useEffect(() => {
     if (!modelConfig.coderEnabled && useCoder) {
@@ -1810,6 +3259,82 @@ function App() {
   }, [repoStore.sshs]);
 
   useEffect(() => {
+    setToolDraft(prev => {
+      const storeTools = Array.isArray(repoStore.tools) ? repoStore.tools : [];
+      const prevIds = new Set(prev.map(t => t.id));
+      const storeIds = new Set(storeTools.map(t => t.id));
+      const idsMatch = prevIds.size === storeIds.size && [...storeIds].every(id => prevIds.has(id));
+      return idsMatch ? prev : storeTools.map((t) => normalizeToolDef(t));
+    });
+  }, [repoStore.tools]);
+
+  useEffect(() => {
+    const label = (assistantName || "Iris").trim() || "Iris";
+    setRepoAssistantMessages((prev) => {
+      if (!prev.length) return prev;
+      const next = [...prev];
+      if (next[0].role === "assistant") {
+        next[0] = {
+          ...next[0],
+          text: `${label} repo assistant is available. Ask what repos are useful, or paste a Git URL and ask me to install it into a selected repo folder.`,
+        };
+      }
+      return next;
+    });
+  }, [assistantName]);
+
+  useEffect(() => {
+    if (!agentStatsHydratedRef.current) return;
+    invoke("set_setup_flags", {
+      args: {
+        agentProficienciesJson: JSON.stringify(agentProficiencies),
+      },
+    }).catch((e) => {
+      console.warn("Failed to persist agent proficiencies", e);
+    });
+  }, [agentProficiencies]);
+
+  useEffect(() => {
+    try {
+      const rawPerm = localStorage.getItem("iris.permission.settings");
+      if (rawPerm) {
+        const parsed = JSON.parse(rawPerm);
+        const next: PermissionSettings = {
+          mode: parsed?.mode === "always_ask" || parsed?.mode === "testing" ? parsed.mode : "balanced",
+          alwaysAllowLowRisk: parsed?.alwaysAllowLowRisk == null ? true : !!parsed.alwaysAllowLowRisk,
+          allowIterationWithoutPrompt: !!parsed?.allowIterationWithoutPrompt,
+          testingConfidenceThreshold: clampScore(Number(parsed?.testingConfidenceThreshold ?? 50)),
+        };
+        setPermissionSettings(next);
+      }
+      const rawStats = localStorage.getItem("iris.agent.proficiencies");
+      if (rawStats) {
+        const parsed = JSON.parse(rawStats);
+        if (Array.isArray(parsed) && parsed.length) {
+          setAgentProficiencies(parsed.map((item: any) => ({
+            id: String(item?.id || makeId("prof")),
+            name: String(item?.name || "Untitled Skill").trim() || "Untitled Skill",
+            score: clampScore(Number(item?.score ?? 50)),
+          })));
+        }
+      }
+    } catch {}
+    agentStatsHydratedRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("iris.permission.settings", JSON.stringify(permissionSettings));
+    } catch {}
+  }, [permissionSettings]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("iris.agent.proficiencies", JSON.stringify(agentProficiencies));
+    } catch {}
+  }, [agentProficiencies]);
+
+  useEffect(() => {
     if (!thinking) return;
     const interval = setInterval(() => {
       setEllipsis((prev) => (prev.length < 3 ? prev + "." : "."));
@@ -1822,6 +3347,11 @@ function App() {
       setChatBridgePanelOpen(false);
     }
   }, [showChatBridgeControls]);
+
+  useEffect(() => {
+    if (!activeProject || !isProjectBridgeConnected(activeProject)) return;
+    void refreshProjectBridgeMetadata(activeProject, { forceFullPull: false, reason: "project_chat_open" });
+  }, [activeProjectId, mcpHealthStatus, mcpLaunchStatus, sshConnectStatus]);
 
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
@@ -1937,7 +3467,7 @@ function App() {
   function moveChatTab(dragTabId: number, targetTabId: number) {
     if (dragTabId === targetTabId) return;
     setTabs(prev => {
-      const settingsTab = prev.find(tab => tab.type === "settings") || null;
+      const utilityTabs = prev.filter(tab => tab.type !== "chat");
       const chatTabs = prev.filter(tab => tab.type === "chat");
       const fromIndex = chatTabs.findIndex(tab => tab.id === dragTabId);
       const toIndex = chatTabs.findIndex(tab => tab.id === targetTabId);
@@ -1945,7 +3475,7 @@ function App() {
       const reordered = [...chatTabs];
       const [moved] = reordered.splice(fromIndex, 1);
       reordered.splice(toIndex, 0, moved);
-      return settingsTab ? [...reordered, settingsTab] : reordered;
+      return [...reordered, ...utilityTabs];
     });
   }
 
@@ -2123,6 +3653,31 @@ function App() {
     appendWorkLog(tabId, sawRoutineError ? "Routine completed with errors" : "Routine completed");
     return { images: capturedImages, windowHint };
   }
+
+  function editAndResendLastUserMessage(editedText: string) {
+    const next = editedText.trim();
+    if (!next || currentTab?.type !== "chat" || !Array.isArray(currentTab.messages)) return;
+
+    const msgs = currentTab.messages;
+    let lastUserIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx < 0) return;
+
+    updateTabMessages(activeTab, () => msgs.slice(0, lastUserIdx));
+    setEditingLastUserMsgIdx(null);
+    setEditingLastUserMsgDraft("");
+    setInput(next);
+
+    queueMicrotask(() => {
+      chatFormRef.current?.requestSubmit();
+    });
+  }
+
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
     if (menuLocked) {
@@ -2131,6 +3686,10 @@ function App() {
 
     // 1) Validate input and tab BEFORE setting any flags
     const text = input.trim();
+    const feedbackDelta = detectFeedbackDelta(text);
+    if (feedbackDelta && lastTaskTags.length) {
+      applyProficiencyDelta(lastTaskTags, feedbackDelta);
+    }
     let hasImages = pendingImages.length > 0;
     const inferredEarlyActions = inferConversationalActions(text);
     const hasConversationalActionIntent = !!(
@@ -2143,6 +3702,10 @@ function App() {
     const bridgeOrFsExplicit = /^\/(mcp|fs|ssh|desktop|project)\b/i.test(text);
     const referentialFollowup = isReferentialFollowup(text);
     const quickMode = !hasImages && !bridgeOrFsExplicit && !hasConversationalActionIntent && isSimpleCasualRequest(text) && !referentialFollowup;
+    const taskTags = Array.from(new Set([...detectTaskTags(text), ...(hasImages ? ["desktop tools"] : [])]));
+    const confidenceForTurn = computeConfidenceForTags(agentProficiencies, taskTags);
+    setLastTaskTags(taskTags);
+    setLastTaskConfidence(confidenceForTurn);
     if ((!text && !hasImages) || currentTab?.type !== "chat") return;
     if (hasImages && !modelConfig.visionEnabled) {
       alert("Vision model is disabled. Enable Vision in Settings > LLMs to send images.");
@@ -2151,6 +3714,7 @@ function App() {
 
     // Capture the originating tab id so async work always attributes to the original tab
     const requestTabId = activeTab;
+    advanceTabTurn(requestTabId);
 
     // Clear input and show user bubble immediately when send is pressed.
     setInput("");
@@ -2158,10 +3722,36 @@ function App() {
     const userDisplayText = text || `Attached ${pendingImages.length} image${pendingImages.length === 1 ? "" : "s"}.`;
     const userImageDataUrls = pendingImages.map((img) => img.dataUrl);
     let allImageDataUrls = [...userImageDataUrls];
+    
+    // Resize images for vision if this is a vision request and resizing is needed
+    if (hasImages && allImageDataUrls.length > 0) {
+      try {
+        // Check GPU availability to determine if we need more aggressive downscaling
+        let gpuAvailable = true;
+        try {
+          const gpuInfo = await invoke("check_gpu_available") as any;
+          gpuAvailable = gpuInfo?.available ?? true;
+        } catch (e) {
+          gpuAvailable = true; // Assume GPU available on error, safer default
+        }
+        
+        const resizedUrls = await Promise.all(
+          allImageDataUrls.map(url => resizeImageForVision(url, llmProfile, gpuAvailable))
+        );
+        allImageDataUrls = resizedUrls;
+      } catch (err) {
+        console.warn("Image resizing failed, continuing with original images", err);
+      }
+    }
+    
+    // Clear pending images after being processed
+    setPendingImages([]);
+    
     const promptHistoryForTurn = text.trim()
       ? [text.trim(), ...((currentTab?.promptHistory || []).filter((item) => item !== text.trim()))].slice(0, 60)
       : (currentTab?.promptHistory || []);
-    updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, userImageDataUrls));
+    // Use resized images for display, not original images
+    updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, allImageDataUrls));
     if (text.trim()) {
       updateTabPromptHistory(requestTabId, text);
     }
@@ -2192,6 +3782,34 @@ function App() {
         });
       } catch {}
       return;
+    }
+
+    const mentionsVersionMismatch = /(version mismatch|outdated|stale repo|repo.*outdated|gdscript.*outdated|godot.*outdated)/i.test(text);
+    if (mentionsVersionMismatch && repoStore.repos.length && networkEnabled) {
+      const targetRepo = repoStore.repos.find((r) => r.id === repoAssistantTargetRepoId) || repoStore.repos[0];
+      const confidence = computeConfidenceForTags(agentProficiencies, ["network lookup", "project memory"]);
+      const approved = await askInlinePermission({
+        title: "Check repo freshness?",
+        message: `It seems the current repo may be outdated on GitHub. Would you like ${assistantLabel} to check and refresh indexing for ${targetRepo.name}?`,
+        actionKey: "organizer.repo.check_update",
+        risk: "medium",
+        confidence,
+      });
+      if (approved) {
+        const report = await inspectRepoUpdateSignal(targetRepo);
+        updateTabMessages(requestTabId, (msgs) => insertLLMBubble(msgs, report));
+        try {
+          const updateResult = await invoke("update_repo_from_remote", { repoPath: targetRepo.path }) as string;
+          await handleRefreshRepo(targetRepo.id);
+          updateTabMessages(requestTabId, (msgs) => patchLastLLMBubble(msgs, `\n\n${updateResult}\nLocal indexing refreshed for ${targetRepo.name}.`));
+        } catch (updateErr: any) {
+          await handleRefreshRepo(targetRepo.id);
+          const reason = String(updateErr?.message || updateErr || "unknown error");
+          updateTabMessages(requestTabId, (msgs) => patchLastLLMBubble(msgs, `\n\nRemote update was not applied (${reason}). I refreshed local indexing for ${targetRepo.name} instead.`));
+        }
+      } else {
+        updateTabMessages(requestTabId, (msgs) => insertLLMBubble(msgs, `Understood. I will skip repo update checks for now.`));
+      }
     }
 
     // Interpret/routing is owned by backend planner.
@@ -2232,10 +3850,13 @@ function App() {
     const linkedSshForPlanner = selectedProjectForPlanner
       ? repoStore.sshs.filter((s) => selectedProjectForPlanner.sshIds?.includes(s.id) && s.enabled)
       : [];
+    const plannerTranscriptTail = buildTranscriptTailFromSnapshot(preloadedSnapshot, 16);
+    const plannerNeedsLongTermMemory = shouldUseLongTermDataweb(text, plannerTranscriptTail);
     const projectContextForPlanner = selectedProjectForPlanner
       ? [
           `Active project: ${selectedProjectForPlanner.name}`,
           `Description: ${selectedProjectForPlanner.description || "(none)"}`,
+          `Godot version (cached): ${selectedProjectForPlanner.godotVersionCached || "unknown"}`,
           `Manipulation root: ${selectedProjectForPlanner.manipulationRootPath || "(none)"}`,
           `Linked repos: ${linkedReposForPlanner.map((r) => r.name).join(", ") || "(none)"}`,
           `Linked SSH: ${linkedSshForPlanner.map((s) => `${s.name} (${s.username ? `${s.username}@` : ""}${s.host}:${s.port || 22})`).join(", ") || "(none)"}`,
@@ -2244,7 +3865,7 @@ function App() {
       : "";
     let projectDatawebForPlanner = "";
     let universalDatawebForPlanner = "";
-    if (!quickMode && selectedProjectForPlanner?.datawebEnabled) {
+    if (!quickMode && plannerNeedsLongTermMemory && selectedProjectForPlanner?.datawebEnabled) {
       try {
         projectDatawebForPlanner = await withTimeout(
           invoke("read_project_dataweb", { projectId: selectedProjectForPlanner.id }) as Promise<string>,
@@ -2253,7 +3874,7 @@ function App() {
         );
       } catch {}
     }
-    if (!quickMode && universalDatawebEnabled) {
+    if (!quickMode && plannerNeedsLongTermMemory && universalDatawebEnabled) {
       try {
         universalDatawebForPlanner = await withTimeout(
           invoke("read_universal_dataweb") as Promise<string>,
@@ -2272,7 +3893,9 @@ function App() {
     const runtimeCaps = profileCapabilities(llmProfile);
 
     let coderish = useCoder;
-    let primaryModel = hasImages ? "iris-vision:latest" : (coderish ? "iris-coder:latest" : "iris-organizer:latest");
+    // Select vision model based on profile: use Moondream2 for low/minimal, iris-vision for others
+    const visionModel = (llmProfile === "Low" || llmProfile === "Minimal") ? "moondream2:latest" : "iris-vision:latest";
+    let primaryModel = hasImages ? visionModel : (coderish ? "iris-coder:latest" : "iris-organizer:latest");
 
     if (interpretV2Enabled && !quickMode) {
       setThinkingProgress(requestTabId, "Interpreting request...");
@@ -2284,12 +3907,13 @@ function App() {
         const dispatchNote = [
           `Coder: ${modelConfig.coderEnabled ? "ENABLED" : "DISABLED"}`,
           `Vision: ${modelConfig.visionEnabled ? "ENABLED" : "DISABLED"}`,
+          `Summarizer: ${modelConfig.summarizerEnabled ? "ENABLED" : "DISABLED"}`,
           `Custom models enabled: ${enabledCustom.length}`,
           ...enabledCustom.map((m) => `- ${m.nickname || m.filename}: ${m.note || "(no note)"}`),
           ...Object.entries(modelConfig.modelNotes || {}).map(([filename, note]) => `- ${filename}: ${note || "(no note)"}`),
         ].join("\n");
         const attempts: any[] = [
-          { tabId: requestTabId, userText: text, tokenBudget: tb, useCoder, coderEnabled: modelConfig.coderEnabled, visionEnabled: modelConfig.visionEnabled, customEnabledModels: enabledCustomModels, organizerDispatchNote: dispatchNote },
+          { tabId: requestTabId, userText: text, tokenBudget: tb, useCoder, coderEnabled: modelConfig.coderEnabled, visionEnabled: modelConfig.visionEnabled, summarizerEnabled: modelConfig.summarizerEnabled, customEnabledModels: enabledCustomModels, organizerDispatchNote: dispatchNote },
           {
             tabId: requestTabId,
             userText: text,
@@ -2297,6 +3921,7 @@ function App() {
             useCoder,
             coderEnabled: modelConfig.coderEnabled,
             visionEnabled: modelConfig.visionEnabled,
+            summarizerEnabled: modelConfig.summarizerEnabled,
             customEnabledModels: enabledCustomModels,
             organizerDispatchNote: dispatchNote,
             assistantName: assistantLabel,
@@ -2317,6 +3942,7 @@ function App() {
             use_coder: useCoder,
             coder_enabled: modelConfig.coderEnabled,
             vision_enabled: modelConfig.visionEnabled,
+            summarizer_enabled: modelConfig.summarizerEnabled,
             custom_enabled_models: enabledCustomModels,
             organizer_dispatch_note: dispatchNote,
             assistant_name: assistantLabel,
@@ -2338,6 +3964,7 @@ function App() {
               useCoder,
               coderEnabled: modelConfig.coderEnabled,
               visionEnabled: modelConfig.visionEnabled,
+              summarizerEnabled: modelConfig.summarizerEnabled,
               customEnabledModels: enabledCustomModels,
               organizerDispatchNote: dispatchNote,
               assistantName: assistantLabel,
@@ -2360,6 +3987,7 @@ function App() {
               use_coder: useCoder,
               coder_enabled: modelConfig.coderEnabled,
               vision_enabled: modelConfig.visionEnabled,
+              summarizer_enabled: modelConfig.summarizerEnabled,
               custom_enabled_models: enabledCustomModels,
               organizer_dispatch_note: dispatchNote,
               assistant_name: assistantLabel,
@@ -2388,7 +4016,7 @@ function App() {
           plannerPath = "v2";
           coderish = !!(plannerV2.shouldUseCoder ?? coderish);
           primaryModel = hasImages
-            ? "iris-vision:latest"
+            ? ((llmProfile === "Low" || llmProfile === "Minimal") ? "moondream2:latest" : "iris-vision:latest")
             : String(plannerV2.model || (coderish ? "iris-coder:latest" : "iris-organizer:latest"));
           plannerPrompt = String(plannerV2.prompt || "");
           plannerResolverUsed = (plannerV2.resolverUsed as ResolverKind) || "none";
@@ -2404,13 +4032,14 @@ function App() {
           };
 
           // Optional routine execution path: screen capture + vision/coder staging.
-          const routinePlan = plannerV2.routinePlan ?? plannerV2.routine_plan;
+          // Skip routine if user already attached images (don't re-screenshot for attached image inspection).
+          const routinePlan = (hasImages ? null : (plannerV2.routinePlan ?? plannerV2.routine_plan));
           if (routinePlan && typeof routinePlan === "object") {
             const routineRes = await executeRoutinePlan(routinePlan, text, requestTabId);
             if (Array.isArray(routineRes.images) && routineRes.images.length) {
               allImageDataUrls = [...allImageDataUrls, ...routineRes.images];
               hasImages = allImageDataUrls.length > 0;
-              primaryModel = "iris-vision:latest";
+              primaryModel = (llmProfile === "Low" || llmProfile === "Minimal") ? "moondream2:latest" : "iris-vision:latest";
             }
             windowHint = routineRes.windowHint || "";
           }
@@ -2432,6 +4061,136 @@ function App() {
     const weatherRequest = !hasImages && !bridgeOrFsExplicit
       ? parseWeatherRequest(text)
       : null;
+    const uvRequest = !hasImages && !bridgeOrFsExplicit
+      ? parseUvIndexRequest(text)
+      : null;
+    const bridgeResyncRequest = !hasImages && !bridgeOrFsExplicit
+      ? isBridgeResyncRequest(text)
+      : false;
+
+    if (bridgeResyncRequest && selectedProjectForPlanner) {
+      const finishBridgeResyncPath = async (replyText: string) => {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
+        try {
+          await persistDirectReply({
+            requestTabId,
+            tabs,
+            userDisplayText,
+            replyText,
+            associatedProjectId: selectedProjectForPlanner.id,
+            promptHistory: promptHistoryForTurn,
+          });
+        } catch {}
+        setThinking(false);
+        setThinkingModel(null);
+        setIsGenerating(false);
+        setIrisStatus("idle");
+        setThinkingStep("");
+        setRespondingTab(null);
+        abortController.current = null;
+      };
+
+      if (!isProjectBridgeConnected(selectedProjectForPlanner)) {
+        await finishBridgeResyncPath("I can refresh project metadata, but the linked bridge is not connected. Open Bridge Servers and launch/check your project bridge first.");
+        return;
+      }
+      try {
+        setThinkingProgress(requestTabId, "Refreshing project snapshot from bridge...");
+        await refreshProjectBridgeMetadata(selectedProjectForPlanner, { forceFullPull: true, reason: "user_requested_resync" });
+        const version = selectedProjectForPlanner.godotVersionCached || "unknown";
+        await finishBridgeResyncPath(`Bridge resync complete for ${selectedProjectForPlanner.name}. Cached Godot version: ${version}.`);
+        return;
+      } catch (e: any) {
+        await finishBridgeResyncPath(`I could not refresh bridge metadata right now: ${String(e?.message || e || "unknown error")}`);
+        return;
+      }
+    }
+
+    if (uvRequest) {
+      const finishUvPath = async (replyText: string) => {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
+        try {
+          setThinkingProgress(requestTabId, "Saving memory...");
+          await persistDirectReply({
+            requestTabId,
+            tabs,
+            userDisplayText,
+            replyText,
+            associatedProjectId: null,
+            promptHistory: promptHistoryForTurn,
+          });
+        } catch (e) {
+          console.warn("[uv-fast-path] snapshot save failed (non-fatal):", e);
+        }
+        setThinking(false);
+        setThinkingModel(null);
+        setIsGenerating(false);
+        setIrisStatus("idle");
+        setThinkingStep("");
+        setRespondingTab(null);
+        abortController.current = null;
+      };
+
+      if (!networkEnabled) {
+        await finishUvPath("Network access is currently disabled, so I can't fetch a live UV index. Enable Network in Settings and ask again.");
+        return;
+      }
+
+      const rememberedLocation = extractLastWeatherLocation(currentTab?.messages || []);
+      const location = uvRequest.location || rememberedLocation;
+      if (!location) {
+        await finishUvPath("I can fetch that, but I need a location. Try: What's the UV index in Durham, NC?");
+        return;
+      }
+
+      try {
+        setThinkingProgress(requestTabId, "Finding UV index...");
+
+        // Attempt 1: weather lookup payload fields
+        const weather = await withTimeout(
+          invoke("weather_lookup", { location, dayOffset: 0 }) as Promise<any>,
+          7000,
+          "weather_lookup_uv"
+        );
+        const uvFromWeather = extractUvFromWeatherPayload(weather);
+        if (uvFromWeather !== null) {
+          await finishUvPath(`The current UV index for ${location} is ${uvFromWeather}. Source: ${String(weather?.sourceUrl || "weather_lookup")}`);
+          return;
+        }
+
+        // Attempt 2+: keep searching network sources for UV index
+        const uvQueries = [
+          `current UV index in ${location}`,
+          `UV index ${location} today`,
+          `${location} UV forecast`
+        ];
+        for (const q of uvQueries) {
+          setThinkingProgress(requestTabId, `Searching UV sources (${q})...`);
+          const net = await withTimeout(
+            invoke("network_search", {
+              query: q,
+              projectContext: "",
+            }) as Promise<any>,
+            8000,
+            "network_search_uv"
+          );
+          const hits = Array.isArray(net?.hits) ? (net.hits as NetworkHit[]) : [];
+          const parsed = extractUvFromNetworkHits(hits);
+          if (parsed.value !== null) {
+            await finishUvPath(`The current UV index for ${location} is ${parsed.value}. Source: ${parsed.sourceUrl || "network sources"}`);
+            return;
+          }
+        }
+
+        await finishUvPath(`I searched multiple live sources for ${location} but still couldn't find a reliable UV index. Try asking for a nearby city or ZIP code.`);
+        return;
+      } catch (e) {
+        console.warn("uv lookup failed", e);
+        await finishUvPath(`I couldn't retrieve the live UV index right now: ${String((e as any)?.message || e || "unknown error")}`);
+        return;
+      }
+    }
+
     if (weatherRequest) {
       const finishWeatherPath = async (replyText: string) => {
         updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
@@ -2478,6 +4237,573 @@ function App() {
       } catch (e) {
         console.warn("weather lookup failed", e);
         await finishWeatherPath(`I couldn't retrieve the live forecast right now: ${String((e as any)?.message || e || "unknown error")}`);
+        return;
+      }
+    }
+
+    const sceneEditIntent = !bridgeOrFsExplicit ? parseSceneEditIntent(text) : null;
+    if (sceneEditIntent) {
+      const rootPath = String(selectedProjectForPlanner?.manipulationRootPath || "").trim();
+      if (!selectedProjectForPlanner || !rootPath) {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, "I can edit that scene, but I need an active project with a configured Manipulation Root first."));
+        return;
+      }
+
+      const finishSceneEdit = async (replyText: string) => {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
+        try {
+          await persistDirectReply({
+            requestTabId,
+            tabs,
+            userDisplayText,
+            replyText,
+            associatedProjectId: selectedProjectForPlanner.id,
+            promptHistory: promptHistoryForTurn,
+          });
+        } catch {}
+        setThinking(false);
+        setThinkingModel(null);
+        setIsGenerating(false);
+        setIrisStatus("idle");
+        setThinkingStep("");
+        setRespondingTab(null);
+        abortController.current = null;
+      };
+
+      try {
+        setThinking(true);
+        setIsGenerating(true);
+        setIrisStatus("thinking");
+        setRespondingTab(activeTab);
+        setThinkingProgress(requestTabId, "Locating scene to edit...");
+        await ensureOllamaServer();
+
+        let coderReady = false;
+        try {
+          if (modelConfig.coderEnabled) {
+            await ensureModel("iris-coder:latest");
+            coderReady = true;
+          }
+        } catch {
+          coderReady = false;
+        }
+        if (!coderReady) {
+          await finishSceneEdit("I couldn't edit the scene because iris-coder is not available right now. Please enable or pull iris-coder and try again.");
+          return;
+        }
+
+        let cachedLastScenePath = "";
+        if (selectedProjectForPlanner.datawebEnabled) {
+          try {
+            const dataweb = await withTimeout(
+              invoke("read_project_dataweb", { projectId: selectedProjectForPlanner.id }) as Promise<string>,
+              1200,
+              "read_project_dataweb(scene_edit)"
+            );
+            cachedLastScenePath = parseLastScenePathFromProjectDataweb(dataweb) || "";
+          } catch {}
+        }
+
+        const chatScenePathHint = recoverLastScenePathFromMessages(currentTab?.messages) || "";
+        if (!cachedLastScenePath && chatScenePathHint) {
+          cachedLastScenePath = chatScenePathHint;
+        }
+
+        const recentScenePaths = getRecentScenePaths(requestTabId, rootPath);
+        const candidates = buildSceneEditCandidatePaths(sceneEditIntent, cachedLastScenePath, recentScenePaths);
+        let resolvedPath = "";
+        let originalContent = "";
+        for (const candidate of candidates) {
+          try {
+            const content = await invoke("fs_read_text", { root: rootPath, path: candidate, maxChars: 250000 }) as string;
+            if (content && content.trim()) {
+              resolvedPath = candidate;
+              originalContent = content;
+              break;
+            }
+          } catch {}
+        }
+
+        if (!resolvedPath) {
+          await finishSceneEdit(`I couldn't find the scene to edit. I checked: ${candidates.join(", ")}`);
+          return;
+        }
+
+        setThinkingProgress(requestTabId, `Applying edits to ${resolvedPath}...`);
+        const editHints: string[] = [];
+        if (sceneEditIntent.cubeSize) editHints.push(`Explicit size requested: ${sceneEditIntent.cubeSize.join("x")}`);
+        if (sceneEditIntent.scaleFactor) editHints.push(`Scale factor requested: ${sceneEditIntent.scaleFactor}`);
+        if (sceneEditIntent.targetAxis) editHints.push(`Primary axis target: ${sceneEditIntent.targetAxis}`);
+        const sceneEditPrompt = [
+          "You are editing an existing Godot 4 .tscn scene file.",
+          `User request: ${text}`,
+          `Target scene path: ${resolvedPath}`,
+          "Output rules:",
+          "- Output exactly one fenced code block with valid Godot 4 .tscn content.",
+          "- Preserve existing scene identity and structure where possible.",
+          "- Apply the user's requested geometric change precisely.",
+          "- Do not output explanation text outside the code block.",
+          editHints.length ? `Parsed edit hints: ${editHints.join(" | ")}` : "Parsed edit hints: none",
+          "Current scene:",
+          "```tscn",
+          normalizeSceneText(originalContent),
+          "```",
+        ].join("\n\n");
+
+        let editedRaw = "";
+        const editController = new AbortController();
+        await stream({
+          model: "iris-coder:latest",
+          prompt: sceneEditPrompt,
+          options: { temperature: 0.15, num_predict: 1400 },
+          signal: editController.signal,
+          onFirstToken: (first) => { editedRaw += first; },
+          onTokens: (delta) => { editedRaw += delta; },
+        });
+
+        const editedFence = extractFirstCodeFence(editedRaw);
+        if (!editedFence) {
+          await finishSceneEdit("I found the scene, but the model did not return editable .tscn content. Please retry with the exact file path or a more specific edit instruction.");
+          return;
+        }
+        const finalSceneContent = normalizeSceneText(editedFence);
+        if (!looksLikeGodotScene(finalSceneContent)) {
+          await finishSceneEdit("I found the scene, but the generated edit was not valid Godot 4 .tscn syntax. Please retry and I will regenerate with stricter constraints.");
+          return;
+        }
+
+        const result = await invoke("fs_write_text", {
+          root: rootPath,
+          path: resolvedPath,
+          content: finalSceneContent,
+          overwrite: true,
+          createDirs: true,
+        }) as string;
+        rememberRecentScenePath(requestTabId, rootPath, resolvedPath, "scene edit");
+
+        if (selectedProjectForPlanner.datawebEnabled) {
+          try {
+            const existing = await withTimeout(
+              invoke("read_project_dataweb", { projectId: selectedProjectForPlanner.id }) as Promise<string>,
+              1000,
+              "read_project_dataweb(scene_edit_layout_note)"
+            );
+            const marker = "## Scene Layout Snapshot";
+            const stamp = new Date().toISOString();
+            const snapshot = `${marker}\n- Updated: ${stamp}\n- Root: ${rootPath}\n- Last scene path: ${resolvedPath}\n${sceneEditIntent.cubeSize ? `- Requested size: ${sceneEditIntent.cubeSize.join("x")}` : ""}${sceneEditIntent.scaleFactor ? `\n- Requested scale factor: ${sceneEditIntent.scaleFactor}` : ""}${sceneEditIntent.targetAxis ? `\n- Requested axis: ${sceneEditIntent.targetAxis}` : ""}`;
+            const next = existing.includes(marker)
+              ? existing.replace(new RegExp(`${marker}[\\s\\S]*?(?=\\n## |$)`, "m"), snapshot)
+              : `${existing.trim()}\n\n${snapshot}`.trim();
+            await withTimeout(
+              invoke("write_project_dataweb", { projectId: selectedProjectForPlanner.id, content: next }) as Promise<any>,
+              1200,
+              "write_project_dataweb(scene_edit_layout_note)"
+            );
+          } catch {}
+        }
+
+        await finishSceneEdit(`${result}\n\nUpdated ${resolvedPath} with the requested scene edits.`);
+        return;
+      } catch (e: any) {
+        await finishSceneEdit(`I could not update the scene right now: ${String(e?.message || e || "unknown error")}`);
+        return;
+      }
+    }
+
+    const sceneRepairIntent = !bridgeOrFsExplicit ? parseSceneRepairIntent(text) : null;
+    if (sceneRepairIntent) {
+      const rootPath = String(selectedProjectForPlanner?.manipulationRootPath || "").trim();
+      if (!selectedProjectForPlanner || !rootPath) {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, "I can repair that scene file, but I need an active project with a configured Manipulation Root first."));
+        return;
+      }
+
+      const finishSceneRepair = async (replyText: string) => {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
+        try {
+          await persistDirectReply({
+            requestTabId,
+            tabs,
+            userDisplayText,
+            replyText,
+            associatedProjectId: selectedProjectForPlanner.id,
+            promptHistory: promptHistoryForTurn,
+          });
+        } catch {}
+        setThinking(false);
+        setThinkingModel(null);
+        setIsGenerating(false);
+        setIrisStatus("idle");
+        setThinkingStep("");
+        setRespondingTab(null);
+        abortController.current = null;
+      };
+
+      try {
+        setThinking(true);
+        setIsGenerating(true);
+        setIrisStatus("thinking");
+        setRespondingTab(activeTab);
+        setThinkingProgress(requestTabId, "Locating scene file...");
+        await ensureOllamaServer();
+        let coderReady = false;
+        try {
+          if (modelConfig.coderEnabled) {
+            await ensureModel("iris-coder:latest");
+            coderReady = true;
+          }
+        } catch {
+          coderReady = false;
+        }
+
+        const candidates = buildSceneRepairCandidatePaths(sceneRepairIntent.relPathHint);
+        let resolvedPath = "";
+        let originalContent = "";
+        for (const candidate of candidates) {
+          try {
+            const content = await invoke("fs_read_text", { root: rootPath, path: candidate, maxChars: 250000 }) as string;
+            if (content && content.trim()) {
+              resolvedPath = candidate;
+              originalContent = content;
+              break;
+            }
+          } catch {}
+        }
+
+        if (!resolvedPath) {
+          await finishSceneRepair(`I couldn't find ${sceneRepairIntent.relPathHint} in your manipulation root. I checked: ${candidates.join(", ")}`);
+          return;
+        }
+
+        setThinkingProgress(requestTabId, `Repairing ${resolvedPath}...`);
+        let finalContent = normalizeSceneText(originalContent);
+        if (coderReady) {
+          const repairPrompt = [
+            "You repair Godot 4 .tscn files so they parse cleanly.",
+            `Target file: ${resolvedPath}`,
+            "Rules:",
+            "- Output exactly one fenced code block containing only valid .tscn text.",
+            "- Preserve the scene intent (same object/theme) where possible.",
+            "- Use only Godot 4 syntax.",
+            "- No explanation text outside the code block.",
+            "Broken content:",
+            "```tscn",
+            originalContent,
+            "```",
+          ].join("\n\n");
+
+          let repairedRaw = "";
+          const repairController = new AbortController();
+          await stream({
+            model: "iris-coder:latest",
+            prompt: repairPrompt,
+            options: { temperature: 0.1, num_predict: 900 },
+            signal: repairController.signal,
+            onFirstToken: (first) => { repairedRaw += first; },
+            onTokens: (delta) => { repairedRaw += delta; },
+          });
+          const repairedFence = extractFirstCodeFence(repairedRaw);
+          finalContent = normalizeSceneText(repairedFence || originalContent);
+        }
+        if (!looksLikeGodotScene(finalContent)) {
+          await finishSceneRepair("I could not repair that scene into valid Godot 4 syntax this pass, so I did not overwrite it with a fallback primitive scene.");
+          return;
+        }
+
+        const result = await invoke("fs_write_text", {
+          root: rootPath,
+          path: resolvedPath,
+          content: finalContent,
+          overwrite: true,
+          createDirs: true,
+        }) as string;
+        rememberRecentScenePath(requestTabId, rootPath, resolvedPath, "scene repair");
+
+        await finishSceneRepair(`${result}\n\nRepaired scene at ${resolvedPath}. If Godot still shows stale data, reimport or reopen the scene tab.`);
+        return;
+      } catch (e: any) {
+        await finishSceneRepair(`I could not repair that scene right now: ${String(e?.message || e || "unknown error")}`);
+        return;
+      }
+    }
+
+    const directSceneIntent = !bridgeOrFsExplicit ? parseSceneDraftIntent(text) : null;
+    const recoveredSceneIntent = (!directSceneIntent && !bridgeOrFsExplicit && isSceneRetryRequest(text))
+      ? recoverRecentSceneIntent(currentTab?.messages, text)
+      : null;
+    const sceneDraftIntent = directSceneIntent || recoveredSceneIntent;
+    if (sceneDraftIntent) {
+      const rootPath = String(selectedProjectForPlanner?.manipulationRootPath || "").trim();
+      if (!selectedProjectForPlanner || !rootPath) {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, "I can draft that scene, but I need an active project with a configured Manipulation Root first."));
+        return;
+      }
+
+      const finishScenePath = async (replyText: string) => {
+        updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, replyText));
+        try {
+          await persistDirectReply({
+            requestTabId,
+            tabs,
+            userDisplayText,
+            replyText,
+            associatedProjectId: selectedProjectForPlanner.id,
+            promptHistory: promptHistoryForTurn,
+          });
+        } catch {}
+        setThinking(false);
+        setThinkingModel(null);
+        setIsGenerating(false);
+        setIrisStatus("idle");
+        setThinkingStep("");
+        setRespondingTab(null);
+        abortController.current = null;
+      };
+
+      try {
+        setThinking(true);
+        setIsGenerating(true);
+        setIrisStatus("thinking");
+        setRespondingTab(activeTab);
+        setThinkingProgress(requestTabId, `Drafting ${sceneDraftIntent.shape} scene...`);
+        await ensureOllamaServer();
+        let coderReady = false;
+        try {
+          if (modelConfig.coderEnabled) {
+            await ensureModel("iris-coder:latest");
+            coderReady = true;
+          }
+        } catch {
+          coderReady = false;
+        }
+
+        let rootEntries: RepoEntry[] = [];
+        let projectLayoutNote = "";
+        try {
+          rootEntries = await invoke("fs_list_dir", { root: rootPath, path: "." }) as RepoEntry[];
+          const preview = (Array.isArray(rootEntries) ? rootEntries : [])
+            .slice(0, 40)
+            .map((e) => `${e.isDir ? "[DIR]" : "[FILE]"} ${e.path}`)
+            .join("\n");
+          projectLayoutNote = preview.trim()
+            ? `Root layout snapshot:\n${preview}`
+            : "Root layout snapshot: (empty or inaccessible)";
+        } catch {
+          projectLayoutNote = "Root layout snapshot: unavailable";
+        }
+
+        let inspirationBlock = "";
+        if (networkEnabled) {
+          try {
+            const net = await withTimeout(invoke("network_search", {
+              query: `godot 4 ${sceneDraftIntent.shape} scene design inspiration`,
+              projectContext: selectedProjectForPlanner.description || "",
+            }) as Promise<any>, 3500, "network_search(scene_inspiration)");
+            const hits = Array.isArray(net?.hits) ? (net.hits as NetworkHit[]) : [];
+            const snippets = hits.slice(0, 3).map((h, i) => `${i + 1}. ${h.title || "Reference"}\n${h.snippet || ""}`).join("\n\n");
+            if (snippets.trim()) {
+              inspirationBlock = `Inspiration references (optional):\n${snippets}\n\nUse references only as style direction; produce original scene structure.`;
+            }
+          } catch {}
+        }
+
+        const scenePrompt = [
+          "You are generating a Godot 4 .tscn scene file for a user request.",
+          `User request: ${text}`,
+          `Primary shape intent: ${sceneDraftIntent.shape}`,
+          "",
+          "=== PARSED INTENT PARAMETERS (Apply these to your structure) ===",
+          sceneDraftIntent.cubeSize ? `Overall bounding box dimensions: ${sceneDraftIntent.cubeSize[0]} x ${sceneDraftIntent.cubeSize[1]} x ${sceneDraftIntent.cubeSize[2]}` : "(no explicit size given—use aesthetic defaults)",
+          sceneDraftIntent.sphereRadius ? `Sphere radius: ${sceneDraftIntent.sphereRadius}` : "",
+          sceneDraftIntent.cloudPieceCount ? `Cloud piece count: ${sceneDraftIntent.cloudPieceCount} pieces (distribute across the bounding volume)` : "",
+          sceneDraftIntent.cloudScale ? `Cloud scale factor: ${sceneDraftIntent.cloudScale} (enlarge each piece proportionally)` : "",
+          sceneDraftIntent.skyscraperFloors ? `Tower height spec: ${sceneDraftIntent.skyscraperFloors} floors (each ~1.8-2.0 units tall)` : "",
+          "",
+          "=== HOW TO USE PARAMETERS ===",
+          sceneDraftIntent.shape === "cloud" ? `Cloud strategy: Place ${sceneDraftIntent.cloudPieceCount} BoxMesh pieces with varied positions spread across a roughly ${sceneDraftIntent.cubeSize?.join("x") || "4x4x4"} volume. Vary x, y, z positions so pieces feel organic and fill the space naturally. Scale all meshes by ${sceneDraftIntent.cloudScale || 1.0}.` : "",
+          sceneDraftIntent.shape === "shop" ? `Shop strategy: Build a 3-wall open-front structure. Create walls for left (negative x), right (positive x), and back (positive z). Leave front (negative z) completely open for entry. Add a flat roof at the top. Size to fill roughly the specified volume.` : "",
+          sceneDraftIntent.shape === "skyscraper" || sceneDraftIntent.shape === "building" || sceneDraftIntent.shape === "tower" ? `Skyscraper strategy: Create a tall rectangular body. Windows go on front and back faces. Number of window rows = ${sceneDraftIntent.skyscraperFloors! - 2} (floors minus base and top). Arrange ${sceneDraftIntent.windowColumns || 4} columns of windows per face. Keep window sizes consistent and spacing regular.` : "",
+          "",
+          "Requirements:",
+          "- Study the example templates below to understand exact Godot 4 .tscn syntax.",
+          "- Output exactly one relative file path line in the format: PATH: <relative/path/to/file.tscn>",
+          "- Then output exactly one fenced code block containing strictly valid Godot 4 .tscn content.",
+          "- Start the file with [gd_scene format=3].",
+          "- Include at least one root [node name=\"...\" type=\"Node3D\"] and one child [node name=\"...\" type=\"MeshInstance3D\" parent=\".\"].",
+          "- Path must be project-relative only (no res://, no absolute paths, no drive letters).",
+          "- Keep the scene practical and editable; favor clean node naming and extensible structure.",
+          "- Infer object structure from common real-world knowledge when possible (for example, a garage-like shop usually has side walls, back wall, open front, and roof).",
+          "- For enclosed structures, prefer multi-part node composition over a single box primitive when the request implies openings or interior space.",
+          "- Always include a sub_resource for at least one mesh type (BoxMesh, SphereMesh, etc.).",
+          "- Do not output explanations outside PATH line and code fence.",
+          "",
+          "=== REQUIRED EXAMPLE: Minimal Valid Godot 4 Cube Scene ===",
+          "",
+          "[gd_scene format=3]",
+          "",
+          "[sub_resource type=\"BoxMesh\" id=\"BoxMesh_1\"]",
+          "size = Vector3(1, 1, 1)",
+          "",
+          "[node name=\"CubeScene\" type=\"Node3D\"]",
+          "",
+          "[node name=\"Cube\" type=\"MeshInstance3D\" parent=\".\"]",
+          "mesh = SubResource(\"BoxMesh_1\")",
+          "",
+          "=== REQUIRED EXAMPLE: Simple Shop with Open Front ===",
+          "",
+          "[gd_scene format=3]",
+          "",
+          "[sub_resource type=\"BoxMesh\" id=\"WallMesh_1\"]",
+          "size = Vector3(8, 6, 0.5)",
+          "",
+          "[sub_resource type=\"BoxMesh\" id=\"RoofMesh_1\"]",
+          "size = Vector3(8.5, 0.5, 8.5)",
+          "",
+          "[node name=\"ShopScene\" type=\"Node3D\"]",
+          "",
+          "[node name=\"LeftWall\" type=\"MeshInstance3D\" parent=\".\"]",
+          "mesh = SubResource(\"WallMesh_1\")",
+          "position = Vector3(-4, 0, 0)",
+          "",
+          "[node name=\"RightWall\" type=\"MeshInstance3D\" parent=\".\"]",
+          "mesh = SubResource(\"WallMesh_1\")",
+          "position = Vector3(4, 0, 0)",
+          "",
+          "[node name=\"BackWall\" type=\"MeshInstance3D\" parent=\".\"]",
+          "mesh = SubResource(\"WallMesh_1\")",
+          "position = Vector3(0, 0, 4)",
+          "",
+          "[node name=\"Roof\" type=\"MeshInstance3D\" parent=\".\"]",
+          "mesh = SubResource(\"RoofMesh_1\")",
+          "position = Vector3(0, 6, 0)",
+          "",
+          "=== END EXAMPLES ===",
+          "",
+          projectLayoutNote,
+          inspirationBlock,
+        ].filter(Boolean).join("\n\n");
+
+        const coderSceneGenerationEnabled = coderReady;
+
+        if (!coderSceneGenerationEnabled) {
+          await finishScenePath("I couldn't generate the scene because iris-coder is not available right now. Please enable or pull iris-coder and try again.");
+          return;
+        }
+
+        let rawSceneResponse = "";
+        const controller = new AbortController();
+        await stream({
+          model: "iris-coder:latest",
+          prompt: scenePrompt,
+          options: { temperature: 0.35, num_predict: 1400 },
+          signal: controller.signal,
+          onFirstToken: (first) => { rawSceneResponse += first; },
+          onTokens: (delta) => { rawSceneResponse += delta; },
+        });
+
+        const fallbackFile = `${sceneDraftIntent.filenameStem}.tscn`;
+        const sanitizedRelPath = extractScenePathFromModelResponse(rawSceneResponse, fallbackFile);
+        const relPath = pickSceneDestinationPath(rootEntries, sanitizedRelPath);
+        let sceneContent = extractSceneContentFromModelResponse(rawSceneResponse);
+        if (!sceneContent) {
+          setThinkingProgress(requestTabId, "Regenerating with strict output constraints...");
+          const strictPrompt = [
+            "Generate only a Godot 4 .tscn scene for this request.",
+            `User request: ${text}`,
+            `Primary shape intent: ${sceneDraftIntent.shape}`,
+            "Output format requirements:",
+            "- First line exactly: PATH: <relative/path/to/file.tscn>",
+            "- Then exactly one ```tscn fenced block with the full scene.",
+            "- No extra text before or after.",
+            "- Scene must start with [gd_scene format=3].",
+          ].join("\n\n");
+          let strictRaw = "";
+          const strictController = new AbortController();
+          await stream({
+            model: "iris-coder:latest",
+            prompt: strictPrompt,
+            options: { temperature: 0.05, num_predict: 1400 },
+            signal: strictController.signal,
+            onFirstToken: (first) => { strictRaw += first; },
+            onTokens: (delta) => { strictRaw += delta; },
+          });
+          sceneContent = extractSceneContentFromModelResponse(strictRaw);
+          if (strictRaw.trim()) {
+            rawSceneResponse = strictRaw;
+          }
+        }
+        if (!sceneContent) {
+          setThinkingProgress(requestTabId, "Using safe fallback scene generator...");
+          sceneContent = buildMinimalValidGodotScene(sceneDraftIntent.shape);
+        }
+
+        setThinkingProgress(requestTabId, "Validating scene syntax...");
+        let finalSceneContent = normalizeSceneText(sceneContent);
+        const repairPrompt = [
+          "You normalize and repair Godot 4 .tscn files to ensure parser-safe syntax.",
+          `Target path: ${relPath || fallbackFile}`,
+          "Rules:",
+          "- Output exactly one fenced code block containing only valid .tscn text.",
+          "- Keep scene intent and structure, but fix invalid syntax.",
+          "- Use Godot 4 syntax only.",
+          "- No explanation text outside the code block.",
+          "Candidate content:",
+          "```tscn",
+          normalizeSceneText(sceneContent),
+          "```",
+        ].join("\n\n");
+
+        let repairedRaw = "";
+        const repairController = new AbortController();
+        await stream({
+          model: "iris-coder:latest",
+          prompt: repairPrompt,
+          options: { temperature: 0.1, num_predict: 1200 },
+          signal: repairController.signal,
+          onFirstToken: (first) => { repairedRaw += first; },
+          onTokens: (delta) => { repairedRaw += delta; },
+        });
+        const repairedContent = extractSceneContentFromModelResponse(repairedRaw);
+        finalSceneContent = normalizeSceneText(repairedContent || sceneContent);
+        if (!looksLikeGodotScene(finalSceneContent)) {
+          setThinkingProgress(requestTabId, "Using safe fallback scene generator...");
+          finalSceneContent = buildMinimalValidGodotScene(sceneDraftIntent.shape);
+        }
+
+        const result = await invoke("fs_write_text", {
+          root: rootPath,
+          path: relPath || fallbackFile,
+          content: finalSceneContent,
+          overwrite: true,
+          createDirs: true,
+        }) as string;
+        rememberRecentScenePath(requestTabId, rootPath, relPath || fallbackFile, "scene create");
+
+        if (selectedProjectForPlanner.datawebEnabled) {
+          try {
+            const existing = await withTimeout(
+              invoke("read_project_dataweb", { projectId: selectedProjectForPlanner.id }) as Promise<string>,
+              1000,
+              "read_project_dataweb(scene_layout_note)"
+            );
+            const marker = "## Scene Layout Snapshot";
+            const stamp = new Date().toISOString();
+            const snapshot = `${marker}\n- Updated: ${stamp}\n- Root: ${rootPath}\n- Last scene path: ${relPath || fallbackFile}\n${projectLayoutNote}`;
+            const next = existing.includes(marker)
+              ? existing.replace(new RegExp(`${marker}[\\s\\S]*?(?=\\n## |$)`, "m"), snapshot)
+              : `${existing.trim()}\n\n${snapshot}`.trim();
+            await withTimeout(
+              invoke("write_project_dataweb", { projectId: selectedProjectForPlanner.id, content: next }) as Promise<any>,
+              1200,
+              "write_project_dataweb(scene_layout_note)"
+            );
+          } catch {}
+        }
+
+        await finishScenePath(`${result}\n\nScene saved as ${relPath || fallbackFile} in your project manipulation root. Refresh Godot's FileSystem dock if it is already open.`);
+        return;
+      } catch (e: any) {
+        await finishScenePath(`I could not complete scene creation right now: ${String(e?.message || e || "unknown error")}`);
         return;
       }
     }
@@ -2674,7 +5000,7 @@ function App() {
           }
         }
 
-  projectContext = `Active project: ${selectedProject.name}\nDescription: ${selectedProject.description || "(none)"}\nManipulation root: ${selectedProject.manipulationRootPath || "(none)"}\nLinked repos: ${linkedRepos.map((r) => r.name).join(", ") || "(none)"}\nLinked MCPs: ${linkedMcps.map((m) => `${m.name} (${m.target})`).join(", ") || "(none)"}\nLinked SSH: ${linkedSshs.map((s) => `${s.name} (${s.username ? `${s.username}@` : ""}${s.host}:${s.port || 22}${s.remoteRoot ? ` root=${s.remoteRoot}` : ""})`).join(", ") || "(none)"}\nSelected references:\n${entriesPreview || "(none)"}${excerptBlock}`;
+  projectContext = `Active project: ${selectedProject.name}\nDescription: ${selectedProject.description || "(none)"}\nGodot version (cached): ${selectedProject.godotVersionCached || "unknown"}\nManipulation root: ${selectedProject.manipulationRootPath || "(none)"}\nLinked repos: ${linkedRepos.map((r) => r.name).join(", ") || "(none)"}\nLinked MCPs: ${linkedMcps.map((m) => `${m.name} (${m.target})`).join(", ") || "(none)"}\nLinked SSH: ${linkedSshs.map((s) => `${s.name} (${s.username ? `${s.username}@` : ""}${s.host}:${s.port || 22}${s.remoteRoot ? ` root=${s.remoteRoot}` : ""})`).join(", ") || "(none)"}\nSelected references:\n${entriesPreview || "(none)"}${excerptBlock}`;
 
         const asksProjectMemory = asksProjectOverview;
         if (asksProjectMemory) {
@@ -2685,6 +5011,7 @@ function App() {
           deterministicProjectReply = [
             `Here is what I currently know about ${selectedProject.name}:`,
             `- Description: ${selectedProject.description || "(no description saved yet)"}`,
+            `- Godot version (cached): ${selectedProject.godotVersionCached || "unknown"}`,
             `- Manipulation root: ${selectedProject.manipulationRootPath || "(none configured yet)"}`,
             `- Linked repositories: ${linkedRepos.map((r) => r.name).join(", ") || "(none)"}`,
             `- Linked MCP connections: ${linkedMcps.map((m) => m.name).join(", ") || "(none)"}`,
@@ -2756,7 +5083,9 @@ function App() {
 
       let projectDatawebText = "";
       let universalDatawebText = "";
-      if (!projectIdeationFastPath && !quickMode && selectedProject?.datawebEnabled) {
+      const transcriptForLongTermGate = recentTranscript || plannerTranscriptTail;
+      const shouldAttachLongTermMemory = !projectIdeationFastPath && !quickMode && shouldUseLongTermDataweb(text, transcriptForLongTermGate);
+      if (shouldAttachLongTermMemory && selectedProject?.datawebEnabled) {
         try {
           projectDatawebText = await withTimeout(
             invoke("read_project_dataweb", { projectId: selectedProject.id }) as Promise<string>,
@@ -2765,7 +5094,7 @@ function App() {
           );
         } catch {}
       }
-      if (!projectIdeationFastPath && !quickMode && universalDatawebEnabled) {
+        if (shouldAttachLongTermMemory && universalDatawebEnabled) {
         try {
           universalDatawebText = await withTimeout(
             invoke("read_universal_dataweb") as Promise<string>,
@@ -2793,6 +5122,23 @@ function App() {
         } else if (!rootPath) {
           projectExecutionLog = "- Project checkpoint command requested, but no project manipulation root is configured.";
         } else {
+          const projectRisk: ActionRisk = projectAction.action === "restore" ? "high" : (projectAction.action === "checkpoint" ? "medium" : "low");
+          const approved = await requestActionPermission({
+            title: "Allow project action?",
+            message: `${assistantLabel} wants to run project.${projectAction.action} for ${selectedProject.name}.`,
+            actionKey: `project.${projectAction.action}`,
+            risk: projectRisk,
+            confidence: confidenceForTurn,
+          });
+          if (!approved) {
+            projectExecutionLog = `- Project ${projectAction.action} was skipped because permission was denied.`;
+            appendActionTrace(requestTabId, {
+              action: `project.${projectAction.action}`,
+              reason: "Permission denied by user",
+              argsSummary: JSON.stringify(projectAction.args || {}),
+              outcome: "denied",
+            });
+          } else {
           try {
             if (projectAction.action === "checkpoint") {
               const label = String(projectAction.args.label || projectAction.args.name || "").trim() || null;
@@ -2865,6 +5211,7 @@ function App() {
             });
           }
         }
+        }
       }
 
       if (fsAction) {
@@ -2874,7 +5221,26 @@ function App() {
           fsExecutionLog = "- FS command requested, but no project manipulation root is configured for the current project.";
         } else {
           const relPath = String(fsAction.args.path || fsAction.args.relPath || fsAction.args.file || "");
-          try {
+          const fsRisk: ActionRisk = (fsAction.action === "write" || fsAction.action === "move" || fsAction.action === "delete")
+            ? "high"
+            : (fsAction.action === "mkdir" ? "medium" : "low");
+          const approved = await requestActionPermission({
+            title: "Allow filesystem action?",
+            message: `${assistantLabel} wants to run filesystem.${fsAction.action}${relPath ? ` on ${relPath}` : ""}.`,
+            actionKey: `filesystem.${fsAction.action}`,
+            risk: fsRisk,
+            confidence: confidenceForTurn,
+          });
+          if (!approved) {
+            fsExecutionLog = `- FS ${fsAction.action} was skipped because permission was denied.`;
+            appendActionTrace(requestTabId, {
+              action: `filesystem.${fsAction.action}`,
+              reason: "Permission denied by user",
+              argsSummary: JSON.stringify(fsAction.args || {}),
+              outcome: "denied",
+            });
+          } else {
+            try {
             if (fsAction.action === "list") {
               const items = await invoke("fs_list_dir", { root: rootPath, path: relPath || "." }) as RepoEntry[];
               const preview = (Array.isArray(items) ? items : []).slice(0, 80).map((i) => `${i.isDir ? "[DIR]" : "[FILE]"} ${i.path}`).join("\n");
@@ -2918,6 +5284,7 @@ function App() {
             });
           }
         }
+        }
       }
 
       if (desktopAction) {
@@ -2928,7 +5295,26 @@ function App() {
         } else {
           const rootPath = activeManipulationRoot.path;
           const relPath = String(desktopAction.args.path || desktopAction.args.relPath || desktopAction.args.file || "");
-          try {
+          const desktopRisk: ActionRisk = (desktopAction.action === "write" || desktopAction.action === "move" || desktopAction.action === "delete")
+            ? "high"
+            : (desktopAction.action === "mkdir" ? "medium" : "low");
+          const approved = await requestActionPermission({
+            title: "Allow desktop action?",
+            message: `${assistantLabel} wants to run desktop.${desktopAction.action}${relPath ? ` on ${relPath}` : ""}.`,
+            actionKey: `desktop.${desktopAction.action}`,
+            risk: desktopRisk,
+            confidence: confidenceForTurn,
+          });
+          if (!approved) {
+            desktopExecutionLog = `- Desktop ${desktopAction.action} was skipped because permission was denied.`;
+            appendActionTrace(requestTabId, {
+              action: `desktop.${desktopAction.action}`,
+              reason: "Permission denied by user",
+              argsSummary: JSON.stringify(desktopAction.args || {}),
+              outcome: "denied",
+            });
+          } else {
+            try {
             if (desktopAction.action === "list") {
               const items = await invoke("fs_list_dir", { root: rootPath, path: relPath || "." }) as RepoEntry[];
               const preview = (Array.isArray(items) ? items : []).slice(0, 80).map((i) => `${i.isDir ? "[DIR]" : "[FILE]"} ${i.path}`).join("\n");
@@ -2971,6 +5357,7 @@ function App() {
               outcome: String(err?.message || err || "error"),
             });
           }
+          }
         }
       }
 
@@ -2986,34 +5373,54 @@ function App() {
         if (!pick) {
           sshExecutionLog = "- SSH command requested, but no enabled SSH connection is associated with the current project (or requested connection was not found).";
         } else {
-          try {
-            const raw = await withTimeout(invoke("ssh_tool_call", {
-              connection: pick,
-              action: sshAction.action,
-              arguments: sshAction.args,
-            }) as Promise<any>, 12000, `ssh_tool_call:${sshAction.action}`);
-            const pretty = (() => {
-              try {
-                return JSON.stringify(raw, null, 2);
-              } catch {
-                return String(raw);
-              }
-            })();
-            sshExecutionLog = `- Executed SSH ${pick.name}.${sshAction.action} with args ${JSON.stringify(sshAction.args)}\n${pretty}`;
+          const sshRisk: ActionRisk = (sshAction.action === "read" || sshAction.action === "list")
+            ? "low"
+            : (sshAction.action === "mkdir" ? "medium" : "high");
+          const approved = await requestActionPermission({
+            title: "Allow SSH action?",
+            message: `${assistantLabel} wants to run ssh.${sshAction.action} on ${pick.name}.`,
+            actionKey: `ssh.${sshAction.action}`,
+            risk: sshRisk,
+            confidence: confidenceForTurn,
+          });
+          if (!approved) {
+            sshExecutionLog = `- SSH ${pick.name}.${sshAction.action} was skipped because permission was denied.`;
             appendActionTrace(requestTabId, {
               action: `ssh.${sshAction.action}`,
-              reason: `Action inferred for SSH connection ${pick.name}`,
+              reason: `Permission denied for SSH connection ${pick.name}`,
               argsSummary: JSON.stringify(sshAction.args || {}),
-              outcome: "ok",
+              outcome: "denied",
             });
-          } catch (err: any) {
-            sshExecutionLog = `- SSH ${pick.name}.${sshAction.action} failed: ${String(err?.message || err || "unknown error")}`;
-            appendActionTrace(requestTabId, {
-              action: `ssh.${sshAction.action}`,
-              reason: `Action failed for SSH connection ${pick.name}`,
-              argsSummary: JSON.stringify(sshAction.args || {}),
-              outcome: String(err?.message || err || "error"),
-            });
+          } else {
+            try {
+              const raw = await withTimeout(invoke("ssh_tool_call", {
+                connection: pick,
+                action: sshAction.action,
+                arguments: sshAction.args,
+              }) as Promise<any>, 12000, `ssh_tool_call:${sshAction.action}`);
+              const pretty = (() => {
+                try {
+                  return JSON.stringify(raw, null, 2);
+                } catch {
+                  return String(raw);
+                }
+              })();
+              sshExecutionLog = `- Executed SSH ${pick.name}.${sshAction.action} with args ${JSON.stringify(sshAction.args)}\n${pretty}`;
+              appendActionTrace(requestTabId, {
+                action: `ssh.${sshAction.action}`,
+                reason: `Action inferred for SSH connection ${pick.name}`,
+                argsSummary: JSON.stringify(sshAction.args || {}),
+                outcome: "ok",
+              });
+            } catch (err: any) {
+              sshExecutionLog = `- SSH ${pick.name}.${sshAction.action} failed: ${String(err?.message || err || "unknown error")}`;
+              appendActionTrace(requestTabId, {
+                action: `ssh.${sshAction.action}`,
+                reason: `Action failed for SSH connection ${pick.name}`,
+                argsSummary: JSON.stringify(sshAction.args || {}),
+                outcome: String(err?.message || err || "error"),
+              });
+            }
           }
         }
       }
@@ -3170,8 +5577,15 @@ function App() {
         });
       }
 
+      const organizerPredictBudget = adaptiveResponseTokenBudget({
+        userText: text,
+        quickMode,
+        hasImages,
+        engineeringTask: engineeringTaskRequest,
+        profile: llmProfile,
+      });
       const organizerOpts = {
-        num_ctx: 768, num_keep: 24, num_predict: 896,
+        num_ctx: 768, num_keep: 24, num_predict: organizerPredictBudget,
         temperature: 0.25, top_p: 0.9, top_k: 40,
         repeat_penalty: 1.06,
         num_thread: 8, num_batch: 80, num_gpu: 999
@@ -3182,8 +5596,15 @@ function App() {
         repeat_penalty: 1.06, repeat_last_n: 128,
         num_thread: 8, num_batch: 8, num_gpu: 100
       };
+      // Vision model optimization: use smaller context for faster image analysis
+      const visionOpts = {
+        num_ctx: 2048, num_keep: 0, num_predict: 512,
+        temperature: 0.32, top_p: 0.9, top_k: 40,
+        repeat_penalty: 1.06,
+        num_thread: 8, num_batch: 8, num_gpu: 999  // Max GPU for vision
+      };
       const model = primaryModel;
-      const options = coderish ? coderOpts : organizerOpts;
+      const options = hasImages ? visionOpts : (coderish ? coderOpts : organizerOpts);
       setThinkingModel((primaryModel || "iris-organizer:latest").replace(/:latest$/i, ""));
       setThinkingProgress(requestTabId, "Preparing response...");
 
@@ -3210,8 +5631,8 @@ function App() {
 
       if (hasImages) {
         const imageGuidance = text.trim()
-          ? `Attached image input is present. First inspect the image carefully, then answer the user's request using visible evidence. Call out uncertainty briefly.`
-          : `Attached image input is present. Describe the image briefly, identify obvious UI/object/layout details, and mention any readable text or notable uncertainty.`;
+          ? `Attached image input is present. First inspect the image carefully, then answer the user's request using only visible evidence from this exact image. Do not describe tools, windows, or settings unless they are clearly visible in the provided image. Call out uncertainty briefly.`
+          : `Attached image input is present. Describe only what is visibly present in this exact image: layout, objects, readable text, and uncertainty. Do not infer hidden windows or unrelated app state.`;
         prompt = `${prompt}\n\n${imageGuidance}`;
         if (!plannerRoutedModels.includes("iris-vision")) {
           setPlannerRoutedModels(["iris-organizer", "iris-vision", "iris-summarizer"]);
@@ -3252,12 +5673,14 @@ function App() {
         ...(flowAdjustments || []),
         ...(flowAdjustmentNote ? [flowAdjustmentNote] : []),
       ];
-      prompt = `${prompt}\n\nIris internal action repository:\n${IRIS_ACTION_REPOSITORY.map((a) => `- ${a}`).join("\n")}\nUse these actions based on intent and context; slash commands are optional and should not be required.`;
-      if (actionTraceLines.trim()) {
-        prompt = `${prompt}\n\nRecent internal action trace:\n${actionTraceLines}`;
-      }
-      if (allFlowAdjustments.length) {
-        prompt = `${prompt}\n\nUser feedback adjustments currently active:\n${allFlowAdjustments.map((n) => `- ${n}`).join("\n")}`;
+      if (!hasImages) {
+        prompt = `${prompt}\n\n${buildToolCatalogPrompt(toolDraft)}`;
+        if (actionTraceLines.trim()) {
+          prompt = `${prompt}\n\nRecent internal action trace:\n${actionTraceLines}`;
+        }
+        if (allFlowAdjustments.length) {
+          prompt = `${prompt}\n\nUser feedback adjustments currently active:\n${allFlowAdjustments.map((n) => `- ${n}`).join("\n")}`;
+        }
       }
 
       if (fsExecutionLog.trim()) {
@@ -3302,7 +5725,7 @@ function App() {
           ? "- Use deeper reasoning loops (plan -> execute -> self-check -> iterate) until a satisfactory result is reached."
           : "- Use one short plan/execute/check loop and ask before deeper iteration.";
 
-        prompt = `${prompt}\n\nProject Dataweb Context:\n${projectContext}\n\nContext routing rules:\n- If user asks for project overview/status, answer from project description + registry + selected references summary.\n- Do not output raw tutorial steps unless user explicitly asks for implementation steps.\n- Use repository excerpts only for concrete implementation/debug requests.\n- Use MCP mentions only when execution/integration is requested.\n${gatingRules}\n\nExecution loop contract:\n- Plan with project dataweb (repos + MCPs when enabled).\n- Execute one concrete step.\n- Self-check results.\n${loopDepthRule}\n- Provide concise progress updates while working, then summarize completed work and next steps.\n${engineeringTaskRequest ? "- CRITICAL: Use TOOL_CALL directives to actually execute actions — do not just describe what to do. Format: TOOL_CALL: {\\\"tool\\\": \\\"exact_tool_name\\\", \\\"args\\\": {\\\"key\\\": \\\"value\\\"}} — one per line. Phases: Inspect (list_directory/read_file) → Plan → Execute (write_file/create_scene/etc via TOOL_CALLs) → Verify → Polish. Keep issuing TOOL_CALLs until the task is done." : ""}\n\nUse this project context for grounding when relevant.`;
+        prompt = `${prompt}\n\nProject Dataweb Context:\n${projectContext}\n\nContext routing rules:\n- If user asks for project overview/status, answer from project description + registry + selected references summary.\n- Do not output raw tutorial steps unless user explicitly asks for implementation steps.\n- Use repository excerpts only for concrete implementation/debug requests.\n- Use MCP mentions only when execution/integration is requested.\n- Treat recent chat transcript as primary memory; consult long-term dataweb memory only when transcript is insufficient or the user explicitly references prior notes/sessions.\n${gatingRules}\n\nExecution loop contract:\n- Plan with project dataweb (repos + MCPs when enabled).\n- Execute one concrete step.\n- Self-check results.\n${loopDepthRule}\n- Provide concise progress updates while working, then summarize completed work and next steps.\n${engineeringTaskRequest ? "- CRITICAL: Use TOOL_CALL directives to actually execute actions — do not just describe what to do. Format: TOOL_CALL: {\\\"tool\\\": \\\"exact_tool_name\\\", \\\"args\\\": {\\\"key\\\": \\\"value\\\"}} — one per line. Phases: Inspect (list_directory/read_file) → Plan → Execute (write_file/create_scene/etc via TOOL_CALLs) → Verify → Polish. Keep issuing TOOL_CALLs until the task is done." : ""}\n\nUse this project context for grounding when relevant.`;
       }
 
       if (!projectIdeationFastPath && selectedProject?.datawebEnabled && projectDatawebText.trim()) {
@@ -3352,26 +5775,122 @@ function App() {
         streamedText = deterministicReply;
         updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, deterministicReply));
       } else {
-        setThinkingProgress(requestTabId, "Generating response...");
-        await stream({
+        // Log diagnostic info about memory context being sent
+        const chatHistory = currentTab?.messages || [];
+        const conversationMessageCount = chatHistory.length;
+        const systemPromptLength = prompt.length;
+        const diagnosticNote = `[Memory: ${conversationMessageCount} prior exchanges, ${systemPromptLength}B context]`;
+        
+        setThinkingProgress(requestTabId, hasImages ? "🔄 Analyzing image..." : `Generating response... ${diagnosticNote}`);
+        let tokenCount = 0;
+        const progressStartTime = Date.now();
+        const SOFT_TIMEOUT_MS = Math.max(60000, Math.max(effectiveVisionTimeout, visionTimeoutMinutes) * 60 * 1000); // Use customizable timeout (or profile default if larger)
+        let softTimeoutShown = false;
+        let hasReceivedFirstToken = false;
+        let progressUpdateCounter = 0;
+        
+        // Check cognitive footprint and VRAM for vision requests
+        if (hasImages) {
+          try {
+            // Attempt to check GPU/VRAM availability
+            const gpuInfo = await invoke("check_gpu_available") as any;
+            if (!gpuInfo?.available && (llmProfile === "Low" || llmProfile === "Minimal")) {
+              setThinkingProgress(requestTabId, "⚠️ GPU not available - Vision on CPU will be slower");
+            }
+          } catch (e) {
+            console.warn("Could not check GPU availability", e);
+          }
+          
+          if (llmProfile === "Low" || llmProfile === "Minimal") {
+            const footprint = computeEffectiveContextFootprint({
+              profile: llmProfile,
+              tokenBudget: profileCapabilities(llmProfile).tokenBudget,
+              reposOn: reposContextActive,
+              mcpOn: mcpContextActive,
+              multiMcp: false,
+              fullRag: false,
+              deepReasoning: false,
+              networkOn: networkEnabled,
+              interpretV2On: interpretV2Enabled,
+            });
+            if (footprint.level === "Heavy" || footprint.level === "Very Heavy") {
+              setThinkingProgress(requestTabId, `⚠️ Cognitive Footprint: ${footprint.level} - Vision may be slow on ${llmProfile} profile`);
+            }
+          }
+        }
+        
+        const streamPromise = stream({
           model,
-          prompt,
+          prompt: undefined,
+          messages: buildConversationMessages(currentTab?.messages || [], prompt, text),
           images: hasImages ? allImageDataUrls.map((img) => img.split(",")[1]).filter(Boolean) : undefined,
           options,
           signal: controller.signal,
-          onHeaders: () => setIrisStatus(hasImages ? "responding" : (coderish ? "coding" : "responding")),
+          onHeaders: () => {
+            setIrisStatus(hasImages ? "responding" : (coderish ? "coding" : "responding"));
+            if (hasImages) {
+              setThinkingProgress(requestTabId, `👁️ Vision processing started...`);
+            }
+          },
           onFirstToken: (first) => {
+            tokenCount += 1;
             streamedText += first;
             updateTabMessages(requestTabId, msgs => insertLLMBubble(msgs, first));
+            if (hasImages && tokenCount === 1) {
+              setThinkingProgress(requestTabId, `✍️ Writing response...`);
+            }
+            hasReceivedFirstToken = true;
           },
           onTokens: (delta) => {
+            tokenCount += 1;
             streamedText += delta;
             updateTabMessages(requestTabId, msgs => patchLastLLMBubble(msgs, delta));
+            // Update progress with detailed percentage if enabled
+            if (hasImages) {
+              progressUpdateCounter++;
+              if (progressUpdateCounter % 8 === 0) { // Update every 8 tokens
+                const elapsedSec = Math.round((Date.now() - progressStartTime) / 1000);
+                if (detailedProgressEnabled) {
+                  // Show estimated progress percentage
+                  const estimatedPercent = Math.min(98, 20 + Math.floor((tokenCount / 500) * 60));
+                  setThinkingProgress(requestTabId, `✍️ Writing response... (${estimatedPercent}% - ${elapsedSec}s)`);
+                } else {
+                  setThinkingProgress(requestTabId, `✍️ Writing response... (${elapsedSec}s)`);
+                }
+              }
+            }
           },
           onDone: () => {
             // No message replacement here; streamedText already has the full reply
           },
         });
+        
+        // Soft timeout check: non-blocking dialog after customizable time if no tokens yet
+        const softTimeoutHandle = setTimeout(() => {
+          if (!softTimeoutShown && !hasReceivedFirstToken) {
+            softTimeoutShown = true;
+            // Non-blocking: show modal but don't await it
+            const timeoutDisplay = Math.max(effectiveVisionTimeout, visionTimeoutMinutes);
+            askCenteredConfirm({
+              title: "Response Taking Longer Than Expected",
+              message: `This response is taking longer than expected. Continue waiting or cancel the request. Timeout is set to ${Math.round(timeoutDisplay * 10) / 10} minutes (${llmProfile} profile).`,
+              confirmLabel: "Keep Waiting",
+              cancelLabel: "Cancel Request",
+            }).then((confirmed) => {
+              if (!confirmed) {
+                controller.abort();
+              }
+            }).catch(() => {
+              // Dialog dismissed, continue waiting
+            });
+          }
+        }, SOFT_TIMEOUT_MS);
+        
+        try {
+          await streamPromise;
+        } finally {
+          clearTimeout(softTimeoutHandle);
+        }
 
         // --- Agentic MCP tool-use loop ---
         // If the model emitted TOOL_CALL directives, execute them and continue.
@@ -3501,7 +6020,7 @@ function App() {
             await stream({
               model,
               prompt: agentContext,
-              options: { ...options, num_predict: 700 },
+              options: { ...options, num_predict: Math.max(900, Math.floor(organizerPredictBudget * 0.8)) },
               signal: controller.signal,
               onFirstToken: (t) => {
                 nextText += t;
@@ -3589,6 +6108,10 @@ function App() {
           .map((h, i) => `- [${i + 1}] ${h.title || "Source"}${h.url ? ` - ${h.url}` : ""}`)
           .join("\n");
         deliveredText = `${deliveredText}\n\nSources consulted:\n${sourcesBlock}`;
+      }
+      const selfFailure = /(failed|error|unable|could not|denied)/i.test(deliveredText);
+      if (lastTaskTags.length) {
+        applyProficiencyDelta(lastTaskTags, selfFailure ? -0.6 : 0.25);
       }
       let artifacts = extractArtifacts(deliveredText);
       const filenameMatch = deliveredText.match(/(?:here's|file|save as|edit)\s+`([^`]+)`/i);
@@ -3900,17 +6423,17 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     const chatTabs = tabs.filter(tab => tab.type === "chat");
     if (chatTabs.length >= 8) return;
 
-    const settingsIdx = tabs.findIndex(tab => tab.type === "settings");
+    const utilityIdx = tabs.findIndex(tab => tab.type !== "chat");
     const newId = tabs.length ? Math.max(...tabs.map(t => t.id)) + 1 : 1;
     const labelNumber = nextChatLabelNumber(tabs);
     const newTab: Tab = { id: newId, title: `Tab #${labelNumber}`, type: "chat", messages: [], promptHistory: [] };
 
-    if (settingsIdx === -1) {
+    if (utilityIdx === -1) {
       setTabs([...tabs, newTab]);
       setActiveTab(newId);
     } else {
       const newTabs = [...tabs];
-      newTabs.splice(settingsIdx, 0, newTab);
+      newTabs.splice(utilityIdx, 0, newTab);
       setTabs(newTabs);
       setActiveTab(newId);
     }
@@ -3934,20 +6457,60 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   function handleSettings() {
     if (menuLocked) return;
-    let settingsTab = tabs.find(tab => tab.type === "settings");
-    if (settingsTab) {
-      if (tabs[tabs.length - 1].type !== "settings") {
+    const existingSettingsTab = tabs.find(tab => tab.type === "settings");
+    if (existingSettingsTab) {
+      if (tabs[tabs.length - 1].id !== existingSettingsTab.id) {
         setTabs([
-          ...tabs.filter(tab => tab.type !== "settings"),
-          settingsTab
+          ...tabs.filter(tab => tab.id !== existingSettingsTab.id),
+          existingSettingsTab
         ]);
       }
-      setActiveTab(settingsTab.id);
+      setActiveTab(existingSettingsTab.id);
     } else {
       if (tabs.length >= 10) return;
       const newId = tabs.length ? Math.max(...tabs.map(t => t.id)) + 1 : 1;
       const newSettingsTab: Tab = { id: newId, title: "Settings", type: "settings" };
       setTabs([...tabs, newSettingsTab]);
+      setActiveTab(newId);
+    }
+  }
+
+  function handleToolsCenter() {
+    if (menuLocked) return;
+    const existingToolsTab = tabs.find(tab => tab.type === "tools");
+    if (existingToolsTab) {
+      if (tabs[tabs.length - 1].id !== existingToolsTab.id) {
+        setTabs([
+          ...tabs.filter(tab => tab.id !== existingToolsTab.id),
+          existingToolsTab
+        ]);
+      }
+      setActiveTab(existingToolsTab.id);
+    } else {
+      if (tabs.length >= 10) return;
+      const newId = tabs.length ? Math.max(...tabs.map(t => t.id)) + 1 : 1;
+      const newToolsTab: Tab = { id: newId, title: "Tools Center", type: "tools" };
+      setTabs([...tabs, newToolsTab]);
+      setActiveTab(newId);
+    }
+  }
+
+  function handleAgentStats() {
+    if (menuLocked) return;
+    const existingStatsTab = tabs.find(tab => tab.type === "agent-stats");
+    if (existingStatsTab) {
+      if (tabs[tabs.length - 1].id !== existingStatsTab.id) {
+        setTabs([
+          ...tabs.filter(tab => tab.id !== existingStatsTab.id),
+          existingStatsTab
+        ]);
+      }
+      setActiveTab(existingStatsTab.id);
+    } else {
+      if (tabs.length >= 10) return;
+      const newId = tabs.length ? Math.max(...tabs.map(t => t.id)) + 1 : 1;
+      const newStatsTab: Tab = { id: newId, title: "Agent Stats", type: "agent-stats" };
+      setTabs([...tabs, newStatsTab]);
       setActiveTab(newId);
     }
   }
@@ -4004,15 +6567,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
         const rows = await Promise.all(
           ordered.map(async (filename) => {
-            const row = await invoke<any>("read_modelfile_data", { filename });
+            const paramRow = await invoke<any>("read_modelfile_params", { filename });
+            let fullRow: any = null;
+            try {
+              fullRow = await invoke<any>("read_modelfile_data", { filename });
+            } catch {
+              fullRow = null;
+            }
             return {
-              filename: String(row?.filename ?? filename),
-              displayName: String(row?.displayName ?? row?.display_name ?? filename),
-              nickname: String(row?.nickname ?? row?.displayName ?? row?.display_name ?? filename),
-              fromModel: String(row?.fromModel ?? row?.from_model ?? ""),
-              systemPrompt: String(row?.systemPrompt ?? row?.system_prompt ?? ""),
-              params: Array.isArray(row?.params)
-                ? row.params.map((p: any) => ({ key: String(p?.key ?? ""), value: String(p?.value ?? "") }))
+              filename: String(fullRow?.filename ?? paramRow?.filename ?? filename),
+              displayName: String(fullRow?.displayName ?? fullRow?.display_name ?? filename),
+              nickname: String(fullRow?.nickname ?? fullRow?.displayName ?? fullRow?.display_name ?? filename),
+              fromModel: String(paramRow?.fromModel ?? paramRow?.from_model ?? fullRow?.fromModel ?? fullRow?.from_model ?? ""),
+              systemPrompt: String(fullRow?.systemPrompt ?? fullRow?.system_prompt ?? ""),
+              params: Array.isArray(paramRow?.params)
+                ? paramRow.params.map((p: any) => ({ key: String(p?.key ?? ""), value: String(p?.value ?? "") }))
                 : [],
             } as ModelfileDataFE;
           })
@@ -4063,15 +6632,26 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     }
     try {
       setModelfileSaving((prev) => ({ ...prev, [filename]: true }));
-      await invoke("save_modelfile_data", {
-        args: {
-          filename,
-          fromModel,
-          params,
-          systemPrompt: opts?.systemPrompt,
-          nickname: opts?.nickname,
-        },
-      });
+      const hasExtendedFields = typeof opts?.systemPrompt === "string" || typeof opts?.nickname === "string";
+      if (hasExtendedFields) {
+        await invoke("save_modelfile_data", {
+          args: {
+            filename,
+            fromModel,
+            params,
+            systemPrompt: opts?.systemPrompt,
+            nickname: opts?.nickname,
+          },
+        });
+      } else {
+        await invoke("save_modelfile_params", {
+          args: {
+            filename,
+            fromModel,
+            params,
+          },
+        });
+      }
 
       setModelfileDatas((prev) => {
         const current = prev[filename];
@@ -4186,6 +6766,51 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     setPendingImages((prev) => prev.filter((img) => img.id !== imageId));
   }
 
+  // Resize image based on profile and return as data URL
+  async function resizeImageForVision(dataUrl: string, profile: LlmProfile, gpuAvailable?: boolean): Promise<string> {
+    let maxSize = 
+      profile === "Minimal" || profile === "Low" ? 448 :
+      profile === "Medium" ? 560 :
+      profile === "MediumHigh" ? 672 :
+      profile === "High" || profile === "Ultra" ? 768 : 672;
+    
+    // If GPU is not available and on low profile, further reduce size for CPU efficiency
+    if (!gpuAvailable && (profile === "Low" || profile === "Minimal")) {
+      maxSize = Math.floor(maxSize * 0.75); // Reduce by 25% if CPU-only
+    }
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxSize) {
+            height = Math.round((height * maxSize) / width);
+            width = maxSize;
+          }
+        } else {
+          if (height > maxSize) {
+            width = Math.round((width * maxSize) / height);
+            height = maxSize;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+        }
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = () => resolve(dataUrl); // Return original on error
+      img.src = dataUrl;
+    });
+  }
+
   async function handleChatPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const imageFiles = Array.from(e.clipboardData.items)
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
@@ -4238,7 +6863,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   async function handleCloseTab(tabId: number) {
     const tabObj = tabs.find(t => t.id === tabId);
-    if (tabObj?.type === "settings") {
+    if (tabObj?.type === "settings" || tabObj?.type === "tools" || tabObj?.type === "agent-stats") {
       setTabs(prevTabs => {
         const idx = prevTabs.findIndex(tab => tab.id === tabId);
         const newTabs = prevTabs.filter(tab => tab.id !== tabId);
@@ -4293,10 +6918,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       const idx = prevTabs.findIndex(tab => tab.id === tabId);
       let newTabs = prevTabs.filter(tab => tab.id !== tabId);
 
-      // keep Settings pinned to the right if present
-      const settings = newTabs.find(t => t.type === "settings");
-      if (settings && newTabs[newTabs.length - 1]?.type !== "settings") {
-        newTabs = [...newTabs.filter(t => t.type !== "settings"), settings];
+      // keep utility pages (Settings/Tools Center) pinned to the right
+      const utilityTabs = newTabs.filter(t => t.type !== "chat");
+      if (utilityTabs.length) {
+        newTabs = [...newTabs.filter(t => t.type === "chat"), ...utilityTabs];
       }
 
       if (tabId === activeTab && newTabs.length > 0) {
@@ -4404,7 +7029,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     setRespondingTab(null);
   }, [startupStatus.active]);
 
-  async function persistGeneralSettings(partial: { assistantName?: string; themeColor?: string; themePreset?: ThemePreset; colorMode?: "dark" | "light" }) {
+  async function persistGeneralSettings(partial: { assistantName?: string; themeColor?: string; themePreset?: ThemePreset; colorMode?: "dark" | "light"; visionTimeoutMinutes?: number; detailedProgressEnabled?: boolean }) {
     try {
       await invoke("set_setup_flags", {
         args: {
@@ -4414,6 +7039,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           colorMode: partial.colorMode ?? colorMode,
         },
       });
+      if (partial.visionTimeoutMinutes !== undefined) {
+        setVisionTimeoutMinutes(partial.visionTimeoutMinutes);
+      }
+      if (partial.detailedProgressEnabled !== undefined) {
+        setDetailedProgressEnabled(partial.detailedProgressEnabled);
+      }
     } catch (e) {
       console.warn("Failed to persist general settings", e);
     }
@@ -4427,6 +7058,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         config: {
           coderEnabled: next.coderEnabled,
           visionEnabled: next.visionEnabled,
+          summarizerEnabled: next.summarizerEnabled,
           customModels: next.customModels,
           modelNotes: next.modelNotes,
           statusVerbs: next.statusVerbs,
@@ -4587,6 +7219,24 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     await persistRepoStore({ ...repoStore, mcps: enriched, sshs: normalized });
   }
 
+  async function saveToolRegistry() {
+    const normalized = (Array.isArray(toolDraft) ? toolDraft : []).map((tool) => normalizeToolDef(tool, tool.name || "Instruction Tool"));
+    setToolDraft(normalized);
+    await persistRepoStore({ ...repoStore, tools: normalized });
+  }
+
+  function updateToolDraft(toolId: string, patch: Partial<IrisToolDef>) {
+    setToolDraft((prev) => prev.map((tool) => (tool.id === toolId ? { ...tool, ...patch } : tool)));
+  }
+
+  function addCustomToolDraft() {
+    setToolDraft((prev) => [...prev, createBlankCustomTool()]);
+  }
+
+  function removeCustomToolDraft(toolId: string) {
+    setToolDraft((prev) => prev.filter((tool) => tool.id !== toolId));
+  }
+
   function appendActionTrace(tabId: number, entry: Omit<IrisActionTrace, "id" | "ts">) {
     const trace: IrisActionTrace = {
       id: makeId("act"),
@@ -4674,6 +7324,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           ...prev,
           [mcp.id]: { state: "connected", message: readiness.message, toolCount: readiness.toolCount },
         }));
+        void refreshProjectsForBridgeOpen(mcp.id, "mcp_bridge_opened");
       } else {
         setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: readiness.message } }));
         try { await invoke("stop_mcp_server", { mcpId: mcp.id }); } catch (_) { /* ignore */ }
@@ -4736,6 +7387,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           message: ok ? "Connected" : String(raw?.error || "Connection check failed"),
         },
       }));
+      if (ok) {
+        const targets = repoStore.projects.filter((p) => p.enabled && (p.sshIds || []).includes(ssh.id));
+        for (const p of targets) {
+          void refreshProjectBridgeMetadata(p, { forceFullPull: true, reason: "ssh_bridge_opened" });
+        }
+      }
     } catch (e: any) {
       setSshConnectStatus((prev) => ({
         ...prev,
@@ -4798,6 +7455,92 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     // which avoids lock contention from read-then-write cycles.
   }
 
+  function getCurrentTabTurn(tabId: number): number {
+    return Math.max(0, Number(tabTurnCounterRef.current[tabId] || 0));
+  }
+
+  function advanceTabTurn(tabId: number): number {
+    const next = getCurrentTabTurn(tabId) + 1;
+    tabTurnCounterRef.current[tabId] = next;
+    const existing = recentSceneFactsByTabRef.current[tabId] || [];
+    recentSceneFactsByTabRef.current[tabId] = existing.filter((fact) => fact.expiresAtTurn >= next);
+    return next;
+  }
+
+  function rememberRecentScenePath(tabId: number, rootPath: string, relPath: string, note: string) {
+    const turn = getCurrentTabTurn(tabId);
+    const normalizedPath = sanitizeGeneratedSceneRelativePath(relPath, "Scene.tscn");
+    if (!normalizedPath) return;
+    const normalizedRoot = normalizeSlashes(rootPath).toLowerCase();
+    const nextFact: RecentSceneFact = {
+      path: normalizedPath,
+      rootPath: normalizedRoot,
+      note: String(note || "scene operation").slice(0, 120),
+      turn,
+      expiresAtTurn: turn + 5,
+    };
+    const existing = (recentSceneFactsByTabRef.current[tabId] || [])
+      .filter((fact) => !(fact.path === nextFact.path && fact.rootPath === nextFact.rootPath));
+    recentSceneFactsByTabRef.current[tabId] = [nextFact, ...existing]
+      .sort((a, b) => b.turn - a.turn)
+      .slice(0, 8);
+  }
+
+  function getRecentScenePaths(tabId: number, rootPath: string): string[] {
+    const turn = getCurrentTabTurn(tabId);
+    const normalizedRoot = normalizeSlashes(rootPath).toLowerCase();
+    const facts = (recentSceneFactsByTabRef.current[tabId] || [])
+      .filter((fact) => fact.rootPath === normalizedRoot && fact.expiresAtTurn >= turn)
+      .sort((a, b) => b.turn - a.turn);
+    return Array.from(new Set(facts.map((fact) => fact.path)));
+  }
+
+  function extractGitRemoteUrlFromConfig(configText: string): string | null {
+    const text = String(configText || "");
+    const m = text.match(/\[remote\s+"origin"\][\s\S]*?\n\s*url\s*=\s*([^\n\r]+)/i);
+    if (m?.[1]) return String(m[1]).trim();
+    const fallback = text.match(/\n\s*url\s*=\s*([^\n\r]+)/i);
+    return fallback?.[1] ? String(fallback[1]).trim() : null;
+  }
+
+  async function inspectRepoUpdateSignal(repo: RepoFolder): Promise<string> {
+    if (!networkEnabled) {
+      return `Network is OFF, so ${assistantLabel} cannot verify GitHub freshness for ${repo.name} right now.`;
+    }
+    let remoteUrl = "";
+    try {
+      const gitConfig = await invoke("fs_read_text", {
+        root: repo.path,
+        path: ".git/config",
+        maxChars: 12000,
+      }) as string;
+      remoteUrl = extractGitRemoteUrlFromConfig(gitConfig) || "";
+    } catch {
+      // Non-git folder or config unavailable.
+    }
+
+    const queryBase = remoteUrl || repo.name;
+    const net = await withTimeout(invoke("network_search", {
+      query: `${queryBase} latest release changelog github`,
+      projectContext: "repository freshness check",
+    }) as Promise<any>, 4500, "network_search(repo_freshness)");
+    const hits = Array.isArray(net?.hits) ? (net.hits as NetworkHit[]) : [];
+    if (!hits.length) {
+      return `I could not find reliable freshness signals for ${repo.name}. You can still refresh local indexing now.`;
+    }
+
+    const top = hits[0];
+    const brief = String(top?.snippet || "").replace(/\s+/g, " ").trim();
+    const confidence = computeConfidenceForTags(agentProficiencies, ["network lookup", "project memory"]);
+    return [
+      `Potential update signal for ${repo.name}:`,
+      `- Source: ${top?.title || "unknown"}${top?.url ? ` (${top.url})` : ""}`,
+      brief ? `- Snippet: ${brief}` : "- Snippet: (not provided)",
+      `- Confidence: ${confidence}/100`,
+      `It seems this repo may be outdated compared to GitHub references. Would you like me to refresh local repo indexing now?`,
+    ].join("\n");
+  }
+
   async function sendRepoAssistantMessage() {
     const text = repoAssistantInput.trim();
     if (!text || repoAssistantBusy) return;
@@ -4806,6 +7549,36 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     setRepoAssistantMessages((prev) => [...prev, { role: "user", text }]);
 
     try {
+      const wantsUpdateCheck = /(update|outdated|latest|refresh).*(repo|repositories|github)|version mismatch/i.test(text);
+      if (wantsUpdateCheck && repoStore.repos.length) {
+        const target = repoStore.repos.find((r) => r.id === repoAssistantTargetRepoId) || repoStore.repos[0];
+        const report = await inspectRepoUpdateSignal(target);
+        setRepoAssistantMessages((prev) => [...prev, { role: "assistant", text: report }]);
+
+        const approveRefresh = await askInlinePermission({
+          title: "Update repo from remote?",
+          message: `${assistantLabel} can run git fetch/pull for ${target.name} and then refresh local indexing.`,
+          actionKey: "repo.update.remote",
+          risk: "medium",
+          confidence: computeConfidenceForTags(agentProficiencies, ["project memory", "network lookup"]),
+        });
+        if (approveRefresh) {
+          try {
+            const updateResult = await invoke("update_repo_from_remote", { repoPath: target.path }) as string;
+            await handleRefreshRepo(target.id);
+            setRepoAssistantMessages((prev) => [...prev, { role: "assistant", text: `${updateResult}\nLocal indexing refreshed for ${target.name}.` }]);
+          } catch (updateErr: any) {
+            const reason = String(updateErr?.message || updateErr || "unknown error");
+            await handleRefreshRepo(target.id);
+            setRepoAssistantMessages((prev) => [...prev, { role: "assistant", text: `Remote update could not be applied (${reason}). Local indexing refreshed for ${target.name}.` }]);
+          }
+        } else {
+          setRepoAssistantMessages((prev) => [...prev, { role: "assistant", text: "Understood. I will not update it right now." }]);
+        }
+        setRepoAssistantBusy(false);
+        return;
+      }
+
       const urlMatch = text.match(/https?:\/\/[^\s]+/i);
       if (urlMatch && repoAssistantTargetRepoId) {
         const target = repoStore.repos.find((r) => r.id === repoAssistantTargetRepoId);
@@ -4822,7 +7595,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       }
 
       const repoSummary = repoStore.repos.map((r) => `${r.name}: ${r.path}`).join("\n") || "(no repos configured)";
-      const prompt = `You are Iris repo assistant. Keep answers concise and actionable.\nConfigured repos:\n${repoSummary}\n\nUser request:\n${text}\n\nIf the user wants automatic install, ask for a direct Git URL and target repo folder.`;
+      const prompt = `You are ${assistantLabel} repo assistant. Keep answers concise and actionable.\nConfigured repos:\n${repoSummary}\n\nUser request:\n${text}\n\nIf the user wants automatic install, ask for a direct Git URL and target repo folder. If freshness/version mismatch is mentioned, suggest a repo update check and ask for approval before refresh actions.`;
       const controller = new AbortController();
       let response = "";
       await stream({
@@ -5174,6 +7947,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         style={{
           ["--app-bg" as any]: appBgColor,
           ["--app-surface" as any]: appSurfaceColor,
+          ["--app-user-bubble" as any]: appUserBubbleColor,
           ["--app-border" as any]: appBorderColor,
           ["--app-tab-bg" as any]: appTabBgColor,
           ["--app-tab-active-bg" as any]: appTabActiveBgColor,
@@ -5219,6 +7993,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               onMouseLeave={() => { setOpenMenu(null); setOpenSubmenu(null); }}
             >
               <div className="dropdown-item" onClick={handleSettings}>Settings</div>
+              <div className="dropdown-item" onClick={handleToolsCenter}>Tools Center</div>
 
               <div
                 className="dropdown-item"
@@ -5234,6 +8009,17 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     onMouseEnter={() => { /* keep parent open */ }}
                     onMouseLeave={() => setOpenSubmenu(null)}
                   >
+                    <div
+                      className="submenu-item"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleAgentStats();
+                        setOpenSubmenu(null);
+                        setOpenMenu(null);
+                      }}
+                    >
+                      Agent Stats
+                    </div>
                     <div
                       className="submenu-item"
                       onClick={async (e) => {
@@ -5327,7 +8113,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 tab.title
               )}
             </button>
-            {(tab.type === "chat" || tab.type === "settings") && (
+            {(tab.type === "chat" || tab.type === "settings" || tab.type === "tools" || tab.type === "agent-stats") && (
               <button
                 className="tab-close"
                 onClick={e => {
@@ -5422,6 +8208,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                                     toolCount: readiness.toolCount,
                                   },
                                 }));
+                                if (readiness.connected) {
+                                  void refreshProjectsForBridgeOpen(mcp.id, "mcp_bridge_reopened");
+                                }
                               } catch (err: any) {
                                 setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: String(err?.message || err || "not connected") } }));
                               }
@@ -5478,7 +8267,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
       <header className="chat-header">
         <h2>
-          {currentTab?.type === "settings" ? `${assistantLabel} • Settings` : `${assistantLabel} • Chat`}
+          {currentTab?.type === "settings"
+            ? `${assistantLabel} • Settings`
+            : currentTab?.type === "tools"
+            ? `${assistantLabel} • Tools Center`
+            : currentTab?.type === "agent-stats"
+            ? `${assistantLabel} • Agent Stats`
+            : `${assistantLabel} • Chat`}
         </h2>
         {currentTab?.type === "settings" && (
           <div className="settings-subtab-bar">
@@ -5629,23 +8424,85 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
       {currentTab?.type === "chat" && (
         <div className="chat-history" ref={historyRef}>
-          {(currentTab.messages || []).map((msg, idx) => (
-            <div className={`bubble ${msg.role}`} key={idx}>
-              <strong>
-                {msg.role === "user" ? "You:" : `${assistantLabel}:`}
-              </strong>{" "}
-              <ReactMarkdown>{msg.text}</ReactMarkdown>
-              {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
-                <div className="bubble-image-strip">
-                  {((msg as any).images as string[]).map((src, imgIdx) => (
-                    <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
-                      <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
-                    </div>
-                  ))}
+          {chatMessages.map((msg, idx) => {
+            const key = `${activeTab}_${idx}`;
+            const isHovered = hoveredMessageKey === key;
+            const isLastUserMessage = msg.role === "user" && idx === lastUserMessageIdx;
+            const isEditingThis = editingLastUserMsgIdx === idx;
+            const timestamp = formatMessageTimestamp((msg as any).time);
+
+            return (
+              <div
+                className={`bubble ${msg.role}`}
+                key={idx}
+                onMouseEnter={() => setHoveredMessageKey(key)}
+                onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
+              >
+                <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
+                  {timestamp ? <span>{timestamp}</span> : null}
+                  {isLastUserMessage && !isEditingThis && (
+                    <button
+                      type="button"
+                      className="bubble-edit-btn"
+                      onClick={() => {
+                        setEditingLastUserMsgIdx(idx);
+                        setEditingLastUserMsgDraft(msg.text || "");
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
                 </div>
-              )}
-            </div>
-          ))}
+
+                <strong>
+                  {msg.role === "user" ? "You:" : `${assistantLabel}:`}
+                </strong>{" "}
+
+                {isEditingThis ? (
+                  <div className="bubble-edit-wrap">
+                    <textarea
+                      className="bubble-edit-input"
+                      value={editingLastUserMsgDraft}
+                      onChange={(e) => setEditingLastUserMsgDraft(e.target.value)}
+                      rows={3}
+                    />
+                    <div className="bubble-edit-actions">
+                      <button
+                        type="button"
+                        className="setup-btn primary"
+                        onClick={() => editAndResendLastUserMessage(editingLastUserMsgDraft)}
+                      >
+                        Save + Resend
+                      </button>
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        onClick={() => {
+                          setEditingLastUserMsgIdx(null);
+                          setEditingLastUserMsgDraft("");
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <ReactMarkdown>{msg.text}</ReactMarkdown>
+                )}
+
+                {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
+                  <div className="bubble-image-strip">
+                    {((msg as any).images as string[]).map((src, imgIdx) => (
+                      <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
+                        <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <div ref={chatEndRef} />
         </div>
       )}
       {!hasChatTabs && currentTab?.type !== "settings" && (
@@ -5654,6 +8511,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             <strong>{assistantLabel}:</strong>{" "}
             No chats are open. Press <strong>File</strong> and then <strong>New tab</strong> to start a new conversation.
           </div>
+          <div ref={chatEndRef} />
         </div>
       )}
       {currentTab?.type === "settings" && (
@@ -5739,6 +8597,108 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </div>
 
               <div style={{ marginBottom: 14 }}>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Response wait threshold (minutes)</label>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input
+                    type="number"
+                    min="0.5"
+                    max="30"
+                    step="0.5"
+                    value={visionTimeoutMinutes}
+                    onChange={(e) => setVisionTimeoutMinutes(Math.max(0.5, parseFloat(e.target.value) || 1.5))}
+                    onBlur={() => persistGeneralSettings({ visionTimeoutMinutes })}
+                    style={{ width: 80, padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                  />
+                  <span style={{ color: "var(--app-text)", fontSize: "0.9rem" }}>minutes (default: 1.5)</span>
+                </div>
+                <p style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
+                  Iris will ask whether to continue waiting or cancel when any response exceeds this duration.
+                </p>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Detailed response progress</label>
+                <button
+                  className={`setup-btn${detailedProgressEnabled ? " primary" : ""}`}
+                  onClick={async () => {
+                    const next = !detailedProgressEnabled;
+                    setDetailedProgressEnabled(next);
+                    await persistGeneralSettings({ detailedProgressEnabled: next });
+                  }}
+                >
+                  Detailed Progress: {detailedProgressEnabled ? "ON" : "OFF"}
+                </button>
+                <p style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
+                  Show estimated % completed while Iris is generating a response. May slightly slow down inference.
+                </p>
+              </div>
+
+              <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)", fontWeight: 700 }}>Permissions</label>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                  <button
+                    className={`setup-btn${permissionSettings.mode === "balanced" ? " primary" : ""}`}
+                    onClick={() => void persistPermissionSettings({ ...permissionSettings, mode: "balanced" })}
+                  >
+                    Balanced
+                  </button>
+                  <button
+                    className={`setup-btn${permissionSettings.mode === "always_ask" ? " primary" : ""}`}
+                    onClick={() => void persistPermissionSettings({ ...permissionSettings, mode: "always_ask" })}
+                  >
+                    Ask Often
+                  </button>
+                  <button
+                    className={`setup-btn${permissionSettings.mode === "testing" ? " primary" : ""}`}
+                    onClick={() => void persistPermissionSettings({ ...permissionSettings, mode: "testing" })}
+                  >
+                    Testing Mode
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+                  <label style={{ color: "var(--app-text)", fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={permissionSettings.alwaysAllowLowRisk}
+                      onChange={(e) => void persistPermissionSettings({ ...permissionSettings, alwaysAllowLowRisk: e.target.checked })}
+                      style={{ marginRight: 6 }}
+                    />
+                    Always allow low-risk actions
+                  </label>
+                  <label style={{ color: "var(--app-text)", fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={permissionSettings.allowIterationWithoutPrompt}
+                      onChange={(e) => void persistPermissionSettings({ ...permissionSettings, allowIterationWithoutPrompt: e.target.checked })}
+                      style={{ marginRight: 6 }}
+                    />
+                    Allow iterative action chains without repeated prompts
+                  </label>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ color: "var(--app-text)", fontSize: 12 }}>Testing confidence threshold</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={permissionSettings.testingConfidenceThreshold}
+                    onChange={(e) => {
+                      const next = clampScore(Number(e.target.value || 50));
+                      void persistPermissionSettings({ ...permissionSettings, testingConfidenceThreshold: next });
+                    }}
+                    style={{ width: 72, padding: "6px 8px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                  />
+                  <span style={{ color: isLightMode ? "#526272" : "#9da8b8", fontSize: 12 }}>/ 100</span>
+                </div>
+                <p style={{ marginTop: 0, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
+                  Testing mode asks permission whenever confidence drops below the threshold. Confidence is estimated from dynamic Agent Stats.
+                </p>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Universal dataweb</label>
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <button
@@ -5818,6 +8778,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <button
                     className={`setup-btn${reposContextActive ? " primary" : ""}`}
+                    disabled={lowPowerProfile}
                     onClick={async () => {
                       const next = !reposEnabled;
                       setReposEnabled(next);
@@ -5832,6 +8793,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
                 <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
                   Turning this off can significantly improve speed and reduce cognitive bandwidth usage, especially on lower-powered devices.
+                  {lowPowerProfile ? " Repos are automatically disabled on Low/Minimal profiles." : ""}
                 </div>
               </div>
               <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
@@ -5912,7 +8874,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                             entryIds: p.entryIds.filter((eid) => !repo.entries.some((e) => e.id === eid)),
                             mcpIds: p.mcpIds || [],
                           }));
-                          await persistRepoStore({ repos: nextRepos, mcps: repoStore.mcps, sshs: repoStore.sshs, projects: nextProjects });
+                          await persistRepoStore({ ...repoStore, repos: nextRepos, projects: nextProjects });
                         }}
                       >
                         Remove
@@ -6011,15 +8973,15 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </div>
 
               <div style={{ marginTop: 14, marginBottom: 14, borderTop: "1px solid #2f2f2f", paddingTop: 12 }}>
-                <h4 style={{ margin: "0 0 8px 0", color: "var(--app-text)" }}>Iris Repo Assistant</h4>
+                <h4 style={{ margin: "0 0 8px 0", color: "var(--app-text)" }}>{assistantLabel} Repo Assistant</h4>
                 {!networkEnabled && (
                   <div style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 7, background: isLightMode ? "rgba(170, 131, 50, 0.12)" : "#1e1a12", border: `1px solid ${isLightMode ? "rgba(170, 131, 50, 0.34)" : "#4a3e1a"}`, color: isLightMode ? "#70531a" : "#d9c27a", fontSize: 12 }}>
-                    Network is disabled. Enable Network in the <strong>Network</strong> tab to use Iris Repo Assistant.
+                    Network is disabled. Enable Network in the <strong>Network</strong> tab to use {assistantLabel} Repo Assistant.
                   </div>
                 )}
                 <div style={{ opacity: networkEnabled ? 1 : 0.38, pointerEvents: networkEnabled ? "auto" : "none", transition: "opacity 0.2s" }}>
                   <p style={{ marginTop: 0, fontSize: 12, color: isLightMode ? "#455566" : "#b9b9b9" }}>
-                    Ask Iris which repositories to add, or paste a Git URL and ask it to install into a selected repository folder.
+                    Ask {assistantLabel} which repositories to add, or paste a Git URL and ask it to install into a selected repository folder.
                   </p>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
                     <span style={{ color: "var(--app-text)", fontSize: 12 }}>Install target</span>
@@ -6037,7 +8999,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <div style={{ border: "1px solid var(--app-border)", borderRadius: 8, maxHeight: 170, overflowY: "auto", padding: 8, background: "var(--app-panel-bg)", marginBottom: 8 }}>
                     {repoAssistantMessages.map((m, i) => (
                       <div key={i} style={{ fontSize: 12, color: m.role === "assistant" ? (isLightMode ? "#29435e" : "#d8e7ff") : "var(--app-text)", marginBottom: 6 }}>
-                        <strong>{m.role === "assistant" ? "Iris" : "You"}:</strong> {m.text}
+                        <strong>{m.role === "assistant" ? assistantLabel : "You"}:</strong> {m.text}
                       </div>
                     ))}
                   </div>
@@ -6086,6 +9048,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       description: "",
                       manipulationRootPath: "",
                       datawebEnabled: true,
+                      godotVersionCached: "",
+                      lastBridgeSyncAt: 0,
+                      lastFullProjectPullAt: 0,
                       repoIds: [],
                       entryIds: [],
                       mcpIds: [],
@@ -6473,6 +9438,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <button
                     className={`setup-btn${mcpContextActive ? " primary" : ""}`}
+                    disabled={lowPowerProfile}
                     onClick={async () => {
                       const next = !mcpEnabled;
                       setMcpEnabled(next);
@@ -6502,6 +9468,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
                 <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
                   MCP OFF reduces tool orchestration overhead; Desktop Tools OFF prevents any automatic window/screenshot routine.
+                  {lowPowerProfile ? " MCP is automatically disabled on Low/Minimal profiles." : ""}
                 </div>
               </div>
               <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
@@ -6963,8 +9930,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       const hw = await invoke<HardwareProfile>("detect_hardware_profile");
                       const next = hw.detectedProfile as LlmProfile;
                       setLlmProfile(next);
+                      if (next === "Low" || next === "Minimal") {
+                        setReposEnabled(false);
+                        setMcpEnabled(false);
+                      }
                       await invoke("apply_model_profile", { profile: next });
-                      await invoke("set_setup_flags", { args: { modelProfile: next } });
+                      await invoke("set_setup_flags", { args: { modelProfile: next, ...(next === "Low" || next === "Minimal" ? { reposEnabled: false, mcpEnabled: false } : {}) } });
                       const msg = `Detected ${hw.gpuName}: Recommending ${next}. ${hw.detectionNote}`;
                       setHwToast(msg);
                       if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
@@ -6994,9 +9965,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   onChange={async (e) => {
                     const next = e.target.value as LlmProfile;
                     setLlmProfile(next);
+                    if (next === "Low" || next === "Minimal") {
+                      setReposEnabled(false);
+                      setMcpEnabled(false);
+                    }
                     try {
                       await invoke("apply_model_profile", { profile: next });
-                      await invoke("set_setup_flags", { args: { modelProfile: next } });
+                      await invoke("set_setup_flags", { args: { modelProfile: next, ...(next === "Low" || next === "Minimal" ? { reposEnabled: false, mcpEnabled: false } : {}) } });
                     } catch (err: any) {
                       alert("Failed to apply profile defaults: " + (err?.message || err));
                     }
@@ -7021,7 +9996,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <div style={{ marginBottom: 18, border: "1px solid rgba(122,148,187,0.35)", borderRadius: 8, padding: 12, background: "rgba(14,20,30,0.35)" }}>
                 <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700 }}>Dynamic Modelfile Editor</div>
                 <div style={{ marginBottom: 10, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
-                  Organizer and Summarizer are always active. Coder and Vision can be toggled. Add custom models, then set per-model note text that is appended to organizer routing instructions.
+                  Organizer is always active. Summarizer, Coder, and Vision can be toggled. Add custom models, then set per-model note text that is appended to organizer routing instructions.
                 </div>
 
                 {modelfileLoadError && (
@@ -7038,8 +10013,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       Organizer (always active)
                     </label>
                     <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <input type="checkbox" checked disabled />
-                      Summarizer (always active)
+                      <input
+                        type="checkbox"
+                        checked={modelConfig.summarizerEnabled}
+                        onChange={async (e) => await persistModelConfig({ ...modelConfig, summarizerEnabled: e.target.checked })}
+                      />
+                      Summarizer
                     </label>
                     <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <input
@@ -7279,11 +10258,23 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       {(modelfileEdits[modelfileSubTab] || []).map((p) => (
                         <div key={`${modelfileSubTab}_${p.key}`} style={{ display: "contents" }}>
                           <div style={{ fontSize: 12, color: "#c8d5ea" }}>{p.key}</div>
-                          <input
-                            value={p.value}
-                            onChange={(e) => updateModelfileParam(modelfileSubTab, p.key, e.target.value)}
-                            style={{ padding: "7px 9px", borderRadius: 6, background: "#131313", color: "#ebebeb", border: "1px solid #3a3a3a" }}
-                          />
+                          {isBooleanParamValue(p.value) ? (
+                            <label style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "#d6e5ff" }}>
+                              <input
+                                type="checkbox"
+                                checked={boolParamChecked(p.value)}
+                                onChange={(e) => updateModelfileParam(modelfileSubTab, p.key, e.target.checked ? "true" : "false")}
+                              />
+                              {boolParamChecked(p.value) ? "true" : "false"}
+                            </label>
+                          ) : (
+                            <input
+                              value={p.value}
+                              onChange={(e) => updateModelfileParam(modelfileSubTab, p.key, e.target.value)}
+                              inputMode={/^(num_|mirostat|top_k|repeat_last_n|seed)/i.test(p.key) ? "numeric" : "text"}
+                              style={{ padding: "7px 9px", borderRadius: 6, background: "#131313", color: "#ebebeb", border: "1px solid #3a3a3a" }}
+                            />
+                          )}
                         </div>
                       ))}
                     </div>
@@ -7314,7 +10305,15 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
                 <div className="footprint-card" style={{ marginBottom: 10 }}>
                   <div className="footprint-top-row">
-                    <span style={{ color: isLightMode ? "#1d2b3a" : "#dbe9ff", fontWeight: 700 }}>Effective Context Footprint</span>
+                    <span style={{ color: isLightMode ? "#1d2b3a" : "#dbe9ff", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      Effective Context Footprint
+                      <span
+                        className="footprint-help"
+                        title="The Footprint Score estimates the cognitive load on your hardware. Scores > 5.0 require significant VRAM/RAM but allow for deeper RAG (Repos) and Multi-tool MCP usage."
+                      >
+                        ?
+                      </span>
+                    </span>
                     <span className="footprint-badge">{effectiveFootprint.level}</span>
                   </div>
                   <div style={{ marginTop: 4, fontSize: 12, color: isLightMode ? "#2b3c52" : "#b9cae7" }}>
@@ -7328,10 +10327,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     profile base + live token budget (`num_ctx` from Organizer, if edited) + repo load + MCP load + planner + network.
                     Lower scores favor responsiveness on constrained hardware; higher scores favor richer context handling.
                   </div>
+                  <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#2f465f" : "#9fb2c9" }}>
+                    This score represents the estimated VRAM and cognitive load on your system. Higher scores allow for deeper project memory but may increase response latency.
+                  </div>
                 </div>
                 <div style={{ marginBottom: 8, color: "var(--app-text)", fontWeight: 600, fontSize: 13 }}>Performance Guide</div>
                 <div style={{ marginBottom: 8, fontSize: 12, color: isLightMode ? "#4e6175" : "#9e9e9e" }}>
-                  Use these baselines with online tools to compare your specs and find your best fit.
+                  Use these baselines to compare your specs via online tools to find the best fit.
                 </div>
                 <div className="perf-guide-table">
                   <div className="perf-guide-header">Profile</div>
@@ -7362,12 +10364,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <div className="perf-guide-cell perf-guide-profile low">Low</div>
                   <div className="perf-guide-cell">VRAM ≤ 4 GB or RAM &lt; 16 GB</div>
                   <div className="perf-guide-cell">Lightweight 1.5–3B models, 1K context</div>
-                  <div className="perf-guide-cell">Optional lightweight Repo/MCP via ON/OFF toggles</div>
+                  <div className="perf-guide-cell">Repos OFF · MCP OFF (auto-gated)</div>
 
                   <div className="perf-guide-cell perf-guide-profile minimal">Minimal</div>
                   <div className="perf-guide-cell">CPU only / no dedicated GPU</div>
                   <div className="perf-guide-cell">Smallest footprint, slow generation</div>
-                  <div className="perf-guide-cell">Keep Repo/MCP OFF by default; enable only when needed</div>
+                  <div className="perf-guide-cell">Repos OFF · MCP OFF (auto-gated)</div>
                 </div>
               </div>
 
@@ -7402,6 +10404,15 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div style={{ color: "#cfdcf1" }}>
                   Iris routes tasks bi-directionally across Organizer, Coder, Summarizer, and Vision according to the selected profile,
                   modelfile parameters, and available tool context (Repos, MCP, Network). This keeps each model focused while maintaining continuity.
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 10, fontSize: 13, lineHeight: 1.55 }}>
+                <div style={{ color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, marginBottom: 4 }}>Inbound MCP: External AI to Iris</div>
+                <div style={{ color: "#cfdcf1" }}>
+                  Iris can expose her command surface through an MCP bridge so external agents (for example ChatGPT-connected tool clients)
+                  can trigger Iris actions like tab switching, memory retrieval, and project-context lookups.
+                  Keep this bridge constrained to trusted endpoints and only enable high-bandwidth routes when hardware profile allows.
                 </div>
               </div>
 
@@ -7459,8 +10470,251 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         </div>
       )}
 
+      {currentTab?.type === "tools" && (
+        <div className="settings-container">
+          <div className="llm-settings-card">
+            <h3>Tools Center</h3>
+            <p>
+              Built-in tools are fixed guidance for Iris. Custom tools are instruction-only and let you add project-specific rules for how Iris should choose actions.
+            </p>
+
+            <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 12, background: isLightMode ? "rgba(86, 112, 138, 0.1)" : "#131b26" }}>
+              <div style={{ fontWeight: 700, marginBottom: 8, color: "var(--app-text)" }}>How to use Tools Center</div>
+              <div style={{ fontSize: 12, color: isLightMode ? "#32485e" : "#c6d5e7", lineHeight: 1.5, marginBottom: 8 }}>
+                Think of custom tools as planning rules for Iris, not new code modules. They help Iris choose among existing capabilities (Filesystem, MCP, SSH, Desktop, Memory, Network).
+              </div>
+
+              <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 6, fontWeight: 700 }}>Limitations</div>
+              <ul style={{ margin: "0 0 10px 18px", padding: 0, fontSize: 12, color: isLightMode ? "#3d556d" : "#b8c8db", lineHeight: 1.45 }}>
+                <li>Custom tools cannot create new runtime commands, APIs, or backend functions.</li>
+                <li>Built-in tools are fixed and cannot be removed or disabled.</li>
+                <li>Instructions influence planning, but cannot guarantee behavior if required context is missing.</li>
+                <li>Custom tools only apply after you click Save Tools.</li>
+              </ul>
+
+              <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 6, fontWeight: 700 }}>Write an effective instructional tool</div>
+              <ol style={{ margin: "0 0 10px 18px", padding: 0, fontSize: 12, color: isLightMode ? "#3d556d" : "#b8c8db", lineHeight: 1.45 }}>
+                <li>Name: keep it specific (for example, "Godot Scene Edit Policy").</li>
+                <li>Description: state the decision goal in one sentence.</li>
+                <li>How it works: define when to prefer one built-in tool over another and list hard constraints.</li>
+                <li>Enable the tool and click Save Tools.</li>
+              </ol>
+
+              <details>
+                <summary style={{ cursor: "pointer", color: isLightMode ? "#24486a" : "#9dc2ea", fontSize: 12, fontWeight: 700 }}>Example instructional tools that work with this framework</summary>
+                <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ border: "1px solid var(--app-border)", borderRadius: 6, padding: 8, background: "var(--app-panel-bg)" }}>
+                    <div style={{ fontSize: 12, color: "var(--app-text)", fontWeight: 700, marginBottom: 4 }}>Example 1: Godot Scene Edit Policy</div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#3d556d" : "#b8c8db", whiteSpace: "pre-wrap", lineHeight: 1.45 }}>
+                      Name: Godot Scene Edit Policy{"\n"}
+                      Description: Prefer direct local edits for known .tscn paths and use MCP only for engine-specific checks.{"\n"}
+                      How it works: If the user asks to resize, rename, or patch a known scene file path, use Filesystem first. Use MCP only when the user asks for engine-only operations or verification not available via direct file edits. If path is unknown, list likely scene folders before editing.
+                    </div>
+                  </div>
+
+                  <div style={{ border: "1px solid var(--app-border)", borderRadius: 6, padding: 8, background: "var(--app-panel-bg)" }}>
+                    <div style={{ fontSize: 12, color: "var(--app-text)", fontWeight: 700, marginBottom: 4 }}>Example 2: Remote-first SSH Workflow</div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#3d556d" : "#b8c8db", whiteSpace: "pre-wrap", lineHeight: 1.45 }}>
+                      Name: Remote Build Policy{"\n"}
+                      Description: Keep file operations on the configured SSH host when the active project is remote.{"\n"}
+                      How it works: When active project has an enabled SSH bridge, prefer SSH list/read/write/move/exec for project files and build commands. Avoid local filesystem writes unless user explicitly requests local-only changes.
+                    </div>
+                  </div>
+
+                  <div style={{ border: "1px solid var(--app-border)", borderRadius: 6, padding: 8, background: "var(--app-panel-bg)" }}>
+                    <div style={{ fontSize: 12, color: "var(--app-text)", fontWeight: 700, marginBottom: 4 }}>Example 3: Freshness Guardrail</div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#3d556d" : "#b8c8db", whiteSpace: "pre-wrap", lineHeight: 1.45 }}>
+                      Name: Fresh Data Policy{"\n"}
+                      Description: Use Network only for time-sensitive or internet-only questions.{"\n"}
+                      How it works: Default to local project context and memory. Use Network lookup only for live data (news, weather, release status) or when user explicitly asks for latest online information.
+                    </div>
+                  </div>
+                </div>
+              </details>
+            </div>
+
+            <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+              <div style={{ marginBottom: 8, fontSize: 12, color: isLightMode ? "#4c6074" : "#b1b1b1" }}>
+                Built-in tools are not toggleable. They describe the capabilities Iris can reason about when planning work.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
+                {INTERNAL_IRIS_TOOLS.map((tool) => (
+                  <div key={tool.id} style={{ border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: isLightMode ? "rgba(86, 112, 138, 0.08)" : "#111824" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                      <strong style={{ color: "var(--app-text)" }}>{tool.name}</strong>
+                      <span style={{ fontSize: 11, color: isLightMode ? "#5e7488" : "#93a8bf" }}>Fixed</span>
+                    </div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#32485e" : "#d6deea", marginBottom: 8 }}>{tool.description}</div>
+                    <div style={{ fontSize: 12, color: isLightMode ? "#4c6074" : "#b9c7d8", lineHeight: 1.45 }}>{tool.instructions}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
+              <button className="setup-btn primary" disabled={menuLocked} onClick={addCustomToolDraft}>Add Instruction Tool</button>
+              <button
+                className={`setup-btn${toolDirty ? " primary" : ""}`}
+                disabled={!toolDirty}
+                onClick={saveToolRegistry}
+              >
+                {toolDirty ? "Save Tools" : "Saved"}
+              </button>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: "min(72vh, 760px)", overflowY: "auto", overflowX: "hidden", paddingRight: 4 }}>
+              {(Array.isArray(toolDraft) ? toolDraft : []).filter((tool) => tool.scope !== "internal").map((tool) => (
+                <div key={tool.id} style={{ border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+                    <input
+                      value={tool.name}
+                      onChange={(e) => updateToolDraft(tool.id, { name: e.target.value })}
+                      style={{ minWidth: 240, padding: "6px 8px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                    />
+                    <label style={{ fontSize: 12, color: "var(--app-text)" }}>
+                      <input
+                        type="checkbox"
+                        checked={tool.enabled}
+                        onChange={(e) => updateToolDraft(tool.id, { enabled: e.target.checked })}
+                        style={{ marginRight: 6 }}
+                      />
+                      Enabled
+                    </label>
+                    <button className="setup-btn" onClick={() => removeCustomToolDraft(tool.id)}>Remove</button>
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    <label style={{ display: "block", fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Description</label>
+                    <textarea
+                      rows={2}
+                      value={tool.description}
+                      onChange={(e) => updateToolDraft(tool.id, { description: e.target.value })}
+                      style={{ width: "100%", boxSizing: "border-box", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)", padding: 8 }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ display: "block", fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>How it works</label>
+                    <textarea
+                      rows={4}
+                      value={tool.instructions}
+                      onChange={(e) => updateToolDraft(tool.id, { instructions: e.target.value })}
+                      placeholder="Explain when Iris should use this capability and what constraints it should follow."
+                      style={{ width: "100%", boxSizing: "border-box", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)", padding: 8 }}
+                    />
+                  </div>
+                </div>
+              ))}
+              {(!Array.isArray(toolDraft) || !toolDraft.filter((tool) => tool.scope !== "internal").length) && (
+                <div style={{ color: "#aaa", fontSize: 13 }}>No custom instructional tools yet.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {currentTab?.type === "agent-stats" && (
+        <div className="settings-container">
+          <div className="llm-settings-card">
+            <h3>Agent Stats</h3>
+            <p>
+              These proficiencies model {assistantLabel}'s perceived capability levels. Defaults ship per app release, then evolve from usage and feedback.
+            </p>
+
+            <div style={{ marginBottom: 12, fontSize: 12, color: isLightMode ? "#3f566d" : "#b5c5d8" }}>
+              Last task confidence: <strong>{lastTaskConfidence}</strong>/100 {lastTaskTags.length ? `| Tags: ${lastTaskTags.join(", ")}` : ""}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+              <input
+                value={agentStatsDraftName}
+                onChange={(e) => setAgentStatsDraftName(e.target.value)}
+                placeholder="Add new proficiency (e.g., Shader Authoring)"
+                style={{ minWidth: 280, flex: 1, padding: "8px 10px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+              />
+              <button
+                className="setup-btn primary"
+                onClick={async () => {
+                  const name = agentStatsDraftName.trim();
+                  if (!name) return;
+                  const exists = agentProficiencies.some((p) => normalizeProficiencyName(p.name) === normalizeProficiencyName(name));
+                  if (exists) return;
+                  setAgentStatsDraftName("");
+                  await persistAgentProficiencies([...agentProficiencies, { id: makeId("prof"), name, score: 50 }]);
+                }}
+              >
+                Add Proficiency
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 150px 180px", gap: 8, alignItems: "center" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "var(--app-text)" }}>Proficiency</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "var(--app-text)" }}>Score</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "var(--app-text)" }}>Adjust</div>
+              {agentProficiencies.map((item) => (
+                <div key={item.id} style={{ display: "contents" }}>
+                  <input
+                    key={`${item.id}_name`}
+                    value={item.name}
+                    onChange={(e) => setAgentProficiencies((prev) => prev.map((p) => p.id === item.id ? { ...p, name: e.target.value } : p))}
+                    onBlur={() => void persistAgentProficiencies(agentProficiencies)}
+                    style={{ padding: "7px 9px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                  />
+                  <input
+                    key={`${item.id}_score`}
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Number(item.score).toFixed(1)}
+                    onChange={(e) => {
+                      const nextScore = clampScore(Number(e.target.value || 0));
+                      setAgentProficiencies((prev) => prev.map((p) => p.id === item.id ? { ...p, score: nextScore } : p));
+                    }}
+                    onBlur={() => void persistAgentProficiencies(agentProficiencies)}
+                    style={{ padding: "7px 9px", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)" }}
+                  />
+                  <div key={`${item.id}_actions`} style={{ display: "flex", gap: 6 }}>
+                    <button
+                      className="setup-btn"
+                      onClick={() => setAgentProficiencies((prev) => prev.map((p) => p.id === item.id ? { ...p, score: clampScore(p.score - 1) } : p))}
+                    >
+                      -1
+                    </button>
+                    <button
+                      className="setup-btn"
+                      onClick={() => setAgentProficiencies((prev) => prev.map((p) => p.id === item.id ? { ...p, score: clampScore(p.score + 1) } : p))}
+                    >
+                      +1
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <button className="setup-btn primary" onClick={() => void persistAgentProficiencies(agentProficiencies)}>Save Agent Stats</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {currentTab?.type === "chat" && (
+        <>
+        {activeInlinePermission && (
+          <div className="inline-permission-card">
+            <div className="inline-permission-title">{activeInlinePermission.title}</div>
+            <div className="inline-permission-body">{activeInlinePermission.message}</div>
+            <div className="inline-permission-meta">
+              <span>Action: {activeInlinePermission.actionKey}</span>
+              <span>Risk: {activeInlinePermission.risk}</span>
+              <span>Confidence: {activeInlinePermission.confidence}/100</span>
+            </div>
+            <div className="inline-permission-actions">
+              <button className="setup-btn" type="button" onClick={() => resolveInlinePermission(activeInlinePermission.id, false)}>No</button>
+              <button className="setup-btn primary" type="button" onClick={() => resolveInlinePermission(activeInlinePermission.id, true)}>Yes</button>
+            </div>
+          </div>
+        )}
         <form
+          ref={chatFormRef}
           className="chat-input-row"
           onSubmit={isGenerating ? handleStop : sendMessage}
           autoComplete="off"
@@ -7496,7 +10750,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             }}
             placeholder={pendingImages.length ? "Add a prompt, or send to let Iris inspect the image..." : "Type your message..."}
             autoFocus
-            disabled={isGenerating || menuLocked}
+            disabled={menuLocked}
             rows={1}
             style={{ resize: "none" }}
             ref={inputRef}
@@ -7531,6 +10785,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             {isGenerating ? "Stop" : "Send"}
           </button>
         </form>
+        </>
       )}
     </div>
     </>

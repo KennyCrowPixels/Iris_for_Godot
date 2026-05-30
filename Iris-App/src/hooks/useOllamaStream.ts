@@ -1,11 +1,14 @@
 // filepath: d:\Iris_for_Godot\Iris-App\src\hooks\useOllamaStream.ts
 import { OLLAMA_URL } from "../lib/ollama";
 
+type Message = { role: "user" | "assistant"; content: string };
+
 export default function useOllamaStream() {
   async function stream({
     model,
     images,
     prompt,
+    messages,
     options,
     signal,
     onHeaders,
@@ -14,8 +17,9 @@ export default function useOllamaStream() {
     onDone,
   }: {
     model: string;
-      images?: string[];
-    prompt: string;
+    images?: string[];
+    prompt?: string;
+    messages?: Message[];
     options?: Record<string, any>;
     signal: AbortSignal;
     onHeaders?: () => void;
@@ -29,17 +33,31 @@ export default function useOllamaStream() {
     let llmInserted = false;
     let acc = "";
 
+    // Determine which endpoint to use: /api/chat for messages, /api/generate for prompt
+    const useChat = messages && messages.length > 0;
+    const endpoint = useChat ? 'http://127.0.0.1:11434/api/chat' : 'http://127.0.0.1:11434/api/generate';
+    
+    const requestBody = useChat
+      ? {
+          model,
+          messages,
+          stream: true,
+          keep_alive: "90s",
+          ...(options || {}),
+        }
+      : {
+          model,
+          ...(images && images.length ? { images } : {}),
+          prompt: prompt || "",
+          stream: true,
+          keep_alive: "90s",
+          ...(model === "iris-coder:latest" ? {} : { options }),
+        };
+
     const fetchOptions = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        ...(images && images.length ? { images } : {}),
-        prompt,
-        stream: true,
-        keep_alive: "90s",
-        ...(model === "iris-coder:latest" ? {} : { options }),
-      }),
+      body: JSON.stringify(requestBody),
       signal,
     };
 
@@ -47,7 +65,7 @@ export default function useOllamaStream() {
     let lastErr: any = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        response = await fetch(OLLAMA_URL, fetchOptions);
+        response = await fetch(endpoint, fetchOptions);
         if (response && response.ok && response.body) break;
         // read body text on error to help debug
         const txt = response ? await response.text().catch(() => "") : "";
@@ -96,8 +114,11 @@ export default function useOllamaStream() {
           try {
             const json = JSON.parse(objStr);
 
-            if (json.response) {
-              buffer += json.response;
+            // Handle both /api/generate (response field) and /api/chat (message.content field)
+            const token = json.response || (json.message && json.message.content) || "";
+            
+            if (token) {
+              buffer += token;
 
               // Insert the LLM bubble on the first actual token
               if (!llmInserted && buffer.length > 0) {

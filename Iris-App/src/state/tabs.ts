@@ -1,11 +1,11 @@
-export type Message = { role: "user" | "llm"; text: string };
+export type Message = { role: "user" | "llm"; text: string; time?: number };
 
 export function updateMessagesAppendUser(prev: Message[], text: string, images?: string[]): Message[] {
-  return [...prev, { role: "user", text, ...(images && images.length ? { images } : {}) } as any];
+  return [...prev, { role: "user", text, time: Math.floor(Date.now() / 1000), ...(images && images.length ? { images } : {}) } as any];
 }
 
 export function insertLLMBubble(prev: Message[], first: string): Message[] {
-  return [...prev, { role: "llm", text: first }];
+  return [...prev, { role: "llm", text: first, time: Math.floor(Date.now() / 1000) }];
 }
 
 export function patchLastLLMBubble(prev: Message[], delta: string): Message[] {
@@ -17,7 +17,7 @@ export function patchLastLLMBubble(prev: Message[], delta: string): Message[] {
       return copy;
     }
   }
-  return [...copy, { role: "llm", text: delta }];
+  return [...copy, { role: "llm", text: delta, time: Math.floor(Date.now() / 1000) }];
 }
 
 // Artifact extractor (string → artifacts[])
