@@ -39,6 +39,20 @@ if errorlevel 1 (
   )
 )
 
+if not exist "node_modules\cross-env\package.json" (
+  echo [Iris] Installing npm dependencies...
+  if defined NPM_CLI_JS (
+    call "%NODE_EXE%" "%NPM_CLI_JS%" install
+  ) else (
+    call "%NPM_CMD%" install
+  )
+  if errorlevel 1 (
+    echo [Iris] npm install failed.
+    popd
+    exit /b 1
+  )
+)
+
 echo [Iris] Building production installer bundles...
 if defined NPM_CLI_JS (
   call "%NODE_EXE%" "%NPM_CLI_JS%" run tauri:build
