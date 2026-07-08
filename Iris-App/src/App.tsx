@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import "./App.css";
 import type { ChatMessage, Artifact } from "./types/models";
@@ -76,6 +77,34 @@ type AgentProficiency = {
   name: string;
   score: number;
 };
+
+type UserTurnPayload = {
+  tab_id: number;
+  input_text: string;
+  images: string[];
+};
+
+type ResolvePermissionPayload = {
+  req_id: string;
+  approved: boolean;
+};
+
+type IrisEvent =
+  | { type: "Status"; payload: string }
+  | { type: "Delta"; payload: string }
+  | { type: "GodotError"; payload: string }
+  | {
+      type: "PermissionRequest";
+      payload: {
+        req_id: string;
+        action: string;
+        target: string;
+        risk_level: "safe" | "warn" | "critical";
+      };
+    }
+  | { type: "ToolResult"; payload: { tool_name: string; status: string } }
+  | { type: "Error"; payload: string }
+  | { type: "Done"; payload: null };
 
 function normalizeMessages(raw: any[] | undefined): Message[] {
   const out: Message[] = [];
@@ -2223,6 +2252,8 @@ function capSnapshotMessages(
 
 
 function App() {
+  const useRustEngine = true;
+  const [rustEngineStatus, setRustEngineStatus] = useState("");
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
   const [input, setInput] = useState("");
@@ -2257,6 +2288,7 @@ function App() {
   const mcpToolCacheRef = useRef<Record<string, { tools: McpToolDescriptor[]; ts: number }>>({});
   const bridgeMetaRefreshRef = useRef<Record<string, number>>({});
   const tabTurnCounterRef = useRef<Record<number, number>>({});
+  const rustHadDeltaByTabRef = useRef<Record<number, boolean>>({});
   const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
   const isMounted = useRef(true);
 
@@ -3353,6 +3385,142 @@ function App() {
     void refreshProjectBridgeMetadata(activeProject, { forceFullPull: false, reason: "project_chat_open" });
   }, [activeProjectId, mcpHealthStatus, mcpLaunchStatus, sshConnectStatus]);
 
+  useEffect(() => {
+    const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+    if (!tauriInvoke) return;
+    if (currentTab?.type !== "chat") return;
+
+    const currentTabId = activeTab;
+    const rootPath = String(activeProject?.manipulationRootPath || "").trim();
+    if (!rootPath) return;
+
+    const normalizedRoot = rootPath.replace(/[\\/]+$/, "");
+    const logPath = `${normalizedRoot}\\godot.log`;
+
+    const startWatcher = async () => {
+      try {
+        await invoke("start_godot_log_watcher", { tabId: currentTabId, logPath });
+      } catch {
+        try {
+          await invoke("start_godot_watcher", { tabId: currentTabId, logPath });
+        } catch {}
+      }
+    };
+
+    const stopWatcher = async () => {
+      try {
+        await invoke("stop_godot_log_watcher", { tabId: currentTabId });
+      } catch {
+        try {
+          await invoke("stop_godot_watcher", { tabId: currentTabId });
+        } catch {}
+      }
+    };
+
+    void startWatcher();
+    return () => {
+      void stopWatcher();
+    };
+  }, [activeTab, currentTab?.type, activeProject?.id, activeProject?.manipulationRootPath]);
+
+  useEffect(() => {
+    const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+    if (!tauriInvoke) {
+      return;
+    }
+
+    const currentTabId = activeTab;
+    const eventName = `iris_event_${currentTabId}`;
+    let unlistenFn: (() => void) | null = null;
+
+    listen<IrisEvent>(eventName, (event) => {
+      const incoming = event.payload as IrisEvent;
+      if (!incoming || typeof incoming !== "object") return;
+
+      switch (incoming.type) {
+        case "Status":
+          setRustEngineStatus(String(incoming.payload || ""));
+          break;
+        case "Delta":
+          console.log("[RustEngine][Delta]", incoming.payload);
+          rustHadDeltaByTabRef.current[currentTabId] = true;
+          updateTabMessages(currentTabId, (msgs) => {
+            const delta = String(incoming.payload || "");
+            if (!delta) return msgs;
+            const copy = [...msgs];
+            const last = copy[copy.length - 1];
+            if (last && last.role === "llm") {
+              copy[copy.length - 1] = { ...last, text: `${last.text}${delta}` };
+              return copy;
+            }
+            return [...copy, { role: "llm", text: delta, time: Math.floor(Date.now() / 1000) }];
+          });
+          break;
+        case "GodotError": {
+          const trace = String(incoming.payload || "").trim();
+          if (!trace) break;
+          setRustEngineStatus("Godot runtime error detected");
+          updateTabMessages(currentTabId, (msgs) => [
+            ...msgs,
+            {
+              role: "llm",
+              text: `[Godot Runtime Error]\n\n\`\`\`text\n${trace}\n\`\`\``,
+              time: Math.floor(Date.now() / 1000),
+            },
+          ]);
+          break;
+        }
+        case "PermissionRequest":
+          console.log("[RustEngine][PermissionRequest]", incoming.payload);
+          break;
+        case "ToolResult":
+          console.log("[RustEngine][ToolResult]", incoming.payload);
+          break;
+        case "Error":
+          console.log("[RustEngine][Error]", incoming.payload);
+          rustHadDeltaByTabRef.current[currentTabId] = true;
+          updateTabMessages(currentTabId, (msgs) => [
+            ...msgs,
+            {
+              role: "llm",
+              text: `[Rust Engine Error]\n\n${String(incoming.payload || "Unknown backend error")}`,
+              time: Math.floor(Date.now() / 1000),
+            },
+          ]);
+          setRustEngineStatus("");
+          setIsGenerating(false);
+          break;
+        case "Done":
+          if (!rustHadDeltaByTabRef.current[currentTabId]) {
+            updateTabMessages(currentTabId, (msgs) => [
+              ...msgs,
+              {
+                role: "llm",
+                text: "[No model output received]\n\nThe Rust engine completed without returning response text. Please retry.",
+                time: Math.floor(Date.now() / 1000),
+              },
+            ]);
+          }
+          rustHadDeltaByTabRef.current[currentTabId] = false;
+          setIsGenerating(false);
+          setRustEngineStatus("");
+          break;
+        default:
+          break;
+      }
+    })
+      .then((off) => {
+        unlistenFn = off;
+      })
+      .catch((err) => {
+        console.warn("Failed to subscribe to Rust engine events", err);
+      });
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, [activeTab]);
+
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
     if (!desktopDashboardEnabled) return;
@@ -3637,7 +3805,6 @@ function App() {
           capturedImages.push(dataUrl);
           setRoutineStepStatus(step.id, { status: "done", result: "Screenshot captured", imageData: dataUrl });
           appendWorkLog(tabId, `Routine step done: ${step.label}`);
-          updateTabMessages(tabId, msgs => ([...msgs, { role: "llm", text: "Captured screenshot for analysis.", images: [dataUrl] }]));
         } else {
           setRoutineStepStatus(step.id, { status: "done" });
           appendWorkLog(tabId, `Routine step done: ${step.label}`);
@@ -3681,6 +3848,54 @@ function App() {
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
     if (menuLocked) {
+      return;
+    }
+
+    if (useRustEngine) {
+      if (currentTab?.type !== "chat") return;
+
+      const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+      if (!tauriInvoke) {
+        setRustEngineStatus("Rust engine requires the Tauri desktop runtime (not browser-only mode).");
+        return;
+      }
+
+      const inputText = input.trim();
+      const images = pendingImages.map((img) => img.dataUrl);
+      if (!inputText && images.length === 0) return;
+
+      const requestTabId = activeTab;
+      const userDisplayText = inputText || `Attached ${images.length} image${images.length === 1 ? "" : "s"}.`;
+      updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, images));
+
+      setInput("");
+      setPendingImages([]);
+      setIsGenerating(true);
+      setRustEngineStatus("Submitting turn to Rust engine...");
+      rustHadDeltaByTabRef.current[requestTabId] = false;
+
+      const payload: UserTurnPayload = {
+        tab_id: requestTabId,
+        input_text: inputText,
+        images,
+      };
+
+      try {
+        await invoke("submit_turn", { payload });
+      } catch (err) {
+        console.error("submit_turn failed", err);
+        rustHadDeltaByTabRef.current[requestTabId] = true;
+        updateTabMessages(requestTabId, (msgs) => [
+          ...msgs,
+          {
+            role: "llm",
+            text: `[Rust Engine Error]\n\n${String((err as any)?.message || err || "unknown error")}`,
+            time: Math.floor(Date.now() / 1000),
+          },
+        ]);
+        setRustEngineStatus(`Rust engine error: ${String((err as any)?.message || err || "unknown error")}`);
+        setIsGenerating(false);
+      }
       return;
     }
 
@@ -5647,7 +5862,7 @@ function App() {
               .map((m) => `${m.name} (${m.target})`)
               .join(", ")
           : "";
-        prompt = `${prompt}\n\nDesktop context:\n- ${windowHint}\n- Use visible screenshot evidence first, then combine with project/MCP context.${enabledMcpSummary ? `\n- Enabled MCP connections: ${enabledMcpSummary}` : ""}`;
+        prompt = `${prompt}\n\nDesktop context:\n- ${windowHint}\n- A screenshot has already been captured for this request. Do not ask whether to proceed with capture. Use the current screenshot first, and only request another screenshot if the user says the image is wrong or insufficient.\n- Use visible screenshot evidence first, then combine with project/MCP context.${enabledMcpSummary ? `\n- Enabled MCP connections: ${enabledMcpSummary}` : ""}`;
       }
 
       if (mcpContextActive && mcpToolCatalog.length) {
@@ -8430,11 +8645,19 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             const isLastUserMessage = msg.role === "user" && idx === lastUserMessageIdx;
             const isEditingThis = editingLastUserMsgIdx === idx;
             const timestamp = formatMessageTimestamp((msg as any).time);
+            const isGodotError =
+              msg.role === "llm" &&
+              typeof msg.text === "string" &&
+              msg.text.startsWith("[Godot Runtime Error]");
 
             return (
               <div
                 className={`bubble ${msg.role}`}
                 key={idx}
+                style={isGodotError ? {
+                  border: "1px solid rgba(220, 93, 93, 0.72)",
+                  background: "rgba(68, 16, 16, 0.68)",
+                } : undefined}
                 onMouseEnter={() => setHoveredMessageKey(key)}
                 onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
               >
@@ -8455,7 +8678,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
 
                 <strong>
-                  {msg.role === "user" ? "You:" : `${assistantLabel}:`}
+                  {msg.role === "user" ? "You:" : (isGodotError ? "Godot Monitor:" : `${assistantLabel}:`)}
                 </strong>{" "}
 
                 {isEditingThis ? (
@@ -10729,6 +10952,14 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           onDrop={(e) => { void handleChatDrop(e); }}
           style={chatDragActive ? { boxShadow: "inset 0 0 0 2px rgba(91, 143, 214, 0.55)" } : undefined}
         >
+          {rustEngineStatus ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: isLightMode ? "#36506a" : "#9fb2c9" }}>
+                {rustEngineStatus}
+              </span>
+            </div>
+          ) : null}
+
           {!!pendingImages.length && (
             <div className="image-attachment-strip">
               {pendingImages.map((img) => (
