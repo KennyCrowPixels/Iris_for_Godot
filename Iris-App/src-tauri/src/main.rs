@@ -99,6 +99,10 @@ fn main() {
                     commands::mcp_list_tools,
                     commands::mcp_call_tool,
                     commands::ssh_tool_call,
+                    commands::start_godot_log_watcher,
+                    commands::stop_godot_log_watcher,
+                    commands::submit_turn,
+                    commands::resolve_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

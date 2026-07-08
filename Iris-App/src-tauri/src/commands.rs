@@ -1,12 +1,13 @@
 ﻿use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use sysinfo::System;
 use regex::Regex;
 
 
 use reqwest;
+use scraper::{Html, Selector};
 use serde_json;
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -16,6 +17,99 @@ use std::collections::hash_map::DefaultHasher;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Emitter};
 use std::hash::{Hash, Hasher};
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct UserTurnPayload {
+  pub tab_id: u32,
+  pub input_text: String,
+  pub images: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OllamaToolCallFunction {
+  #[serde(default)]
+  pub name: String,
+  #[serde(default)]
+  pub arguments: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OllamaToolCall {
+  #[serde(default)]
+  pub function: OllamaToolCallFunction,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OllamaMessage {
+  pub role: String,
+  pub content: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub images: Option<Vec<String>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentCompiledContext {
+  pub system_prompt: String,
+  pub messages: Vec<OllamaMessage>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OllamaChatRequest {
+  pub model: String,
+  pub messages: Vec<OllamaMessage>,
+  pub stream: bool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub keep_alive: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub tools: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct OllamaChatStreamMessage {
+  #[serde(default)]
+  pub content: String,
+  #[serde(default)]
+  pub tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct OllamaChatStreamChunk {
+  #[serde(default)]
+  pub message: Option<OllamaChatStreamMessage>,
+  #[serde(default)]
+  pub done: bool,
+  #[serde(default)]
+  pub error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", content = "payload")]
+#[allow(dead_code)]
+pub enum IrisEvent {
+  Status(String),
+  Delta(String),
+  GodotError(String),
+  PermissionRequest {
+    req_id: String,
+    action: String,
+    target: String,
+    risk_level: String, // "safe", "warn", "critical"
+  },
+  ToolResult {
+    tool_name: String,
+    status: String,
+  },
+  Error(String),
+  Done,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ResolvePermissionPayload {
+  pub req_id: String,
+  pub approved: bool,
+}
 
 // Extended ChatMessage with a unix timestamp (defaults to 0 when missing on disk)
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -33,10 +127,1143 @@ use std::io::{Write, BufRead, BufReader};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static OLLAMA_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static GODOT_WATCHERS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
 const MODEL_TAG: &str = "iris-organizer:latest";
+
+#[tauri::command]
+pub async fn submit_turn(
+    app: tauri::AppHandle,
+    payload: UserTurnPayload,
+    window: tauri::Window,
+) -> Result<(), String> {
+    let event_name = format!("iris_event_{}", payload.tab_id);
+
+    // MCP project handoff (non-Godot requests on a project tab with an active MCP)
+    if try_external_handoff(&app, &payload, &window, &event_name) {
+      println!("[Routing] MCP Handoff Payload");
+      return Ok(());
+    }
+
+    // Standard chat path — tool schema attached; model drives tool execution dynamically
+    println!("[Routing] Standard Chat Payload (tools attached)");
+
+    match compile_agent_context(&app, &payload).await {
+      Ok(context) => {
+        let selected_model = resolve_submit_model(&app, &payload);
+        let historical_count = context.messages.len().saturating_sub(1);
+        let msg = format!(
+          "Rust Context Built: {} historical messages loaded. System Prompt length: {}. Model: {}",
+          historical_count,
+          context.system_prompt.len(),
+          selected_model
+        );
+        let _ = window.emit(&event_name, IrisEvent::Status(msg));
+
+        let session_summary = format!(
+          "tab={} history_messages={} prompt_chars={} model={}",
+          payload.tab_id,
+          historical_count,
+          context.system_prompt.chars().count(),
+          selected_model
+        );
+        let _ = export_shared_session_markdown(&app, &context, &session_summary);
+
+        let request = build_ollama_chat_request(context, selected_model);
+        match execute_ollama_chat_stream(&window, &event_name, &request).await {
+          Ok(reply) => {
+            let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
+          }
+          Err(_) => {
+            let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, "");
+          }
+        }
+      }
+      Err(e) => {
+        let _ = window.emit(&event_name, IrisEvent::Error(e));
+        let _ = window.emit(&event_name, IrisEvent::Done);
+      }
+    }
+
+    Ok(())
+}
+
+fn build_agent_tool_section(flags: &SetupFlags) -> String {
+  let mut features = Vec::new();
+  features.push(format!("ollama_verified={}", flags.ollama_verified));
+  features.push(format!("models_verified={}", flags.models_verified));
+  features.push(format!("repos={}", flags.repos_enabled));
+  features.push(format!("mcp={}", flags.mcp_enabled));
+  features.push(format!("desktop_tools={}", flags.desktop_tools_enabled));
+  features.push(format!("network={}", flags.network_enabled));
+  features.push(format!("universal_dataweb={}", flags.universal_dataweb_enabled));
+  format!(
+    "Available backend capabilities: {}. When current weather, breaking news, recent headlines, or live web facts are requested and the matching tool exists, you must invoke the appropriate tool instead of claiming that you lack real-time access.",
+    features.join(", ")
+  )
+}
+
+pub async fn compile_agent_context(
+  app_handle: &tauri::AppHandle,
+  payload: &UserTurnPayload,
+) -> Result<AgentCompiledContext, String> {
+  let flags = read_setup_flags(app_handle);
+  let persona = load_persona_prompt();
+  let snapshot = load_tab(app_handle, payload.tab_id)?;
+
+  let mut messages: Vec<OllamaMessage> = snapshot
+    .messages
+    .into_iter()
+    .filter_map(|message| match message.role.as_str() {
+      "user" => Some(OllamaMessage { role: "user".to_string(), content: message.text, images: None, tool_calls: None }),
+      "llm" => Some(OllamaMessage { role: "assistant".to_string(), content: message.text, images: None, tool_calls: None }),
+      _ => None,
+    })
+    .collect();
+
+  const MAX_HISTORY_MESSAGES: usize = 40;
+  if messages.len() > MAX_HISTORY_MESSAGES {
+    let keep_from = messages.len().saturating_sub(MAX_HISTORY_MESSAGES);
+    messages = messages.split_off(keep_from);
+  }
+
+  messages.push(OllamaMessage {
+    role: "user".to_string(),
+    content: payload.input_text.clone(),
+    images: if payload.images.is_empty() { None } else { Some(payload.images.clone()) },
+    tool_calls: None,
+  });
+
+  let assistant_name = if flags.assistant_name.trim().is_empty() {
+    "Iris".to_string()
+  } else {
+    flags.assistant_name.clone()
+  };
+
+  let system_prompt = format!(
+    "{}\n\nRuntime identity:\n- Your display name is {}.\n- Stay concise and helpful.\n- Never expose raw tool invocation JSON, parameter objects, or internal payloads to the user.\n- For simple arithmetic, provide the plain numeric result and only add explanation if it helps the user.\n- If a screenshot has already been captured for the current request, do not ask whether you should proceed with capture; continue with the existing image unless the user explicitly says it is wrong or insufficient.\n\n{}",
+    persona,
+    assistant_name,
+    build_agent_tool_section(&flags)
+  );
+
+  Ok(AgentCompiledContext { system_prompt, messages })
+}
+
+fn build_ollama_chat_request(context: AgentCompiledContext, model: String) -> OllamaChatRequest {
+  let mut messages = Vec::with_capacity(context.messages.len() + 1);
+  messages.push(OllamaMessage {
+    role: "system".to_string(),
+    content: context.system_prompt,
+    images: None,
+    tool_calls: None,
+  });
+  messages.extend(context.messages);
+
+  OllamaChatRequest {
+    model,
+    messages,
+    stream: true,
+    keep_alive: Some("90s".to_string()),
+    tools: Some(build_default_tools()),
+  }
+}
+
+fn drain_ndjson_lines(buffer: &mut String) -> Vec<String> {
+  let mut lines = Vec::new();
+  while let Some(pos) = buffer.find('\n') {
+    let line = buffer[..pos].trim().to_string();
+    let remainder = buffer[pos + 1..].to_string();
+    *buffer = remainder;
+    if !line.is_empty() {
+      lines.push(line);
+    }
+  }
+  lines
+}
+
+async fn execute_ollama_chat_stream_inner(
+  window: &tauri::Window,
+  event_name: &str,
+  request: &OllamaChatRequest,
+) -> Result<String, String> {
+  let client = reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(5))
+    .timeout(Duration::from_secs(180))
+    .build()
+    .map_err(|e| format!("HTTP client build failed: {}", e))?;
+
+  // ---------------------------------------------------------------------------
+  // Pass 1: Initial chat request — detect tool_calls or stream direct response
+  // ---------------------------------------------------------------------------
+  let mut resp = client
+    .post(format!("{}/api/chat", OLLAMA_BASE))
+    .json(request)
+    .send()
+    .await
+    .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+  if !resp.status().is_success() {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    return Err(format!("HTTP status {} from /api/chat: {}", status, body));
+  }
+
+  let mut ndjson_buffer = String::new();
+  let mut full_text = String::new();
+  let mut intercepted_tool_calls: Vec<OllamaToolCall> = Vec::new();
+  let mut assistant_tool_call_content = String::new();
+
+  'pass1: loop {
+    let maybe_chunk = resp
+      .chunk()
+      .await
+      .map_err(|e| format!("Byte stream read failed: {}", e))?;
+
+    let chunk = match maybe_chunk {
+      Some(c) => c,
+      None => break 'pass1,
+    };
+
+    ndjson_buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+    for line in drain_ndjson_lines(&mut ndjson_buffer) {
+      let parsed: OllamaChatStreamChunk = serde_json::from_str(&line)
+        .map_err(|e| format!("JSON parsing failed: {} | line: {}", e, line))?;
+
+      if let Some(err) = parsed.error {
+        return Err(format!("Remote error: {}", err));
+      }
+
+      if let Some(ref msg) = parsed.message {
+        if let Some(ref calls) = msg.tool_calls {
+          if !calls.is_empty() {
+            // Intercept tool call payload — pause stream emission for synthesis
+            println!("[ToolCall] Intercepted {} tool call(s) from model", calls.len());
+            intercepted_tool_calls = calls.clone();
+            assistant_tool_call_content = msg.content.clone();
+          }
+        } else if !msg.content.is_empty() {
+          full_text.push_str(&msg.content);
+        }
+      }
+
+      if parsed.done {
+        break 'pass1;
+      }
+    }
+  }
+
+  // Drain any remaining buffered NDJSON tail
+  let tail = ndjson_buffer.trim().to_string();
+  if !tail.is_empty() {
+    if let Ok(parsed) = serde_json::from_str::<OllamaChatStreamChunk>(&tail) {
+      if let Some(err) = parsed.error {
+        return Err(format!("Remote error: {}", err));
+      }
+      if let Some(ref msg) = parsed.message {
+        if let Some(ref calls) = msg.tool_calls {
+          if !calls.is_empty() && intercepted_tool_calls.is_empty() {
+            intercepted_tool_calls = calls.clone();
+            assistant_tool_call_content = msg.content.clone();
+          }
+        } else if !msg.content.is_empty() {
+          full_text.push_str(&msg.content);
+        }
+      }
+    }
+  }
+
+  // If no tool_calls were intercepted, optionally synthesize a compatibility fallback
+  // for models that answer with a real-time/network disclaimer instead of emitting tools.
+  if intercepted_tool_calls.is_empty() {
+    if let Some(fallback_tool_call) = derive_fallback_tool_call(request, &full_text) {
+      println!("[ToolCall] Compatibility fallback triggered for {}", fallback_tool_call.function.name);
+      intercepted_tool_calls.push(fallback_tool_call);
+    } else {
+      if !full_text.is_empty() {
+        let _ = window.emit(event_name, IrisEvent::Delta(full_text.clone()));
+      }
+      return Ok(full_text);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pass 2: Execute intercepted tool calls, append results, re-submit for synthesis
+  // ---------------------------------------------------------------------------
+  println!("[ToolCall] Executing {} intercepted tool call(s)", intercepted_tool_calls.len());
+  let _ = window.emit(event_name, IrisEvent::Status(
+    format!("Executing tool: {}...", intercepted_tool_calls[0].function.name)
+  ));
+
+  // Build follow-up message context
+  let mut follow_up_messages = request.messages.clone();
+
+  // Append the assistant message that contained the tool_calls
+  follow_up_messages.push(OllamaMessage {
+    role: "assistant".to_string(),
+    content: assistant_tool_call_content,
+    images: None,
+    tool_calls: Some(intercepted_tool_calls.clone()),
+  });
+
+  // Execute each tool and append result as a tool role message
+  for tool_call in &intercepted_tool_calls {
+    let tool_result = execute_tool_call(&tool_call.function.name, &tool_call.function.arguments).await;
+    follow_up_messages.push(OllamaMessage {
+      role: "tool".to_string(),
+      content: tool_result.content,
+      images: if tool_result.images.is_empty() { None } else { Some(tool_result.images) },
+      tool_calls: None,
+    });
+  }
+
+  // Second POST: synthesis request without tools to prevent recursion
+  let follow_up_request = OllamaChatRequest {
+    model: request.model.clone(),
+    messages: follow_up_messages,
+    stream: true,
+    keep_alive: request.keep_alive.clone(),
+    tools: None,
+  };
+
+  let mut synth_resp = client
+    .post(format!("{}/api/chat", OLLAMA_BASE))
+    .json(&follow_up_request)
+    .send()
+    .await
+    .map_err(|e| format!("Tool synthesis HTTP request failed: {}", e))?;
+
+  if !synth_resp.status().is_success() {
+    let status = synth_resp.status();
+    let body = synth_resp.text().await.unwrap_or_default();
+    return Err(format!("Tool synthesis HTTP status {} from /api/chat: {}", status, body));
+  }
+
+  let mut synth_buffer = String::new();
+  let mut synthesis_text = String::new();
+
+  'pass2: loop {
+    let maybe_chunk = synth_resp
+      .chunk()
+      .await
+      .map_err(|e| format!("Synthesis stream read failed: {}", e))?;
+
+    let chunk = match maybe_chunk {
+      Some(c) => c,
+      None => break 'pass2,
+    };
+
+    synth_buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+    for line in drain_ndjson_lines(&mut synth_buffer) {
+      let parsed: OllamaChatStreamChunk = serde_json::from_str(&line)
+        .map_err(|e| format!("Synthesis JSON parsing failed: {} | line: {}", e, line))?;
+
+      if let Some(err) = parsed.error {
+        return Err(format!("Synthesis remote error: {}", err));
+      }
+
+      if let Some(ref msg) = parsed.message {
+        if !msg.content.is_empty() {
+          synthesis_text.push_str(&msg.content);
+          let _ = window.emit(event_name, IrisEvent::Delta(msg.content.clone()));
+        }
+      }
+
+      if parsed.done {
+        return Ok(synthesis_text);
+      }
+    }
+  }
+
+  Ok(synthesis_text)
+}
+
+async fn execute_ollama_chat_stream(
+  window: &tauri::Window,
+  event_name: &str,
+  request: &OllamaChatRequest,
+) -> Result<String, String> {
+  let result = execute_ollama_chat_stream_inner(window, event_name, request).await;
+
+  if let Err(err) = &result {
+    let _ = window.emit(event_name, IrisEvent::Error(err.clone()));
+  }
+
+  let _ = window.emit(event_name, IrisEvent::Done);
+  result
+}
+
+// ---------------------------------------------------------------------------
+// Ollama tool schema + tool call execution
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+struct ToolExecutionResult {
+  content: String,
+  images: Vec<String>,
+}
+
+fn build_default_tools() -> Vec<serde_json::Value> {
+  vec![
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "universal_web_search",
+        "description": "Searches the web for current information, recent news, and factual data not available in training context. Use depth=shallow for quick 1-2 result lookups; depth=deep for broader 3-5 result news queries.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "The search query string to execute"
+            },
+            "depth": {
+              "type": "string",
+              "enum": ["shallow", "deep"],
+              "description": "shallow: 1-2 results via DDG HTML scrape; deep: 3-5 results using RSS fallback for news queries"
+            }
+          },
+          "required": ["query", "depth"]
+        }
+      }
+    }),
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "get_current_weather",
+        "description": "Returns real-time weather forecast data for a city or region using the Open-Meteo API. Use when the user asks about weather, temperature, or forecast.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "City and optionally state or country, e.g. 'Durham, NC' or 'London, UK'"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    }),
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "perform_arithmetic",
+        "description": "Computes a basic arithmetic result and returns the numeric answer. Use for addition, subtraction, multiplication, or division.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": ["add", "subtract", "multiply", "divide"]
+            },
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            }
+          },
+          "required": ["operation", "x", "y"]
+        }
+      }
+    }),
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "capture_desktop_screenshot",
+        "description": "Captures a screenshot for the current request. Use when the user asks you to inspect the screen, take a screenshot, or analyze visible UI state.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target_hint": {
+              "type": "string",
+              "description": "Optional window or application hint, e.g. 'iris-app' or 'Godot'"
+            }
+          },
+          "required": []
+        }
+      }
+    }),
+  ]
+}
+
+fn choose_window_for_hint(target_hint: &str, windows: &[WindowInfo]) -> Option<WindowInfo> {
+  let hint = target_hint.to_lowercase();
+  let tokens = hint.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() >= 3);
+  windows.iter().cloned().max_by_key(|w| {
+    let title = w.title.to_lowercase();
+    let proc = w.process_name.to_lowercase();
+    let mut score = 0i32;
+    if title.contains(&hint) || proc.contains(&hint) { score += 8; }
+    for t in tokens.clone() {
+      if title.contains(t) { score += 2; }
+      if proc.contains(t) { score += 1; }
+    }
+    score
+  }).filter(|w| {
+    let title = w.title.to_lowercase();
+    let proc = w.process_name.to_lowercase();
+    title.contains(&hint) || proc.contains(&hint) || hint.split_whitespace().any(|t| title.contains(t) || proc.contains(t))
+  })
+}
+
+fn capture_screenshot_for_hint(target_hint: Option<&str>) -> Result<(String, String), String> {
+  if let Some(hint) = target_hint.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Ok(windows) = list_windows() {
+      if let Some(window) = choose_window_for_hint(hint, &windows) {
+        let base64 = take_window_screenshot(window.id)?;
+        return Ok((base64, format!("Captured window screenshot for {} ({})", window.title, window.process_name)));
+      }
+    }
+  }
+  let base64 = take_screenshot()?;
+  Ok((base64, "Captured full-screen screenshot".to_string()))
+}
+
+async fn execute_universal_search(query: &str, depth: &str) -> String {
+  let client = match reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(3))
+    .timeout(Duration::from_secs(8))
+    .build()
+  {
+    Ok(c) => c,
+    Err(_) => return "Search HTTP client initialization failed.".to_string(),
+  };
+
+  match depth {
+    "shallow" => {
+      let resp = client
+        .get("https://lite.duckduckgo.com/lite/")
+        .header("User-Agent", "iris-app-network-search/1.0")
+        .query(&[("q", query)])
+        .send()
+        .await;
+      if let Ok(r) = resp {
+        if let Ok(body) = r.text().await {
+          let hits = parse_duckduckgo_lite_hits(&body, 2);
+          if !hits.is_empty() {
+            return hits
+              .iter()
+              .map(|h| format!("{}: {}", h.title, h.snippet))
+              .collect::<Vec<_>>()
+              .join("\n");
+          }
+        }
+      }
+      "No shallow search results found.".to_string()
+    }
+    _ => {
+      // deep: try DDG JSON then RSS fallback
+      let ddg_resp = client
+        .get("https://api.duckduckgo.com/")
+        .header("User-Agent", "iris-app-network-search/1.0")
+        .query(&[("q", query), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
+        .send()
+        .await;
+      let mut hits: Vec<NetworkHit> = Vec::new();
+      if let Ok(r) = ddg_resp {
+        if let Ok(json) = r.json::<Value>().await {
+          let abstract_text = json.get("AbstractText").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+          let abstract_url = json.get("AbstractURL").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+          if !abstract_text.is_empty() {
+            hits.push(NetworkHit { title: "Result".to_string(), url: abstract_url, snippet: abstract_text, score: 1.0 });
+          }
+          if let Some(related) = json.get("RelatedTopics") {
+            add_related_topics_hits(related, &mut hits);
+          }
+        }
+      }
+      if hits.is_empty() {
+        let rss_resp = client
+          .get("https://news.google.com/rss/search")
+          .header("User-Agent", "iris-app-network-search/1.0")
+          .query(&[("q", query), ("hl", "en-US"), ("gl", "US"), ("ceid", "US:en")])
+          .send()
+          .await;
+        if let Ok(r) = rss_resp {
+          if let Ok(body) = r.text().await {
+            hits = parse_news_rss_hits(&body, 5);
+          }
+        }
+      }
+      if hits.is_empty() {
+        return "No deep search results found.".to_string();
+      }
+      hits.iter()
+        .take(5)
+        .map(|h| format!("{}: {}", h.title, h.snippet))
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+  }
+}
+
+async fn execute_tool_call(name: &str, args: &serde_json::Value) -> ToolExecutionResult {
+  println!("[ToolCall] Dispatching tool: {}", name);
+  match name {
+    "universal_web_search" => {
+      let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+      let depth = args.get("depth").and_then(|v| v.as_str()).unwrap_or("shallow");
+      if query.is_empty() {
+        return ToolExecutionResult { content: "No query provided to universal_web_search.".to_string(), images: Vec::new() };
+      }
+      ToolExecutionResult { content: execute_universal_search(&query, depth).await, images: Vec::new() }
+    }
+    "get_current_weather" => {
+      let location = args.get("location").and_then(|v| v.as_str()).unwrap_or("").to_string();
+      if location.is_empty() {
+        return ToolExecutionResult { content: "No location provided to get_current_weather.".to_string(), images: Vec::new() };
+      }
+      match weather_lookup(location, None).await {
+        Ok(result) => ToolExecutionResult {
+          content: format!(
+            "Weather for {}, {} ({}): {}\nSource: {}",
+            result.city, result.region, result.day_label, result.summary, result.source_url
+          ),
+          images: Vec::new(),
+        },
+        Err(e) => ToolExecutionResult { content: format!("Weather lookup failed: {}", e), images: Vec::new() },
+      }
+    }
+    "perform_arithmetic" => {
+      let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+      let x = parse_numeric_arg(args.get("x"));
+      let y = parse_numeric_arg(args.get("y"));
+      let (Some(x), Some(y)) = (x, y) else {
+        return ToolExecutionResult { content: "Arithmetic invocation failed: numeric operands are required.".to_string(), images: Vec::new() };
+      };
+      let content = match operation {
+        "add" => format_number_result(x + y),
+        "subtract" => format_number_result(x - y),
+        "multiply" => format_number_result(x * y),
+        "divide" => {
+          if y == 0.0 {
+            "Division is undefined because the divisor is zero.".to_string()
+          } else {
+            format_number_result(x / y)
+          }
+        }
+        _ => format!("Unsupported arithmetic operation: {}", operation),
+      };
+      ToolExecutionResult { content, images: Vec::new() }
+    }
+    "capture_desktop_screenshot" => {
+      let hint = args.get("target_hint").and_then(|v| v.as_str());
+      match capture_screenshot_for_hint(hint) {
+        Ok((base64, status)) => ToolExecutionResult {
+          content: status,
+          images: vec![format!("data:image/png;base64,{}", base64)],
+        },
+        Err(e) => ToolExecutionResult { content: format!("Screenshot capture failed: {}", e), images: Vec::new() },
+      }
+    }
+    _ => ToolExecutionResult { content: format!("Unknown tool invocation: {}", name), images: Vec::new() },
+  }
+}
+
+fn parse_numeric_arg(value: Option<&serde_json::Value>) -> Option<f64> {
+  match value {
+    Some(serde_json::Value::Number(n)) => n.as_f64(),
+    Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+    _ => None,
+  }
+}
+
+fn format_number_result(value: f64) -> String {
+  if (value.fract()).abs() < 1e-9 {
+    format!("{}", value.round() as i64)
+  } else {
+    let mut out = format!("{:.6}", value);
+    while out.contains('.') && out.ends_with('0') {
+      out.pop();
+    }
+    if out.ends_with('.') {
+      out.pop();
+    }
+    out
+  }
+}
+
+fn extract_weather_location_for_fallback(input: &str) -> Option<String> {
+  if let Ok(re) = Regex::new(r"(?i)\b(?:in|for|at)\s+([a-z0-9\s,.'\-]+?)(?:\s+now)?\??\s*$") {
+    if let Some(cap) = re.captures(input.trim()) {
+      if let Some(m) = cap.get(1) {
+        let location = m.as_str().trim().trim_matches(',').trim().to_string();
+        if !location.is_empty() {
+          return Some(location);
+        }
+      }
+    }
+  }
+  None
+}
+
+fn latest_user_message(messages: &[OllamaMessage]) -> Option<&str> {
+  messages
+    .iter()
+    .rev()
+    .find(|msg| msg.role == "user")
+    .map(|msg| msg.content.as_str())
+}
+
+fn derive_fallback_tool_call(request: &OllamaChatRequest, model_text: &str) -> Option<OllamaToolCall> {
+  let user_text = latest_user_message(&request.messages)?;
+  let user_lower = user_text.to_lowercase();
+  let model_lower = model_text.to_lowercase();
+
+  if let Ok(raw_json) = serde_json::from_str::<serde_json::Value>(model_text.trim()) {
+    if let Some(name) = raw_json.get("name").and_then(|v| v.as_str()) {
+      let parameters = raw_json.get("parameters").cloned().unwrap_or(serde_json::Value::Null);
+      let normalized_name = match name {
+        "add" | "subtract" | "multiply" | "divide" => "perform_arithmetic",
+        other => other,
+      };
+      let normalized_args = match name {
+        "add" | "subtract" | "multiply" | "divide" => serde_json::json!({
+          "operation": name,
+          "x": parameters.get("x").cloned().unwrap_or(serde_json::Value::Null),
+          "y": parameters.get("y").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+        _ => parameters,
+      };
+      return Some(OllamaToolCall {
+        function: OllamaToolCallFunction {
+          name: normalized_name.to_string(),
+          arguments: normalized_args,
+        },
+      });
+    }
+  }
+
+  let network_enabled = request
+    .messages
+    .first()
+    .map(|msg| msg.content.to_lowercase().contains("network=true"))
+    .unwrap_or(false);
+
+  if !network_enabled {
+    return None;
+  }
+
+  let realtime_disclaimer = model_lower.contains("don't have real-time")
+    || model_lower.contains("do not have real-time")
+    || model_lower.contains("not able to perform a network search")
+    || model_lower.contains("check a reliable weather website")
+    || model_lower.contains("weather.com")
+    || model_lower.contains("accuweather");
+
+  if !realtime_disclaimer {
+    return None;
+  }
+
+  if user_lower.contains("weather") || user_lower.contains("forecast") || user_lower.contains("temperature") {
+    if let Some(location) = extract_weather_location_for_fallback(user_text) {
+      return Some(OllamaToolCall {
+        function: OllamaToolCallFunction {
+          name: "get_current_weather".to_string(),
+          arguments: serde_json::json!({ "location": location }),
+        },
+      });
+    }
+  }
+
+  if user_lower.contains("news") || user_lower.contains("headline") || user_lower.contains("current events") {
+    let depth = if user_lower.contains("latest") || user_lower.contains("recent") || user_lower.contains("breaking") {
+      "deep"
+    } else {
+      "shallow"
+    };
+    return Some(OllamaToolCall {
+      function: OllamaToolCallFunction {
+        name: "universal_web_search".to_string(),
+        arguments: serde_json::json!({ "query": user_text, "depth": depth }),
+      },
+    });
+  }
+
+  None
+}
+
+fn persist_rust_turn_snapshot(
+  app: &tauri::AppHandle,
+  tab_id: u32,
+  user_text: &str,
+  assistant_text: &str,
+) -> Result<(), String> {
+  let path = tab_file(app, tab_id)?;
+  let mut snap = if path.exists() {
+    iris_read_snapshot_file(&path)?
+  } else {
+    Snapshot {
+      tab_id: Some(tab_id),
+      title: format!("Tab #{}", tab_id),
+      ..Default::default()
+    }
+  };
+
+  let ts = now_ts();
+  if !user_text.trim().is_empty() {
+    snap.messages.push(ChatMessage {
+      role: "user".to_string(),
+      text: user_text.to_string(),
+      time: ts,
+    });
+  }
+  if !assistant_text.trim().is_empty() {
+    snap.messages.push(ChatMessage {
+      role: "llm".to_string(),
+      text: assistant_text.to_string(),
+      time: ts,
+    });
+  }
+  if snap.title.trim().is_empty() {
+    snap.title = format!("Tab #{}", tab_id);
+  }
+  snap.tab_id = Some(tab_id);
+  snap.last_updated = Some(ts);
+  bound_snapshot_payload(&mut snap);
+  iris_write_snapshot_file(&path, &snap)
+}
+
+fn godot_watchers() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+  GODOT_WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_godot_primary_request(input: &str) -> bool {
+  let normalized = input.to_lowercase();
+  let keywords = [
+    "godot", "gdscript", "scene", "node", "shader", "tauri", "typescript", "rust", "repo", "build", "debug", "project",
+  ];
+  keywords.iter().any(|k| normalized.contains(k))
+}
+
+fn try_external_handoff(
+  app: &tauri::AppHandle,
+  payload: &UserTurnPayload,
+  window: &tauri::Window,
+  event_name: &str,
+) -> bool {
+  if is_godot_primary_request(&payload.input_text) {
+    return false;
+  }
+
+  let snapshot_path = match tab_file(app, payload.tab_id) {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+  let snapshot = match iris_read_snapshot_file(&snapshot_path) {
+    Ok(s) => s,
+    Err(_) => return false,
+  };
+  let Some(project_id) = snapshot.associated_project_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    return false;
+  };
+
+  let store = read_repo_project_store(app);
+  let Some(project) = store.projects.iter().find(|p| p.enabled && p.id == project_id) else {
+    return false;
+  };
+
+  let Some(mcp) = store
+    .mcps
+    .iter()
+    .find(|m| m.enabled && project.mcp_ids.iter().any(|id| id == &m.id))
+    .cloned()
+  else {
+    return false;
+  };
+
+  let _ = window.emit(event_name, IrisEvent::Status(format!(
+    "Out-of-scope request detected. Attempting MCP handoff via {}...",
+    mcp.name
+  )));
+
+  if connect_mcp_server_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ).is_err() {
+    return false;
+  }
+
+  let tools = match mcp_list_tools_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ) {
+    Ok(t) => t,
+    Err(_) => return false,
+  };
+
+  let preferred = ["chat", "ask", "query", "answer", "complete", "assistant"];
+  let selected_tool = tools.iter().find_map(|tool| {
+    let lower = tool.name.to_lowercase();
+    if preferred.iter().any(|key| lower.contains(key)) {
+      Some(tool.name.clone())
+    } else {
+      None
+    }
+  });
+
+  let Some(tool_name) = selected_tool else {
+    return false;
+  };
+
+  let args = serde_json::json!({
+    "query": payload.input_text,
+    "input": payload.input_text,
+    "text": payload.input_text,
+  });
+
+  let response = match mcp_call_tool(
+    mcp.id,
+    mcp.target,
+    mcp.connection_type,
+    mcp.launch_command,
+    mcp.launch_args,
+    tool_name,
+    args,
+  ) {
+    Ok(v) => v,
+    Err(_) => return false,
+  };
+
+  let answer = response
+    .get("text")
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string())
+    .or_else(|| response.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    .or_else(|| response.get("result").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    .unwrap_or_else(|| response.to_string());
+
+  let _ = window.emit(event_name, IrisEvent::Delta(answer));
+  let _ = window.emit(event_name, IrisEvent::Done);
+  true
+}
+
+fn resolve_submit_model(app: &tauri::AppHandle, payload: &UserTurnPayload) -> String {
+  let flags = read_setup_flags(app);
+  let profile = ModelProfile::parse(&flags.model_profile);
+  let model_config = read_model_config(app);
+
+  if !payload.images.is_empty() {
+    if !model_config.vision_enabled {
+      return "iris-organizer:latest".to_string();
+    }
+    return match profile {
+      ModelProfile::Low | ModelProfile::Minimal => "moondream2:latest".to_string(),
+      _ => "iris-vision:latest".to_string(),
+    };
+  }
+
+  "iris-organizer:latest".to_string()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundQueueMode {
+  Normal,
+  Downgraded,
+  Paused,
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundQueueGate {
+  mode: BackgroundQueueMode,
+  delay_ms: u64,
+  network_hit_cap: usize,
+  repo_entry_cap: usize,
+}
+
+fn evaluate_background_queue_gate() -> BackgroundQueueGate {
+  let hw = match detect_hardware_profile() {
+    Ok(h) => h,
+    Err(_) => {
+      return BackgroundQueueGate {
+        mode: BackgroundQueueMode::Normal,
+        delay_ms: 0,
+        network_hit_cap: 8,
+        repo_entry_cap: 2000,
+      }
+    }
+  };
+
+  if hw.detected_profile.eq_ignore_ascii_case("minimal") || hw.detected_profile.eq_ignore_ascii_case("low") || hw.vram_gb <= 4.0 {
+    return BackgroundQueueGate {
+      mode: BackgroundQueueMode::Paused,
+      delay_ms: 450,
+      network_hit_cap: 4,
+      repo_entry_cap: 900,
+    };
+  }
+
+  if hw.detected_profile.eq_ignore_ascii_case("medium") || hw.vram_gb < 8.0 {
+    return BackgroundQueueGate {
+      mode: BackgroundQueueMode::Downgraded,
+      delay_ms: 150,
+      network_hit_cap: 6,
+      repo_entry_cap: 1400,
+    };
+  }
+
+  BackgroundQueueGate {
+    mode: BackgroundQueueMode::Normal,
+    delay_ms: 0,
+    network_hit_cap: 8,
+    repo_entry_cap: 2000,
+  }
+}
+
+fn unix_to_ymd(ts: i64) -> (i32, u32, u32) {
+  let days = ts.div_euclid(86_400);
+  let z = days + 719_468;
+  let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+  let doe = z - era * 146_097;
+  let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+  let y = yoe + era * 400;
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  let mp = (5 * doy + 2) / 153;
+  let d = doy - (153 * mp + 2) / 5 + 1;
+  let m = mp + if mp < 10 { 3 } else { -9 };
+  let year = y + if m <= 2 { 1 } else { 0 };
+  (year as i32, m as u32, d as u32)
+}
+
+fn export_shared_session_markdown(
+  app: &tauri::AppHandle,
+  context: &AgentCompiledContext,
+  session_summary: &str,
+) -> Result<PathBuf, String> {
+  let base = memory_dir(app)?.join("shared_sync");
+  create_dir_all(&base).map_err(|e| format!("Failed creating shared sync dir: {}", e))?;
+
+  let ts = now_ts();
+  let (year, month, day) = unix_to_ymd(ts);
+  let file = base.join(format!("{:04}-{:02}-{:02}-session-log.md", year, month, day));
+
+  let mut lines: Vec<String> = Vec::new();
+  lines.push(format!("## Session {}", ts));
+  lines.push(String::new());
+  lines.push(format!("Summary: {}", session_summary));
+  lines.push(String::new());
+  lines.push("### System prompt".to_string());
+  lines.push(context.system_prompt.clone());
+  lines.push(String::new());
+  lines.push("### Messages".to_string());
+  for msg in &context.messages {
+    lines.push(format!("- {}: {}", msg.role, msg.content.replace('\n', " ")));
+  }
+  lines.push(String::new());
+
+  let mut out = if file.exists() {
+    fs::read_to_string(&file).unwrap_or_default()
+  } else {
+    "# Iris Shared Session Sync\n\n".to_string()
+  };
+  out.push_str(&lines.join("\n"));
+  atomic_write_text(&file, &out)?;
+  Ok(file)
+}
+
+#[tauri::command]
+pub fn start_godot_log_watcher(app: tauri::AppHandle, tab_id: u32, log_path: String) -> Result<String, String> {
+  let path = PathBuf::from(log_path.trim());
+  if !path.exists() || !path.is_file() {
+    return Err("Godot log path is not a readable file".to_string());
+  }
+
+  let key = tab_id.to_string();
+  let stop_flag = Arc::new(AtomicBool::new(false));
+  {
+    let mut map = godot_watchers().lock().map_err(|_| "Godot watcher lock poisoned".to_string())?;
+    if let Some(existing) = map.remove(&key) {
+      existing.store(true, Ordering::Relaxed);
+    }
+    map.insert(key.clone(), Arc::clone(&stop_flag));
+  }
+
+  let app_handle = app.clone();
+  let event_name = format!("iris_event_{}", tab_id);
+  thread::spawn(move || {
+    let mut last_size: u64 = 0;
+    let error_re = Regex::new(r"(?i)(error|exception|stack trace|fatal|failed)").ok();
+    loop {
+      if stop_flag.load(Ordering::Relaxed) {
+        break;
+      }
+
+      if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() < last_size {
+          last_size = 0;
+        }
+      }
+
+      if let Ok(file) = fs::File::open(&path) {
+        let mut reader = BufReader::new(file);
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        if reader.seek(SeekFrom::Start(last_size)).is_ok() {
+          let mut line = String::new();
+          loop {
+            line.clear();
+            let bytes = match reader.read_line(&mut line) {
+              Ok(n) => n,
+              Err(_) => 0,
+            };
+            if bytes == 0 {
+              break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+              continue;
+            }
+            let looks_like_error = match &error_re {
+              Some(re) => re.is_match(trimmed),
+              None => trimmed.to_lowercase().contains("error"),
+            };
+            if looks_like_error {
+              let _ = app_handle.emit(&event_name, IrisEvent::GodotError(trimmed.to_string()));
+            }
+          }
+          if let Ok(pos) = reader.stream_position() {
+            last_size = pos;
+          }
+        }
+      }
+
+      std::thread::sleep(Duration::from_millis(700));
+    }
+  });
+
+  Ok("Godot log watcher started".to_string())
+}
+
+#[tauri::command]
+pub fn stop_godot_log_watcher(tab_id: u32) -> Result<bool, String> {
+  let key = tab_id.to_string();
+  let mut map = godot_watchers().lock().map_err(|_| "Godot watcher lock poisoned".to_string())?;
+  if let Some(flag) = map.remove(&key) {
+    flag.store(true, Ordering::Relaxed);
+    return Ok(true);
+  }
+  Ok(false)
+}
+
+#[tauri::command]
+pub async fn resolve_permission(
+    payload: ResolvePermissionPayload,
+) -> Result<(), String> {
+    // TEMPORARY STUB: Will interact with tokio::oneshot channels later
+    println!("Permission resolved for {}: {}", payload.req_id, payload.approved);
+    Ok(())
+}
 
 /// Which stdio framing protocol the MCP server speaks.
 /// NDJSON = one JSON object per line (MCP Python SDK 1.x / official spec)
@@ -1066,7 +2293,29 @@ fn first_number_in_text(text: &str) -> Option<f64> {
 
 fn is_recall_intent(user_text: &str) -> bool {
   let t = user_text.to_lowercase();
-  contains_any(&t, &["what was", "what is", "what joke", "first joke", "last joke", "just told", "earlier", "previous", "remember", "topic", "joke did you tell"])
+  contains_any(&t, &[
+    "what was", "what is", "what joke", "first joke", "last joke", "just told", "earlier",
+    "previous", "remember", "topic", "joke did you tell", "product", "result", "answer",
+    "last number", "previous number"
+  ])
+}
+
+fn is_numeric_recall_query(user_text: &str) -> bool {
+  let text = user_text.to_lowercase();
+  let asks_for_prior_value = contains_any(&text, &[
+    "what was", "what is", "repeat", "say again", "remember", "earlier", "previous", "last"
+  ]);
+  let asks_for_numeric_result = contains_any(&text, &[
+    "product", "result", "answer", "total", "number", "value"
+  ]);
+  asks_for_prior_value && asks_for_numeric_result
+}
+
+fn try_resolve_numeric_recall_reply(user_text: &str, transcript: &str) -> Option<String> {
+  if !is_numeric_recall_query(user_text) {
+    return None;
+  }
+  extract_last_assistant_number(transcript).map(format_num)
 }
 
 fn extract_joke_replies(messages: &[ChatMessage]) -> Vec<String> {
@@ -1100,6 +2349,10 @@ fn infer_joke_topic(joke: &str) -> String {
 fn try_resolve_recall_reply(user_text: &str, messages: &[ChatMessage], transcript: &str) -> Option<String> {
   if !is_recall_intent(user_text) { return None; }
   let text = user_text.to_lowercase();
+
+  if let Some(number) = try_resolve_numeric_recall_reply(user_text, transcript) {
+    return Some(number);
+  }
 
   let assistant_messages: Vec<String> = messages.iter()
     .filter(|m| m.role == "llm")
@@ -1356,7 +2609,7 @@ fn detect_godot_version_hint(user_text: &str, transcript: &str) -> String {
 
 fn load_persona_prompt() -> String {
   let core = load_core_persona_prompt().unwrap_or_else(|| {
-    "You are Iris, a disciplined but personable local development assistant. Interpret first, answer clearly, and preserve project continuity while staying natural.".to_string()
+    "You are Iris, an open-source local AI assistant for real project work. Interpret first, answer clearly, preserve project continuity, and help across implementation, planning, research, debugging, and general assistance.".to_string()
   });
   let user = load_user_persona_prompt().unwrap_or_default();
   if user.trim().is_empty() {
@@ -2531,7 +3784,11 @@ pub fn scan_repo_entries(path: String) -> Result<Vec<RepoEntry>, String> {
   if !root.exists() || !root.is_dir() {
     return Err("Selected path is not a folder".to_string());
   }
-  Ok(scan_repo_entries_internal(&root, 2000))
+  let gate = evaluate_background_queue_gate();
+  if gate.delay_ms > 0 {
+    std::thread::sleep(Duration::from_millis(gate.delay_ms));
+  }
+  Ok(scan_repo_entries_internal(&root, gate.repo_entry_cap))
 }
 
 #[tauri::command]
@@ -2942,9 +4199,31 @@ pub struct NetworkSearchResponse {
 #[serde(rename_all = "camelCase")]
 pub struct WeatherLookupResponse {
   pub location: String,
+  pub city: String,
+  pub region: String,
+  pub temperature_f: f64,
+  pub weather_conditions: String,
   pub day_label: String,
   pub summary: String,
   pub source_url: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct SanitizedWeatherPayload {
+  city: String,
+  region: String,
+  temperature_f: f64,
+  weather_conditions: String,
+}
+
+#[derive(Clone, Debug)]
+struct WeatherGeoTarget {
+  lat: f64,
+  lon: f64,
+  city: String,
+  region: String,
+  country: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -3039,7 +4318,7 @@ fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
   score
 }
 
-async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) -> Result<(f64, f64, String), String> {
+async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) -> Result<WeatherGeoTarget, String> {
   let trimmed = raw_location.trim();
   if trimmed.is_empty() {
     return Err("Location is required".to_string());
@@ -3084,19 +4363,20 @@ async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) 
       let city = result.get("name").and_then(|v| v.as_str()).unwrap_or(trimmed);
       let admin1 = result.get("admin1").and_then(|v| v.as_str()).unwrap_or("");
       let country = result.get("country").and_then(|v| v.as_str()).unwrap_or("");
-      let location_label = [city, admin1, country]
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(", ");
-      return Ok((lat, lon, location_label));
+      return Ok(WeatherGeoTarget {
+        lat,
+        lon,
+        city: city.to_string(),
+        region: admin1.to_string(),
+        country: country.to_string(),
+      });
     }
   }
 
   let nominatim_resp = client
     .get("https://nominatim.openstreetmap.org/search")
     .header("User-Agent", "iris-app-weather/1.0")
-    .query(&[("q", normalized_us.as_str()), ("format", "jsonv2"), ("limit", "1")])
+    .query(&[("q", normalized_us.as_str()), ("format", "jsonv2"), ("limit", "1"), ("addressdetails", "1")])
     .send()
     .await
     .map_err(|e| format!("Fallback geocoding failed: {}", e))?;
@@ -3117,12 +4397,36 @@ async fn geocode_weather_location(client: &reqwest::Client, raw_location: &str) 
     .and_then(|v| v.as_str())
     .and_then(|s| s.parse::<f64>().ok())
     .ok_or_else(|| "Missing fallback longitude".to_string())?;
-  let label = fallback
-    .get("display_name")
+
+  let addr = fallback.get("address").cloned().unwrap_or(Value::Null);
+  let city = addr
+    .get("city")
+    .or_else(|| addr.get("town"))
+    .or_else(|| addr.get("village"))
+    .or_else(|| addr.get("municipality"))
     .and_then(|v| v.as_str())
     .unwrap_or(trimmed)
     .to_string();
-  Ok((lat, lon, label))
+  let region = addr
+    .get("state")
+    .or_else(|| addr.get("region"))
+    .or_else(|| addr.get("county"))
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_string();
+  let country = addr
+    .get("country")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_string();
+
+  Ok(WeatherGeoTarget {
+    lat,
+    lon,
+    city,
+    region,
+    country,
+  })
 }
 
 #[tauri::command]
@@ -3138,13 +4442,13 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
     .build()
     .map_err(|e| e.to_string())?;
 
-  let (lat, lon, location_label) = geocode_weather_location(&client, q).await?;
+  let geo = geocode_weather_location(&client, q).await?;
 
   let forecast_resp = client
     .get("https://api.open-meteo.com/v1/forecast")
     .query(&[
-      ("latitude", lat.to_string()),
-      ("longitude", lon.to_string()),
+      ("latitude", geo.lat.to_string()),
+      ("longitude", geo.lon.to_string()),
       ("daily", "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max".to_string()),
       ("timezone", "auto".to_string()),
       ("forecast_days", "4".to_string()),
@@ -3174,9 +4478,20 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
   let precip_prob = precip[index].as_i64().unwrap_or(0);
   let code = codes[index].as_i64().unwrap_or(-1);
   let day_label = if index == 0 { "today" } else if index == 1 { "tomorrow" } else { date };
+  let sanitized = SanitizedWeatherPayload {
+    city: geo.city.clone(),
+    region: geo.region.clone(),
+    temperature_f: max_temp,
+    weather_conditions: weather_code_label(code).to_string(),
+  };
+  let location_label = [geo.city.as_str(), geo.region.as_str(), geo.country.as_str()]
+    .into_iter()
+    .filter(|s| !s.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(", ");
   let summary = format!(
     "{} with a high around {:.0} F, a low around {:.0} F, and about a {}% chance of precipitation.",
-    weather_code_label(code),
+    sanitized.weather_conditions,
     max_temp,
     min_temp,
     precip_prob
@@ -3184,6 +4499,10 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
 
   Ok(WeatherLookupResponse {
     location: location_label,
+    city: sanitized.city,
+    region: sanitized.region,
+    temperature_f: sanitized.temperature_f,
+    weather_conditions: sanitized.weather_conditions,
     day_label: day_label.to_string(),
     summary,
     source_url: "https://open-meteo.com/".to_string(),
@@ -3203,13 +4522,18 @@ pub async fn uv_lookup(location: String) -> Result<UvLookupResponse, String> {
     .build()
     .map_err(|e| e.to_string())?;
 
-  let (lat, lon, location_label) = geocode_weather_location(&client, q).await?;
+  let geo = geocode_weather_location(&client, q).await?;
+  let location_label = [geo.city.as_str(), geo.region.as_str(), geo.country.as_str()]
+    .into_iter()
+    .filter(|s| !s.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(", ");
 
   let resp = client
     .get("https://api.open-meteo.com/v1/forecast")
     .query(&[
-      ("latitude", lat.to_string()),
-      ("longitude", lon.to_string()),
+      ("latitude", geo.lat.to_string()),
+      ("longitude", geo.lon.to_string()),
       ("current", "uv_index".to_string()),
       ("hourly", "uv_index".to_string()),
       ("timezone", "auto".to_string()),
@@ -3298,6 +4622,96 @@ fn add_related_topics_hits(value: &Value, out: &mut Vec<NetworkHit>) {
   }
 }
 
+fn is_news_query(query: &str) -> bool {
+  let q = query.to_lowercase();
+  q.contains("news") || q.contains("headline") || q.contains("current events") || q.contains("breaking")
+}
+
+fn parse_duckduckgo_lite_hits(html: &str, max_results: usize) -> Vec<NetworkHit> {
+  let mut out = Vec::new();
+  let doc = Html::parse_document(html);
+  let selector = match Selector::parse("a") {
+    Ok(s) => s,
+    Err(_) => return out,
+  };
+
+  for anchor in doc.select(&selector) {
+    if out.len() >= max_results {
+      break;
+    }
+    let text = anchor.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let href = anchor.value().attr("href").unwrap_or("").trim().to_string();
+    if text.is_empty() || href.is_empty() {
+      continue;
+    }
+    if !href.starts_with("http") {
+      continue;
+    }
+    if href.contains("duckduckgo.com") {
+      continue;
+    }
+    out.push(NetworkHit {
+      title: text.clone(),
+      url: href,
+      snippet: text,
+      score: 0.0,
+    });
+  }
+
+  out
+}
+
+fn parse_news_rss_hits(xml: &str, max_results: usize) -> Vec<NetworkHit> {
+  let mut out = Vec::new();
+  let item_re = match Regex::new(r"(?is)<item>(.*?)</item>") {
+    Ok(r) => r,
+    Err(_) => return out,
+  };
+  let title_re = match Regex::new(r"(?is)<title>(.*?)</title>") {
+    Ok(r) => r,
+    Err(_) => return out,
+  };
+  let link_re = match Regex::new(r"(?is)<link>(.*?)</link>") {
+    Ok(r) => r,
+    Err(_) => return out,
+  };
+  let desc_re = match Regex::new(r"(?is)<description>(.*?)</description>") {
+    Ok(r) => r,
+    Err(_) => return out,
+  };
+
+  for cap in item_re.captures_iter(xml) {
+    if out.len() >= max_results {
+      break;
+    }
+    let block = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+    let title = title_re
+      .captures(block)
+      .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+      .unwrap_or_default();
+    let link = link_re
+      .captures(block)
+      .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+      .unwrap_or_default();
+    let desc = desc_re
+      .captures(block)
+      .and_then(|c| c.get(1).map(|m| m.as_str().replace("<![CDATA[", "").replace("]]>", "")))
+      .unwrap_or_default();
+
+    if title.is_empty() || link.is_empty() {
+      continue;
+    }
+    out.push(NetworkHit {
+      title: title.clone(),
+      url: link,
+      snippet: title,
+      score: if desc.is_empty() { 0.0 } else { 0.25 },
+    });
+  }
+
+  out
+}
+
 #[tauri::command]
 pub async fn network_search(query: String, project_context: Option<String>) -> Result<NetworkSearchResponse, String> {
   let q = query.trim();
@@ -3305,14 +4719,20 @@ pub async fn network_search(query: String, project_context: Option<String>) -> R
     return Ok(NetworkSearchResponse::default());
   }
 
+  let gate = evaluate_background_queue_gate();
+  if gate.delay_ms > 0 {
+    tokio::time::sleep(Duration::from_millis(gate.delay_ms)).await;
+  }
+
   let client = reqwest::Client::builder()
     .connect_timeout(Duration::from_secs(3))
-    .timeout(Duration::from_secs(8))
+    .timeout(Duration::from_secs(if gate.mode == BackgroundQueueMode::Normal { 8 } else { 6 }))
     .build()
     .map_err(|e| e.to_string())?;
 
   let resp = client
     .get("https://api.duckduckgo.com/")
+    .header("User-Agent", "iris-app-network-search/1.0")
     .query(&[("q", q), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
     .send()
     .await
@@ -3338,6 +4758,34 @@ pub async fn network_search(query: String, project_context: Option<String>) -> R
     add_related_topics_hits(related, &mut hits);
   }
 
+  if hits.is_empty() {
+    let lite_resp = client
+      .get("https://lite.duckduckgo.com/lite/")
+      .header("User-Agent", "iris-app-network-search/1.0")
+      .query(&[("q", q)])
+      .send()
+      .await;
+    if let Ok(resp) = lite_resp {
+      if let Ok(body) = resp.text().await {
+        hits.extend(parse_duckduckgo_lite_hits(&body, 3));
+      }
+    }
+  }
+
+  if hits.is_empty() && is_news_query(q) {
+    let rss_resp = client
+      .get("https://news.google.com/rss/search")
+      .header("User-Agent", "iris-app-network-search/1.0")
+      .query(&[("q", q), ("hl", "en-US"), ("gl", "US"), ("ceid", "US:en")])
+      .send()
+      .await;
+    if let Ok(resp) = rss_resp {
+      if let Ok(body) = resp.text().await {
+        hits.extend(parse_news_rss_hits(&body, 3));
+      }
+    }
+  }
+
   // Deduplicate by URL+title to keep output compact.
   let mut seen = HashSet::new();
   hits.retain(|h| {
@@ -3356,7 +4804,7 @@ pub async fn network_search(query: String, project_context: Option<String>) -> R
     h.score = score_network_hit(h, &relevance_context, &query_lower);
   }
   hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-  hits.truncate(8);
+  hits.truncate(gate.network_hit_cap);
 
   let summary = if hits.is_empty() {
     "No reliable network snippets were returned for this query.".to_string()
