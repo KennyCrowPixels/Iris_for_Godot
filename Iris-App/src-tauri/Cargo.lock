@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "iris-app"
-version = "0.2.0"
+version = "0.3.0-alpha.0"
 dependencies = [
  "dirs 5.0.1",
  "regex",

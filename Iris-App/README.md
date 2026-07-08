@@ -1,41 +1,77 @@
-# Tauri + React + Typescript
+# Iris App (v0.3 Pre-Alpha)
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Iris is a Tauri + React desktop assistant focused on real project work.
 
-## Recommended IDE Setup
+This branch includes the Async ReAct runtime overhaul and post-overhaul onboarding upgrades.
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Windows Quick Start
 
-## Shipping Iris As A Download
+### Developers (one command)
 
-Use this flow to publish Iris from your website (including Google Sites) with manual updates now and auto-updates later.
+```bat
+setup-windows.bat --dev --yes
+launch-dev.bat
+```
 
-### Build release installers
+What this does:
 
-Run:
+- Auto-installs missing system dependencies with `winget`
+- Installs npm dependencies
+- Runs `npm run check`
+- Launches Tauri dev mode
+
+### Build installers (one command)
 
 ```bat
 build-release.bat
 ```
 
-This generates Windows installer artifacts in:
+What this does:
 
-- `src-tauri/target/release/bundle/nsis/*.exe`
-- `src-tauri/target/release/bundle/msi/*.msi`
+- Runs the same automated bootstrap path (`setup-windows.bat --consumer --yes`)
+- Builds Windows installer bundles
+- Copies `.exe` and `.msi` outputs into `D:\Iris_for_Godot\Builds`
 
-### Host installers on your website
+## Auto-Installed Dependencies
 
-1. Upload the latest installer to your Google Site (or linked Drive file).
-2. Copy the public installer download URL.
-3. In Iris, open `Settings -> Network -> Manual App Updates`.
-4. Paste:
-	- Installer download URL
-	- Release notes URL (optional)
-5. Click `Save Update Links`.
+`setup-windows.bat` checks and installs the following when missing:
 
-Users can then click `Open Installer Download` in-app, download, and run the installer to update manually.
+- Git for Windows
+- Node.js LTS
+- Rust toolchain (rustup + cargo)
+- Visual Studio 2022 Build Tools (C++ workload)
 
-### Automatic updates (coming soon)
+The script prints progress percentages at each major step so contributors and build operators can see where setup is spending time.
 
-The Network tab includes a disabled `Automatic Updates (Coming Soon)` section with a reserved update-feed URL field.
-You can store your planned feed URL now, but auto-update checks are intentionally disabled until the feed/installer pipeline is finalized.
+## Contributor Guide
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full setup, workflow, and troubleshooting notes.
+
+## CI Release Automation
+
+Windows release automation is now scaffolded with GitHub Actions:
+
+- Workflow: [.github/workflows/windows-prealpha-release.yml](.github/workflows/windows-prealpha-release.yml)
+- Validation on `main`: `npm run check` + `cargo check`
+- Installer build on Windows runner: `npm run tauri:build`
+- Tag-based prerelease publishing for tags matching `v*`
+
+Detailed operator flow: [docs/RELEASE_AUTOMATION.md](docs/RELEASE_AUTOMATION.md)
+
+## Shipping Iris As A Download
+
+1. Run `build-release.bat`.
+2. Upload the newest installer from `D:\Iris_for_Godot\Builds`.
+3. In-app, open `Settings -> Network -> Manual App Updates`.
+4. Save installer URL (and optional release notes URL).
+
+Automatic in-app updater plumbing is still intentionally gated while feed + signing workflows are finalized.
+
+## What Still Needs To Be Done
+
+These are the remaining steps before truly frictionless consumer installs + updates:
+
+- Configure installer code-signing certificates in CI.
+- Finalize and host update feed JSON schema (template: [public/update-feed.template.json](public/update-feed.template.json)).
+- Enable and test in-app automatic updater flow end-to-end.
+- Add platform coverage beyond Windows (if required).

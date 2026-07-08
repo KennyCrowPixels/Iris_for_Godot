@@ -1,10 +1,22 @@
 @echo off
-REM Initialize Visual Studio developer environment
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+setlocal
+pushd "%~dp0"
 
-REM Add Node.js and Cargo to PATH
-set PATH=C:\Program Files\nodejs;%USERPROFILE%\.cargo\bin;%PATH%
+echo [Iris Launch] Preparing dependencies and workspace...
+call "%~dp0setup-windows.bat" --dev --yes
+if errorlevel 1 (
+	echo [Iris Launch] Setup failed. Aborting launch.
+	popd
+	exit /b 1
+)
 
-REM Launch Tauri dev
-cd /d "%~dp0"
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" (
+	call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
+)
+
+echo [Iris Launch] Starting Tauri development runtime...
 call npm run tauri:dev
+set "EXIT_CODE=%ERRORLEVEL%"
+
+popd
+exit /b %EXIT_CODE%

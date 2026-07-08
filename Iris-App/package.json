@@ -1,13 +1,16 @@
 {
   "name": "iris-app",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0-alpha.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420",
     "check": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && vite build",
     "preview": "vite preview",
+    "setup:windows": "setup-windows.bat --dev --yes",
+    "dev:desktop": "launch-dev.bat",
+    "release:windows": "build-release.bat",
     "tauri": "tauri",
     "tauri:dev": "cross-env CARGO_BUILD_JOBS=2 tauri dev",
     "tauri:build": "cross-env CARGO_BUILD_JOBS=2 tauri build"

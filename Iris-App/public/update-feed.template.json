@@ -1,0 +1,22 @@
+{
+  "channel": "pre-alpha",
+  "latest": "0.3.0-alpha.0",
+  "publishedAt": "2026-07-07T00:00:00Z",
+  "notesUrl": "https://github.com/KennyCrowPixels/Iris_for_Godot/releases",
+  "artifacts": [
+    {
+      "platform": "windows-x64",
+      "kind": "nsis",
+      "version": "0.3.0-alpha.0",
+      "url": "https://github.com/KennyCrowPixels/Iris_for_Godot/releases/download/v0.3.0-alpha.0/iris-app_0.3.0-alpha.0_x64-setup.exe",
+      "sha256": "REPLACE_WITH_REAL_SHA256"
+    },
+    {
+      "platform": "windows-x64",
+      "kind": "msi",
+      "version": "0.3.0-alpha.0",
+      "url": "https://github.com/KennyCrowPixels/Iris_for_Godot/releases/download/v0.3.0-alpha.0/iris-app_0.3.0-alpha.0_x64_en-US.msi",
+      "sha256": "REPLACE_WITH_REAL_SHA256"
+    }
+  ]
+}

@@ -45,6 +45,13 @@ type StartupStatus = {
   progress: number;
 };
 
+type SetupChecklistItem = {
+  id: string;
+  label: string;
+  done: boolean;
+  hint: string;
+};
+
 type CenterDialogState = {
   open: boolean;
   title: string;
@@ -2526,6 +2533,40 @@ function App() {
   const currentTab = tabs.find(t => t.id === activeTab);
   const hasChatTabs = tabs.some(t => t.type === "chat");
   const menuLocked = startupStatus.active || modelStatus === "checking" || modelStatus === "loading";
+  const setupChecklist: SetupChecklistItem[] = [
+    {
+      id: "ollama",
+      label: "Ollama runtime installed",
+      done: setupResult === "ready" || coderReady === true,
+      hint: "Install via the startup setup modal if missing.",
+    },
+    {
+      id: "models",
+      label: "Core models pulled",
+      done: setupResult === "ready",
+      hint: "Use setup modal -> Pull Models.",
+    },
+    {
+      id: "network",
+      label: "Network assist configured",
+      done: networkEnabled === networkDraftEnabled,
+      hint: "Settings -> Network -> Save Network Setting.",
+    },
+    {
+      id: "updates",
+      label: "Manual update URL configured",
+      done: isValidHttpUrl(manualDownloadUrl),
+      hint: "Settings -> Network -> Manual App Updates.",
+    },
+    {
+      id: "desktop",
+      label: "Desktop tools policy set",
+      done: desktopToolsEnabled,
+      hint: "Settings -> Bridges -> Desktop tools toggle.",
+    },
+  ];
+  const setupChecklistDone = setupChecklist.filter((item) => item.done).length;
+  const setupChecklistPct = Math.round((setupChecklistDone / Math.max(setupChecklist.length, 1)) * 100);
   const activeThemeColor = themePreset === "Custom" ? customThemeColor : THEME_PRESET_COLORS[themePreset as Exclude<ThemePreset, "Custom">];
   const isLightMode = colorMode === "light";
   // App background and border follow ONLY theme color — not light/dark mode
@@ -8743,6 +8784,31 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             <div className="llm-settings-card">
               <h3>General</h3>
               <p>Customize appearance and persona wiring for this app instance.</p>
+
+              <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <label style={{ display: "block", marginBottom: 8, color: "var(--app-text)", fontWeight: 700 }}>
+                  First-Run Readiness Checklist
+                </label>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#425971" : "#b8c3d4", fontSize: 12 }}>
+                  {setupChecklistDone}/{setupChecklist.length} complete ({setupChecklistPct}%)
+                </div>
+                <div style={{ height: 8, borderRadius: 8, overflow: "hidden", background: isLightMode ? "rgba(97, 122, 148, 0.24)" : "rgba(137, 171, 204, 0.2)", marginBottom: 10 }}>
+                  <div style={{ height: "100%", width: `${setupChecklistPct}%`, background: isLightMode ? "#3d7dc2" : "#8ab5f2", transition: "width 0.2s ease" }} />
+                </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  {setupChecklist.map((item) => (
+                    <div key={item.id} style={{ display: "grid", gridTemplateColumns: "20px 1fr", gap: 8, alignItems: "start", fontSize: 12, color: "var(--app-text)" }}>
+                      <span aria-hidden="true" style={{ color: item.done ? (isLightMode ? "#2b6b2b" : "#7ed37e") : (isLightMode ? "#8d6b2e" : "#d8b26c") }}>
+                        {item.done ? "[x]" : "[ ]"}
+                      </span>
+                      <div>
+                        <div style={{ fontWeight: 600 }}>{item.label}</div>
+                        {!item.done && <div style={{ opacity: 0.8 }}>{item.hint}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
 
               <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Assistant name</label>
