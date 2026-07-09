@@ -126,7 +126,7 @@
   font-weight: 400;
 
   color: #0f0f0f;
-  background-color: #f6f6f6;
+  background-color: var(--boot-bg, #f6f6f6);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -139,13 +139,13 @@ html, body {
   height: 100%;
   margin: 0;
   padding: 0;
-  background: #232323;
+  background: var(--boot-bg, #232323);
   overflow: hidden; /* Prevent double scrollbars */
 }
 
 #root {
   height: 100vh;
-  background: #232323;
+  background: var(--boot-bg, #232323);
 }
 
 .container {
@@ -321,6 +321,16 @@ button {
 }
 
 .bubble-edit-btn {
+  border: 1px solid var(--app-border, #555);
+  background: rgba(18, 18, 18, 0.82);
+  color: #eaeaea;
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.bubble-copy-btn {
   border: 1px solid var(--app-border, #555);
   background: rgba(18, 18, 18, 0.82);
   color: #eaeaea;

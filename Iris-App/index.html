@@ -4,6 +4,31 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        try {
+          var themeColor = localStorage.getItem("iris.ui.themeColor") || "#232323";
+          var themePreset = localStorage.getItem("iris.ui.themePreset") || "Black";
+          var colorMode = localStorage.getItem("iris.ui.colorMode") || "dark";
+          var root = document.documentElement;
+          root.style.setProperty("--boot-bg", themeColor);
+          root.style.backgroundColor = themeColor;
+          root.style.setProperty("color-scheme", colorMode === "light" ? "light" : "dark");
+          if (document.body) {
+            document.body.style.backgroundColor = themeColor;
+          }
+          root.setAttribute("data-iris-theme-preset", themePreset);
+          root.setAttribute("data-iris-color-mode", colorMode);
+          if (document.readyState !== "loading" && document.body) {
+            document.body.style.backgroundColor = themeColor;
+          } else {
+            document.addEventListener("DOMContentLoaded", function () {
+              document.body.style.backgroundColor = themeColor;
+            }, { once: true });
+          }
+        } catch (err) {}
+      })();
+    </script>
     <title>Tauri + React + Typescript</title>
   </head>
 

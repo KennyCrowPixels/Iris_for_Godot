@@ -1954,6 +1954,32 @@ const THEME_PRESET_COLORS: Record<Exclude<ThemePreset, "Custom">, string> = {
   Grey: "#3a3a3a",
 };
 
+function readStoredThemePreset(): ThemePreset {
+  try {
+    const raw = localStorage.getItem("iris.ui.themePreset");
+    if (raw === "Black" || raw === "Blue" || raw === "Pink" || raw === "Purple" || raw === "Silver" || raw === "Grey" || raw === "Custom") {
+      return raw;
+    }
+  } catch {}
+  return "Black";
+}
+
+function readStoredThemeColor(): string {
+  try {
+    const raw = localStorage.getItem("iris.ui.themeColor");
+    if (raw && raw.trim()) return raw.trim();
+  } catch {}
+  return "#232323";
+}
+
+function readStoredColorMode(): "dark" | "light" {
+  try {
+    const raw = localStorage.getItem("iris.ui.colorMode");
+    if (raw === "light") return "light";
+  } catch {}
+  return "dark";
+}
+
 function hexToRgb(hex: string): { r: number; g: number; b: number } {
   const clean = hex.replace("#", "").trim();
   const full = clean.length === 3 ? clean.split("").map((c) => `${c}${c}`).join("") : clean;
@@ -2296,6 +2322,9 @@ function App() {
   const bridgeMetaRefreshRef = useRef<Record<string, number>>({});
   const tabTurnCounterRef = useRef<Record<number, number>>({});
   const rustHadDeltaByTabRef = useRef<Record<number, boolean>>({});
+  const rustDeltaQueueByTabRef = useRef<Record<number, string>>({});
+  const rustDeltaDrainTimerByTabRef = useRef<Record<number, ReturnType<typeof setInterval> | null>>({});
+  const rustStreamDoneByTabRef = useRef<Record<number, boolean>>({});
   const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
   const isMounted = useRef(true);
 
@@ -2333,9 +2362,9 @@ function App() {
   const [lastTaskTags, setLastTaskTags] = useState<string[]>([]);
   const [lastTaskConfidence, setLastTaskConfidence] = useState<number>(50);
   const agentStatsHydratedRef = useRef(false);
-  const [themePreset, setThemePreset] = useState<ThemePreset>("Black");
-  const [customThemeColor, setCustomThemeColor] = useState("#232323");
-  const [colorMode, setColorMode] = useState<"dark" | "light">("dark");
+  const [themePreset, setThemePreset] = useState<ThemePreset>(() => readStoredThemePreset());
+  const [customThemeColor, setCustomThemeColor] = useState(() => readStoredThemeColor());
+  const [colorMode, setColorMode] = useState<"dark" | "light">(() => readStoredColorMode());
   const [networkEnabled, setNetworkEnabled] = useState(false);
   const [universalDatawebEnabled, setUniversalDatawebEnabled] = useState(true);
   const [networkDraftEnabled, setNetworkDraftEnabled] = useState(false);
@@ -3485,17 +3514,7 @@ function App() {
         case "Delta":
           console.log("[RustEngine][Delta]", incoming.payload);
           rustHadDeltaByTabRef.current[currentTabId] = true;
-          updateTabMessages(currentTabId, (msgs) => {
-            const delta = String(incoming.payload || "");
-            if (!delta) return msgs;
-            const copy = [...msgs];
-            const last = copy[copy.length - 1];
-            if (last && last.role === "llm") {
-              copy[copy.length - 1] = { ...last, text: `${last.text}${delta}` };
-              return copy;
-            }
-            return [...copy, { role: "llm", text: delta, time: Math.floor(Date.now() / 1000) }];
-          });
+          queueRustDelta(currentTabId, String(incoming.payload || ""));
           break;
         case "GodotError": {
           const trace = String(incoming.payload || "").trim();
@@ -3519,6 +3538,9 @@ function App() {
           break;
         case "Error":
           console.log("[RustEngine][Error]", incoming.payload);
+          rustStreamDoneByTabRef.current[currentTabId] = false;
+          rustDeltaQueueByTabRef.current[currentTabId] = "";
+          stopRustDeltaDrain(currentTabId);
           rustHadDeltaByTabRef.current[currentTabId] = true;
           updateTabMessages(currentTabId, (msgs) => [
             ...msgs,
@@ -3532,7 +3554,9 @@ function App() {
           setIsGenerating(false);
           break;
         case "Done":
-          if (!rustHadDeltaByTabRef.current[currentTabId]) {
+          rustStreamDoneByTabRef.current[currentTabId] = true;
+          const queued = rustDeltaQueueByTabRef.current[currentTabId] || "";
+          if (!rustHadDeltaByTabRef.current[currentTabId] && !queued.length) {
             updateTabMessages(currentTabId, (msgs) => [
               ...msgs,
               {
@@ -3541,10 +3565,18 @@ function App() {
                 time: Math.floor(Date.now() / 1000),
               },
             ]);
+            rustHadDeltaByTabRef.current[currentTabId] = false;
+            rustStreamDoneByTabRef.current[currentTabId] = false;
+            setIsGenerating(false);
+            setRustEngineStatus("");
+            break;
           }
-          rustHadDeltaByTabRef.current[currentTabId] = false;
-          setIsGenerating(false);
-          setRustEngineStatus("");
+          if (queued.length) {
+            setRustEngineStatus("Finalizing response...");
+            startRustDeltaDrain(currentTabId);
+          } else {
+            maybeFinalizeRustStream(currentTabId);
+          }
           break;
         default:
           break;
@@ -3910,10 +3942,14 @@ function App() {
       updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, images));
 
       setInput("");
+      queueMicrotask(() => { if (inputRef.current) inputRef.current.style.height = "auto"; });
       setPendingImages([]);
       setIsGenerating(true);
       setRustEngineStatus("Submitting turn to Rust engine...");
       rustHadDeltaByTabRef.current[requestTabId] = false;
+      rustStreamDoneByTabRef.current[requestTabId] = false;
+      rustDeltaQueueByTabRef.current[requestTabId] = "";
+      stopRustDeltaDrain(requestTabId);
 
       const payload: UserTurnPayload = {
         tab_id: requestTabId,
@@ -3925,6 +3961,9 @@ function App() {
         await invoke("submit_turn", { payload });
       } catch (err) {
         console.error("submit_turn failed", err);
+        rustStreamDoneByTabRef.current[requestTabId] = false;
+        rustDeltaQueueByTabRef.current[requestTabId] = "";
+        stopRustDeltaDrain(requestTabId);
         rustHadDeltaByTabRef.current[requestTabId] = true;
         updateTabMessages(requestTabId, (msgs) => [
           ...msgs,
@@ -7216,6 +7255,92 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     el.style.height = Math.min(el.scrollHeight, maxHeight) + "px";
   }
 
+  function stopRustDeltaDrain(tabId: number) {
+    const timer = rustDeltaDrainTimerByTabRef.current[tabId];
+    if (timer) {
+      clearInterval(timer);
+      rustDeltaDrainTimerByTabRef.current[tabId] = null;
+    }
+  }
+
+  function appendRustDelta(tabId: number, delta: string) {
+    if (!delta) return;
+    updateTabMessages(tabId, (msgs) => {
+      const copy = [...msgs];
+      const last = copy[copy.length - 1];
+      if (last && last.role === "llm") {
+        copy[copy.length - 1] = { ...last, text: `${last.text}${delta}` };
+        return copy;
+      }
+      return [...copy, { role: "llm", text: delta, time: Math.floor(Date.now() / 1000) }];
+    });
+  }
+
+  function maybeFinalizeRustStream(tabId: number) {
+    const queued = rustDeltaQueueByTabRef.current[tabId] || "";
+    const done = !!rustStreamDoneByTabRef.current[tabId];
+    if (!done || queued.length > 0) return;
+    rustStreamDoneByTabRef.current[tabId] = false;
+    rustHadDeltaByTabRef.current[tabId] = false;
+    stopRustDeltaDrain(tabId);
+    setIsGenerating(false);
+    setRustEngineStatus("");
+  }
+
+  function startRustDeltaDrain(tabId: number) {
+    if (rustDeltaDrainTimerByTabRef.current[tabId]) return;
+    rustDeltaDrainTimerByTabRef.current[tabId] = setInterval(() => {
+      const queued = rustDeltaQueueByTabRef.current[tabId] || "";
+      if (!queued.length) {
+        maybeFinalizeRustStream(tabId);
+        return;
+      }
+
+      const take = queued.length > 160 ? 18 : queued.length > 64 ? 9 : 4;
+      const chunk = queued.slice(0, take);
+      rustDeltaQueueByTabRef.current[tabId] = queued.slice(take);
+      appendRustDelta(tabId, chunk);
+      if (!rustDeltaQueueByTabRef.current[tabId]) {
+        maybeFinalizeRustStream(tabId);
+      }
+    }, 12);
+  }
+
+  function queueRustDelta(tabId: number, delta: string) {
+    if (!delta) return;
+    rustDeltaQueueByTabRef.current[tabId] = `${rustDeltaQueueByTabRef.current[tabId] || ""}${delta}`;
+    startRustDeltaDrain(tabId);
+  }
+
+  async function copyChatMessageText(text: string) {
+    const value = String(text || "");
+    if (!value.trim()) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setRustEngineStatus("Copied message to clipboard.");
+      window.setTimeout(() => {
+        setRustEngineStatus((current) => (current === "Copied message to clipboard." ? "" : current));
+      }, 1200);
+    } catch (err) {
+      console.warn("Failed to copy chat message", err);
+      setRustEngineStatus("Copy failed.");
+    }
+  }
+
+  useEffect(() => {
+    autoResize();
+  }, [input]);
+
+  useEffect(() => {
+    return () => {
+      for (const key of Object.keys(rustDeltaDrainTimerByTabRef.current)) {
+        const timer = rustDeltaDrainTimerByTabRef.current[Number(key)];
+        if (timer) clearInterval(timer);
+      }
+      rustDeltaDrainTimerByTabRef.current = {};
+    };
+  }, []);
+
   function recallPromptHistory(direction: "older" | "newer") {
     if (currentTab?.type !== "chat") return;
     const history = currentTab.promptHistory || [];
@@ -7287,12 +7412,20 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   async function persistGeneralSettings(partial: { assistantName?: string; themeColor?: string; themePreset?: ThemePreset; colorMode?: "dark" | "light"; visionTimeoutMinutes?: number; detailedProgressEnabled?: boolean }) {
     try {
+      const nextThemePreset = partial.themePreset ?? themePreset;
+      const nextThemeColor = partial.themeColor ?? appBgColor;
+      const nextColorMode = partial.colorMode ?? colorMode;
+      try {
+        localStorage.setItem("iris.ui.themePreset", nextThemePreset);
+        localStorage.setItem("iris.ui.themeColor", nextThemeColor);
+        localStorage.setItem("iris.ui.colorMode", nextColorMode);
+      } catch {}
       await invoke("set_setup_flags", {
         args: {
           assistantName: partial.assistantName ?? assistantLabel,
-          themeColor: partial.themeColor ?? appBgColor,
-          themePreset: partial.themePreset ?? themePreset,
-          colorMode: partial.colorMode ?? colorMode,
+          themeColor: nextThemeColor,
+          themePreset: nextThemePreset,
+          colorMode: nextColorMode,
         },
       });
       if (partial.visionTimeoutMinutes !== undefined) {
@@ -8704,6 +8837,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               >
                 <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
                   {timestamp ? <span>{timestamp}</span> : null}
+                  <button
+                    type="button"
+                    className="bubble-copy-btn"
+                    onClick={() => void copyChatMessageText(msg.text)}
+                  >
+                    Copy
+                  </button>
                   {isLastUserMessage && !isEditingThis && (
                     <button
                       type="button"
