@@ -55,6 +55,36 @@ pub struct AgentCompiledContext {
   pub messages: Vec<OllamaMessage>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RecommendedToolPolicy {
+  AllowAll,
+  ReadOnly,
+  NoTools,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RedirectStyle {
+  Neutral,
+  GentleRedirect,
+  ProtectiveRedirect,
+}
+
+#[derive(Clone, Debug)]
+struct IntegrityAssessment {
+  integrity_score: f32,
+  confidence: f32,
+  tags: Vec<String>,
+  recommended_tool_policy: RecommendedToolPolicy,
+  redirect_style: RedirectStyle,
+  momentum_score: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct IntegrityMomentumState {
+  score: f32,
+  updated_at_secs: i64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OllamaChatRequest {
   pub model: String,
@@ -132,6 +162,8 @@ static GODOT_WATCHERS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceL
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
 const MODEL_TAG: &str = "iris-organizer:latest";
+const INTEGRITY_NORMAL_BAND: f32 = 0.80;
+const INTEGRITY_CAUTION_BAND: f32 = 0.60;
 
 #[tauri::command]
 pub async fn submit_turn(
@@ -147,8 +179,8 @@ pub async fn submit_turn(
       return Ok(());
     }
 
-    // Standard chat path — tool schema attached; model drives tool execution dynamically
-    println!("[Routing] Standard Chat Payload (tools attached)");
+    // Standard chat path — attach tools only when the user's request actually needs them.
+    println!("[Routing] Standard Chat Payload (intent-gated tools)");
 
     match compile_agent_context(&app, &payload).await {
       Ok(context) => {
