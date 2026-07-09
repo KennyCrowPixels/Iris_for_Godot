@@ -158,6 +158,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static OLLAMA_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static GODOT_WATCHERS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+static INTEGRITY_MOMENTUM: OnceLock<Mutex<HashMap<u32, IntegrityMomentumState>>> = OnceLock::new();
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
@@ -203,7 +204,23 @@ pub async fn submit_turn(
         );
         let _ = export_shared_session_markdown(&app, &context, &session_summary);
 
-        let request = build_ollama_chat_request(context, selected_model);
+        // Integrity is prompt-specific; momentum only shapes redirect tone and never hard-locks chat.
+        let mut integrity = assess_integrity_for_prompt(&payload.input_text);
+        apply_integrity_momentum(payload.tab_id, &mut integrity);
+        let attach_tools_by_intent = request_warrants_tools(&payload.input_text, !payload.images.is_empty());
+        let tool_policy = resolve_turn_tool_policy(attach_tools_by_intent, &integrity);
+        let bridge_note = build_ephemeral_bridge_note(&integrity);
+
+        let _ = window.emit(&event_name, IrisEvent::Status(format!(
+          "Integrity {:.2} (momentum {:.2}, confidence {:.2}) | policy {} | tags {}",
+          integrity.integrity_score,
+          integrity.momentum_score,
+          integrity.confidence,
+          tool_policy_label(&tool_policy),
+          if integrity.tags.is_empty() { "none".to_string() } else { integrity.tags.join(",") }
+        )));
+
+        let request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
         match execute_ollama_chat_stream(&window, &event_name, &request).await {
           Ok(reply) => {
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
@@ -287,7 +304,304 @@ pub async fn compile_agent_context(
   Ok(AgentCompiledContext { system_prompt, messages })
 }
 
-fn build_ollama_chat_request(context: AgentCompiledContext, model: String) -> OllamaChatRequest {
+fn tool_policy_label(policy: &RecommendedToolPolicy) -> &'static str {
+  match policy {
+    RecommendedToolPolicy::AllowAll => "allow_all",
+    RecommendedToolPolicy::ReadOnly => "read_only",
+    RecommendedToolPolicy::NoTools => "no_tools",
+  }
+}
+
+fn clamp01(v: f32) -> f32 {
+  if v < 0.0 {
+    0.0
+  } else if v > 1.0 {
+    1.0
+  } else {
+    v
+  }
+}
+
+fn now_unix_secs() -> i64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs() as i64)
+    .unwrap_or(0)
+}
+
+fn destructive_ops_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| {
+    Regex::new(
+      r"(?i)\b(rm\s+-rf|del\s+/[sqf]|format\s+[a-z]:|wipe|delete\s+(everything|all files|root|system32)|drop\s+database|truncate\s+table)\b"
+    ).expect("valid destructive regex")
+  })
+}
+
+fn malware_or_abuse_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| {
+    Regex::new(
+      r"(?i)\b(keylogger|ransomware|payload|backdoor|credential\s+stealer|token\s+stealer|phishing|malware)\b"
+    ).expect("valid malware regex")
+  })
+}
+
+fn deception_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| {
+    Regex::new(
+      r"(?i)\b(hide\s+this|undetected|bypass|evade|spoof|impersonate|stealth|without\s+them\s+knowing)\b"
+    ).expect("valid deception regex")
+  })
+}
+
+fn credential_abuse_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| {
+    Regex::new(
+      r"(?i)\b(exfiltrate|dump\s+passwords|steal\s+credentials|harvest\s+tokens|session\s+hijack)\b"
+    ).expect("valid credential regex")
+  })
+}
+
+fn benign_guardrail_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| {
+    Regex::new(
+      r"(?i)\b(dry\s+run|simulation|sandbox|safe\s+mode|backup|restore\s+plan|explain\s+risks)\b"
+    ).expect("valid benign regex")
+  })
+}
+
+fn assess_integrity_for_prompt(user_text: &str) -> IntegrityAssessment {
+  let text = user_text.to_lowercase();
+  let trimmed = text.trim();
+
+  if trimmed.is_empty() {
+    return IntegrityAssessment {
+      integrity_score: 1.0,
+      confidence: 0.40,
+      tags: vec!["empty_prompt".to_string()],
+      recommended_tool_policy: RecommendedToolPolicy::AllowAll,
+      redirect_style: RedirectStyle::Neutral,
+      momentum_score: 1.0,
+    };
+  }
+
+  let mut score = 1.0_f32;
+  let mut tags: Vec<String> = Vec::new();
+  let mut matches = 0_u32;
+
+  if destructive_ops_regex().is_match(trimmed) {
+    score -= 0.45;
+    tags.push("destructive_ops".to_string());
+    matches += 1;
+  }
+  if malware_or_abuse_regex().is_match(trimmed) {
+    score -= 0.40;
+    tags.push("malware_or_abuse".to_string());
+    matches += 1;
+  }
+  if deception_regex().is_match(trimmed) {
+    score -= 0.22;
+    tags.push("deception".to_string());
+    matches += 1;
+  }
+  if credential_abuse_regex().is_match(trimmed) {
+    score -= 0.35;
+    tags.push("credential_abuse".to_string());
+    matches += 1;
+  }
+  if benign_guardrail_regex().is_match(trimmed) {
+    score += 0.10;
+    tags.push("benign_guardrails".to_string());
+    matches += 1;
+  }
+
+  score = clamp01(score);
+
+  let policy = if score < INTEGRITY_CAUTION_BAND {
+    RecommendedToolPolicy::NoTools
+  } else if score < INTEGRITY_NORMAL_BAND {
+    RecommendedToolPolicy::ReadOnly
+  } else {
+    RecommendedToolPolicy::AllowAll
+  };
+
+  let redirect_style = if score < INTEGRITY_CAUTION_BAND {
+    RedirectStyle::ProtectiveRedirect
+  } else if score < INTEGRITY_NORMAL_BAND {
+    RedirectStyle::GentleRedirect
+  } else {
+    RedirectStyle::Neutral
+  };
+
+  IntegrityAssessment {
+    integrity_score: score,
+    confidence: (0.45 + (matches as f32 * 0.15)).min(0.95),
+    tags,
+    recommended_tool_policy: policy,
+    redirect_style,
+    momentum_score: score,
+  }
+}
+
+fn apply_integrity_momentum(tab_id: u32, assessment: &mut IntegrityAssessment) {
+  let now = now_unix_secs();
+  let momentum_map = INTEGRITY_MOMENTUM.get_or_init(|| Mutex::new(HashMap::new()));
+  let mut map = match momentum_map.lock() {
+    Ok(guard) => guard,
+    Err(_) => return,
+  };
+
+  let prev = map.get(&tab_id).cloned().unwrap_or_default();
+  let elapsed = (now - prev.updated_at_secs).max(0) as f32;
+  let decay = if prev.updated_at_secs <= 0 {
+    0.0
+  } else {
+    (-(elapsed / 180.0)).exp()
+  };
+  let decayed = if prev.updated_at_secs <= 0 {
+    assessment.integrity_score
+  } else {
+    prev.score * decay
+  };
+
+  // Momentum influences only redirection tone, not hard policy lockout.
+  let blended = clamp01(assessment.integrity_score * 0.8 + decayed * 0.2);
+  assessment.momentum_score = blended;
+  if assessment.integrity_score >= INTEGRITY_CAUTION_BAND && blended < INTEGRITY_NORMAL_BAND {
+    assessment.redirect_style = RedirectStyle::GentleRedirect;
+  }
+
+  map.insert(
+    tab_id,
+    IntegrityMomentumState {
+      score: blended,
+      updated_at_secs: now,
+    },
+  );
+}
+
+fn resolve_turn_tool_policy(
+  attach_tools_by_intent: bool,
+  assessment: &IntegrityAssessment,
+) -> RecommendedToolPolicy {
+  if !attach_tools_by_intent {
+    RecommendedToolPolicy::NoTools
+  } else {
+    assessment.recommended_tool_policy.clone()
+  }
+}
+
+fn build_ephemeral_bridge_note(assessment: &IntegrityAssessment) -> Option<String> {
+  if assessment.integrity_score >= INTEGRITY_NORMAL_BAND {
+    return None;
+  }
+
+  let note = match assessment.redirect_style {
+    RedirectStyle::ProtectiveRedirect => {
+      "[System Integrity Note: The current prompt carries potentially destructive or deceptive intent. Do not use corporate disclaimers. Stay warm and loyal; redirect the user toward safe, practical alternatives that protect their files, environment, and goals.]"
+    }
+    RedirectStyle::GentleRedirect => {
+      "[System Integrity Note: The current prompt appears risky or ambiguous. Keep a supportive tone and steer toward safer, concrete options while preserving user momentum.]"
+    }
+    RedirectStyle::Neutral => {
+      "[System Integrity Note: Maintain constructive and grounded guidance.]"
+    }
+  };
+  Some(note.to_string())
+}
+
+fn request_warrants_tools(input_text: &str, has_images: bool) -> bool {
+  if has_images {
+    return true;
+  }
+
+  let lower = input_text.to_lowercase();
+  if contains_any(&lower, &[
+    "help me think",
+    "think through",
+    "brainstorm",
+    "ethical",
+    "ethics",
+    "laws of robotics",
+    "robotics laws",
+    "principles",
+    "alignment",
+  ]) {
+    return false;
+  }
+
+  contains_any(&lower, &[
+    "screenshot",
+    "screen shot",
+    "weather",
+    "forecast",
+    "temperature",
+    "current",
+    "latest",
+    "news",
+    "search",
+    "look up",
+    "find on the web",
+    "calculate",
+    "math",
+    "compute",
+    "what is 2 +",
+    "what is 3 +",
+    "what is 4 +",
+    "what is 5 +",
+    "how much is",
+    "mcp",
+    "bridge",
+    "inspect",
+    "scan",
+    "refresh repo",
+    "pull from remote",
+    "fetch updates",
+    "update repo",
+    "open devtools",
+  ])
+}
+
+fn is_read_only_tool_schema(tool: &serde_json::Value) -> bool {
+  let name = tool
+    .pointer("/function/name")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_lowercase();
+
+  match name.as_str() {
+    "universal_web_search" | "get_current_weather" | "perform_arithmetic" => true,
+    _ => false,
+  }
+}
+
+fn filter_tools_by_policy(
+  all_tools: Vec<serde_json::Value>,
+  policy: &RecommendedToolPolicy,
+) -> Option<Vec<serde_json::Value>> {
+  match policy {
+    RecommendedToolPolicy::AllowAll => Some(all_tools),
+    RecommendedToolPolicy::ReadOnly => {
+      let filtered: Vec<serde_json::Value> = all_tools
+        .into_iter()
+        .filter(|tool| is_read_only_tool_schema(tool))
+        .collect();
+      if filtered.is_empty() { None } else { Some(filtered) }
+    }
+    RecommendedToolPolicy::NoTools => None,
+  }
+}
+
+fn build_ollama_chat_request(
+  context: AgentCompiledContext,
+  model: String,
+  tool_policy: RecommendedToolPolicy,
+  bridge_note: Option<String>,
+) -> OllamaChatRequest {
   let mut messages = Vec::with_capacity(context.messages.len() + 1);
   messages.push(OllamaMessage {
     role: "system".to_string(),
@@ -295,6 +609,14 @@ fn build_ollama_chat_request(context: AgentCompiledContext, model: String) -> Ol
     images: None,
     tool_calls: None,
   });
+  if let Some(note) = bridge_note {
+    messages.push(OllamaMessage {
+      role: "system".to_string(),
+      content: note,
+      images: None,
+      tool_calls: None,
+    });
+  }
   messages.extend(context.messages);
 
   OllamaChatRequest {
@@ -302,7 +624,7 @@ fn build_ollama_chat_request(context: AgentCompiledContext, model: String) -> Ol
     messages,
     stream: true,
     keep_alive: Some("90s".to_string()),
-    tools: Some(build_default_tools()),
+    tools: filter_tools_by_policy(build_default_tools(), &tool_policy),
   }
 }
 
@@ -582,11 +904,43 @@ async fn execute_ollama_chat_stream(
   let result = execute_ollama_chat_stream_inner(window, event_name, request).await;
 
   if let Err(err) = &result {
+    if request.tools.is_some() {
+      let retry_request = build_plain_text_retry_request(request);
+      let _ = window.emit(event_name, IrisEvent::Status("Tool path failed; retrying in plain language...".to_string()));
+      let retry_result = execute_ollama_chat_stream_inner(window, event_name, &retry_request).await;
+      if retry_result.is_ok() {
+        return retry_result;
+      }
+      let fallback = "I hit an internal reply-formatting issue, but I can still help. Please ask again in plain language and I will answer directly.".to_string();
+      let _ = window.emit(event_name, IrisEvent::Delta(fallback.clone()));
+      let _ = window.emit(event_name, IrisEvent::Done);
+      return Ok(fallback);
+    }
+
     let _ = window.emit(event_name, IrisEvent::Error(err.clone()));
   }
 
   let _ = window.emit(event_name, IrisEvent::Done);
   result
+}
+
+fn build_plain_text_retry_request(request: &OllamaChatRequest) -> OllamaChatRequest {
+  let mut messages = Vec::with_capacity(request.messages.len() + 1);
+  messages.push(OllamaMessage {
+    role: "system".to_string(),
+    content: "Answer in plain language only. Do not produce tool calls, JSON, or schema-like output.".to_string(),
+    images: None,
+    tool_calls: None,
+  });
+  messages.extend(request.messages.clone());
+
+  OllamaChatRequest {
+    model: request.model.clone(),
+    messages,
+    stream: request.stream,
+    keep_alive: request.keep_alive.clone(),
+    tools: None,
+  }
 }
 
 // ---------------------------------------------------------------------------
