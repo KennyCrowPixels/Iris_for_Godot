@@ -232,7 +232,10 @@ pub async fn compile_agent_context(
   messages.push(OllamaMessage {
     role: "user".to_string(),
     content: payload.input_text.clone(),
-    images: if payload.images.is_empty() { None } else { Some(payload.images.clone()) },
+    images: {
+      let normalized = normalize_ollama_images(&payload.images);
+      if normalized.is_empty() { None } else { Some(normalized) }
+    },
     tool_calls: None,
   });
 
@@ -269,6 +272,56 @@ fn build_ollama_chat_request(context: AgentCompiledContext, model: String) -> Ol
     keep_alive: Some("90s".to_string()),
     tools: Some(build_default_tools()),
   }
+}
+
+fn normalize_ollama_image_data(input: &str) -> Option<String> {
+  let trimmed = input.trim();
+  if trimmed.is_empty() {
+    return None;
+  }
+  if let Some(rest) = trimmed.strip_prefix("data:") {
+    if let Some(idx) = rest.find(',') {
+      let data = rest[idx + 1..].trim();
+      if !data.is_empty() {
+        return Some(data.to_string());
+      }
+    }
+  }
+  Some(trimmed.to_string())
+}
+
+fn normalize_ollama_images(images: &[String]) -> Vec<String> {
+  images.iter().filter_map(|v| normalize_ollama_image_data(v)).collect()
+}
+
+fn looks_like_tool_payload_text(text: &str) -> bool {
+  let trimmed = text.trim();
+  let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+    return false;
+  };
+  let Some(obj) = value.as_object() else {
+    return false;
+  };
+  obj.contains_key("tool_calls")
+    || obj.contains_key("name")
+    || obj.contains_key("parameters")
+    || (obj.contains_key("type") && obj.contains_key("properties"))
+    || (obj.contains_key("operation") && obj.contains_key("x") && obj.contains_key("y"))
+}
+
+fn is_screenshot_intent_text(input: &str) -> bool {
+  let lower = input.to_lowercase();
+  contains_any(&lower, &[
+    "screenshot",
+    "screen shot",
+    "capture screen",
+    "screen capture",
+    "take a screenshot",
+    "look at my screen",
+    "analyze screenshot",
+    "what is on my screen",
+    "what's on my screen",
+  ])
 }
 
 fn drain_ndjson_lines(buffer: &mut String) -> Vec<String> {
@@ -384,6 +437,11 @@ async fn execute_ollama_chat_stream_inner(
       intercepted_tool_calls.push(fallback_tool_call);
     } else {
       if !full_text.is_empty() {
+        if looks_like_tool_payload_text(&full_text) {
+          let safe_text = "I hit an internal tool-formatting issue while generating that reply. Please ask again, and I will respond in plain language.".to_string();
+          let _ = window.emit(event_name, IrisEvent::Delta(safe_text.clone()));
+          return Ok(safe_text);
+        }
         let _ = window.emit(event_name, IrisEvent::Delta(full_text.clone()));
       }
       return Ok(full_text);
@@ -410,12 +468,14 @@ async fn execute_ollama_chat_stream_inner(
   });
 
   // Execute each tool and append result as a tool role message
+  let latest_user_text = latest_user_message(&request.messages).unwrap_or("").to_string();
   for tool_call in &intercepted_tool_calls {
-    let tool_result = execute_tool_call(&tool_call.function.name, &tool_call.function.arguments).await;
+    let tool_result = execute_tool_call(&tool_call.function.name, &tool_call.function.arguments, &latest_user_text).await;
+    let normalized_tool_images = normalize_ollama_images(&tool_result.images);
     follow_up_messages.push(OllamaMessage {
       role: "tool".to_string(),
       content: tool_result.content,
-      images: if tool_result.images.is_empty() { None } else { Some(tool_result.images) },
+      images: if normalized_tool_images.is_empty() { None } else { Some(normalized_tool_images) },
       tool_calls: None,
     });
   }
@@ -702,7 +762,7 @@ async fn execute_universal_search(query: &str, depth: &str) -> String {
   }
 }
 
-async fn execute_tool_call(name: &str, args: &serde_json::Value) -> ToolExecutionResult {
+async fn execute_tool_call(name: &str, args: &serde_json::Value, latest_user_text: &str) -> ToolExecutionResult {
   println!("[ToolCall] Dispatching tool: {}", name);
   match name {
     "universal_web_search" => {
@@ -752,11 +812,17 @@ async fn execute_tool_call(name: &str, args: &serde_json::Value) -> ToolExecutio
       ToolExecutionResult { content, images: Vec::new() }
     }
     "capture_desktop_screenshot" => {
+      if !is_screenshot_intent_text(latest_user_text) {
+        return ToolExecutionResult {
+          content: "Screenshot tool skipped because the current user request did not ask for screenshot analysis.".to_string(),
+          images: Vec::new(),
+        };
+      }
       let hint = args.get("target_hint").and_then(|v| v.as_str());
       match capture_screenshot_for_hint(hint) {
         Ok((base64, status)) => ToolExecutionResult {
           content: status,
-          images: vec![format!("data:image/png;base64,{}", base64)],
+          images: vec![base64],
         },
         Err(e) => ToolExecutionResult { content: format!("Screenshot capture failed: {}", e), images: Vec::new() },
       }
