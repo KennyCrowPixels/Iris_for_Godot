@@ -1,5 +1,5 @@
 ﻿use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use sysinfo::System;
@@ -159,6 +159,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static OLLAMA_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static GODOT_WATCHERS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 static INTEGRITY_MOMENTUM: OnceLock<Mutex<HashMap<u32, IntegrityMomentumState>>> = OnceLock::new();
+static INTEGRITY_BAND_NORMAL: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_BAND_CAUTION: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_BAND_PROTECTIVE: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_POLICY_ALLOW_ALL: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_POLICY_READ_ONLY: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_POLICY_NO_TOOLS: AtomicU64 = AtomicU64::new(0);
+static INTEGRITY_BRIDGE_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 // <-- your custom tag created via `ollama create iris-organizer -f ...`
@@ -209,6 +216,7 @@ pub async fn submit_turn(
         apply_integrity_momentum(payload.tab_id, &mut integrity);
         let attach_tools_by_intent = request_warrants_tools(&payload.input_text, !payload.images.is_empty());
         let tool_policy = resolve_turn_tool_policy(attach_tools_by_intent, &integrity);
+        record_integrity_metrics(&integrity, &tool_policy);
         let bridge_note = build_ephemeral_bridge_note(&integrity);
 
         let _ = window.emit(&event_name, IrisEvent::Status(format!(
@@ -295,7 +303,7 @@ pub async fn compile_agent_context(
   };
 
   let system_prompt = format!(
-    "{}\n\nRuntime identity:\n- Your display name is {}.\n- Stay concise and helpful.\n- Never expose raw tool invocation JSON, parameter objects, or internal payloads to the user.\n- For simple arithmetic, provide the plain numeric result and only add explanation if it helps the user.\n- If a screenshot has already been captured for the current request, do not ask whether you should proceed with capture; continue with the existing image unless the user explicitly says it is wrong or insufficient.\n\n{}",
+    "{}\n\nRuntime identity:\n- Your display name is {}.\n- You are a local companion: loyal, practical, and supportive.\n- Keep responses concise, clear, and emotionally grounded.\n- Protect the user and their workspace through constructive alternatives, not hard shutdown language.\n- Never expose raw tool invocation JSON, parameter objects, or internal payloads to the user.\n- For simple arithmetic, provide the plain numeric result and only add explanation if it helps the user.\n- If a screenshot has already been captured for the current request, do not ask whether you should proceed with capture; continue with the existing image unless the user explicitly says it is wrong or insufficient.\n\nStyle directives:\n- Use warm, direct language and concrete next steps.\n- When a request is risky, redirect smoothly to safe, useful options in Iris' wheelhouse.\n- Avoid corporate boilerplate or detached policy-jargon phrasing.\n\n{}",
     persona,
     assistant_name,
     build_agent_tool_section(&flags)
@@ -500,6 +508,7 @@ fn build_ephemeral_bridge_note(assessment: &IntegrityAssessment) -> Option<Strin
     return None;
   }
 
+  INTEGRITY_BRIDGE_APPLIED.fetch_add(1, Ordering::Relaxed);
   let note = match assessment.redirect_style {
     RedirectStyle::ProtectiveRedirect => {
       "[System Integrity Note: The current prompt carries potentially destructive or deceptive intent. Do not use corporate disclaimers. Stay warm and loyal; redirect the user toward safe, practical alternatives that protect their files, environment, and goals.]"
@@ -512,6 +521,28 @@ fn build_ephemeral_bridge_note(assessment: &IntegrityAssessment) -> Option<Strin
     }
   };
   Some(note.to_string())
+}
+
+fn record_integrity_metrics(assessment: &IntegrityAssessment, policy: &RecommendedToolPolicy) {
+  if assessment.integrity_score >= INTEGRITY_NORMAL_BAND {
+    INTEGRITY_BAND_NORMAL.fetch_add(1, Ordering::Relaxed);
+  } else if assessment.integrity_score >= INTEGRITY_CAUTION_BAND {
+    INTEGRITY_BAND_CAUTION.fetch_add(1, Ordering::Relaxed);
+  } else {
+    INTEGRITY_BAND_PROTECTIVE.fetch_add(1, Ordering::Relaxed);
+  }
+
+  match policy {
+    RecommendedToolPolicy::AllowAll => {
+      INTEGRITY_POLICY_ALLOW_ALL.fetch_add(1, Ordering::Relaxed);
+    }
+    RecommendedToolPolicy::ReadOnly => {
+      INTEGRITY_POLICY_READ_ONLY.fetch_add(1, Ordering::Relaxed);
+    }
+    RecommendedToolPolicy::NoTools => {
+      INTEGRITY_POLICY_NO_TOOLS.fetch_add(1, Ordering::Relaxed);
+    }
+  }
 }
 
 fn request_warrants_tools(input_text: &str, has_images: bool) -> bool {
