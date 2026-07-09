@@ -108,26 +108,38 @@ set "PKG_ID=%~2"
 set "DISPLAY=%~3"
 where %CMD_NAME% >nul 2>nul
 if not errorlevel 1 (
-  echo [Iris Setup] %DISPLAY% is already installed.
+  echo [Iris Setup] !DISPLAY! is already installed.
   exit /b 0
 )
 
-echo [Iris Setup] %DISPLAY% missing. Installing via winget...
+echo [Iris Setup] !DISPLAY! missing. Installing via winget...
 if "%AUTO_YES%"=="1" (
-  winget install --id %PKG_ID% -e --accept-package-agreements --accept-source-agreements
+  winget install --id !PKG_ID! -e --accept-package-agreements --accept-source-agreements
 ) else (
-  winget install --id %PKG_ID% -e --accept-package-agreements --accept-source-agreements
+  winget install --id !PKG_ID! -e --accept-package-agreements --accept-source-agreements
 )
 if errorlevel 1 (
-  echo [Iris Setup] Failed to install %DISPLAY% (%PKG_ID%).
+  echo [Iris Setup] Failed to install !DISPLAY! (!PKG_ID!).
   exit /b 1
 )
 exit /b 0
 
 :ensure_build_tools
+set "VSDEVCMD_X86=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
+set "VSDEVCMD_X64=C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 where cl >nul 2>nul
 if not errorlevel 1 (
   echo [Iris Setup] Visual C++ Build Tools already available.
+  exit /b 0
+)
+
+if exist "%VSDEVCMD_X86%" (
+  echo [Iris Setup] Visual C++ Build Tools are installed and can be loaded via VsDevCmd.
+  exit /b 0
+)
+
+if exist "%VSDEVCMD_X64%" (
+  echo [Iris Setup] Visual C++ Build Tools are installed and can be loaded via VsDevCmd.
   exit /b 0
 )
 
