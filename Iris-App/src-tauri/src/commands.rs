@@ -2782,7 +2782,24 @@ pub struct InterpretPlanV2 {
   pub route_summary: String,
   pub status_hint: String,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_resume_hint: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase_checkpoints: Option<Vec<PlannerPhaseCheckpoint>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub routine_plan: Option<RoutinePlan>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerPhaseCheckpoint {
+  pub phase: String,
+  pub label: String,
+  pub summary: String,
+  pub doc_type: String,
+  pub doc_version: u64,
+  pub ts: i64,
 }
 
 
@@ -6486,6 +6503,74 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     "pressureScore": pressure,
     "resolverUsed": &resolver_used,
   });
+
+  let existing_plan_versions = load_cognitive_doc_versions(&app, &goal_for_docs, "planning_logs");
+  let planner_resume_hint = existing_plan_versions
+    .last()
+    .map(|v| format!("resume_from_planning_logs_v{}", v.version));
+
+  let phase_1_summary = format!(
+    "goal_discovery: primary_intent={} secondary_intent={} pressure={:.2} context_tokens~{}",
+    primary_intent,
+    secondary_intent,
+    pressure,
+    compiled.recent_transcript.chars().count() / 4
+  );
+  let phase_2_summary = format!(
+    "constraints_exit_criteria: strategy={} deterministic_resolver={} use_coder={}",
+    strategy,
+    resolver_used,
+    should_use_coder
+  );
+  let phase_3_summary = format!(
+    "master_plan: model={} routed_models={} status_hint={}",
+    model,
+    routed_models.join(" -> "),
+    status_hint
+  );
+  let phase_4_summary = format!(
+    "execution_ready: prompt_chars={} routine_plan={} bridge_note_present={}",
+    prompt.chars().count(),
+    if routine_plan.is_some() { "yes" } else { "no" },
+    if bridge_note.trim().is_empty() { "no" } else { "yes" }
+  );
+
+  let mut planner_phase_checkpoints: Vec<PlannerPhaseCheckpoint> = Vec::new();
+  let phase_entries = vec![
+    ("phase_1", "Goal + Resource Discovery", "phase1_logs", phase_1_summary),
+    ("phase_2", "Exit Criteria + Constraints", "phase2_logs", phase_2_summary),
+    ("phase_3", "Master Plan + Skeleton", "phase3_logs", phase_3_summary),
+    ("phase_4", "Execution Readiness", "phase4_logs", phase_4_summary),
+  ];
+
+  for (phase, label, doc_type, summary) in phase_entries {
+    let meta = serde_json::json!({
+      "phase": phase,
+      "label": label,
+      "tabId": args.tab_id,
+      "statusHint": &status_hint,
+      "routeSummary": &route_summary,
+      "suggestedGodotVersion": &suggested_godot_version,
+    });
+    if let Ok(v) = append_cognitive_doc_version_internal(
+      &app,
+      &goal_for_docs,
+      doc_type,
+      "planner",
+      &summary,
+      meta,
+    ) {
+      planner_phase_checkpoints.push(PlannerPhaseCheckpoint {
+        phase: phase.to_string(),
+        label: label.to_string(),
+        summary,
+        doc_type: doc_type.to_string(),
+        doc_version: v.version,
+        ts: v.ts,
+      });
+    }
+  }
+
   let _ = append_cognitive_doc_version_internal(
     &app,
     &goal_for_docs,
@@ -6514,6 +6599,9 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     routed_models,
     route_summary,
     status_hint,
+    planner_phase: Some("phase_4_execution_ready".to_string()),
+    planner_resume_hint,
+    planner_phase_checkpoints: if planner_phase_checkpoints.is_empty() { None } else { Some(planner_phase_checkpoints) },
     routine_plan,
   })
 }

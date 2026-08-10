@@ -4168,6 +4168,9 @@ function App() {
   const [irisStatus, setIrisStatus] = useState<"idle" | "thinking" | "summarizing" | "responding" | "coding">("idle");
   const [plannerRoutedModels, setPlannerRoutedModels] = useState<string[]>([]);
   const [plannerRouteSummary, setPlannerRouteSummary] = useState<string>("");
+  const [plannerPhase, setPlannerPhase] = useState<string>("");
+  const [plannerResumeHint, setPlannerResumeHint] = useState<string>("");
+  const [plannerCheckpointCount, setPlannerCheckpointCount] = useState<number>(0);
   const [respondingTab, setRespondingTab] = useState<number | null>(null);
   const [thinkingStep, setThinkingStep] = useState<string>("");
   const [thinkingSeconds, setThinkingSeconds] = useState<number>(0);
@@ -4770,6 +4773,10 @@ function App() {
           plannerSuggestedGodotVersion = String(plannerV2.suggestedGodotVersion || plannerV2.suggested_godot_version || "unspecified");
           setPlannerRoutedModels(Array.isArray(plannerV2.routedModels ?? plannerV2.routed_models) ? (plannerV2.routedModels ?? plannerV2.routed_models) : []);
           setPlannerRouteSummary(String(plannerV2.routeSummary ?? plannerV2.route_summary ?? ""));
+          setPlannerPhase(String(plannerV2.plannerPhase ?? plannerV2.planner_phase ?? ""));
+          setPlannerResumeHint(String(plannerV2.plannerResumeHint ?? plannerV2.planner_resume_hint ?? ""));
+          const phaseCheckpoints = plannerV2.plannerPhaseCheckpoints ?? plannerV2.planner_phase_checkpoints;
+          setPlannerCheckpointCount(Array.isArray(phaseCheckpoints) ? phaseCheckpoints.length : 0);
           const cc = plannerV2.compiledContext || {};
           compiled = {
             microSummary: cc.microSummary ?? cc.micro_summary ?? compiled.microSummary,
@@ -11094,6 +11101,16 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   {!!plannerRouteSummary && plannerRouteSummary !== configuredRouteSummary && (
                     <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
                       Last planner-selected route: {plannerRouteSummary.replace(/^Planner route:\s*/i, "")}
+                    </div>
+                  )}
+                  {!!plannerPhase && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 6 }}>
+                      Planner phase: {plannerPhase.replace(/_/g, " ")} {plannerCheckpointCount > 0 ? `| checkpoints: ${plannerCheckpointCount}` : ""}
+                    </div>
+                  )}
+                  {!!plannerResumeHint && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
+                      Resume hint: {plannerResumeHint}
                     </div>
                   )}
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
