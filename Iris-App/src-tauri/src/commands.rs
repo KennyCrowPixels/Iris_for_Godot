@@ -6343,6 +6343,13 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let universal_dataweb = args.universal_dataweb.as_deref().unwrap_or("").trim();
   let allow_long_term_dataweb = explicitly_requests_long_term_memory(&args.user_text)
     || transcript_insufficient_for_long_term(&compiled.recent_transcript, &args.user_text);
+  let runtime_state_for_docs = read_cognitive_runtime_state(&app);
+  let runtime_goal_for_docs = if runtime_state_for_docs.goal_id.trim().is_empty() {
+    format!("tab{}_planning", args.tab_id)
+  } else {
+    runtime_state_for_docs.goal_id
+  };
+  let include_cognitive_slice = allow_long_term_dataweb || pressure >= 0.58;
   let system_state_block = format!(
     "System state:\n- Assistant name: {}\n- Model profile: {}\n- Network: {}\n- Repos context: {}\n- MCP context: {}\n- Desktop tools: {}\n- Selected project: {}",
     assistant_name,
@@ -6362,6 +6369,21 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   }
   if allow_long_term_dataweb && !universal_dataweb.is_empty() {
     injected_context_parts.push(format!("Universal dataweb memory:\n{}", universal_dataweb));
+  }
+  if include_cognitive_slice {
+    if let Ok(slice) = read_cognitive_doc_context_slice(
+      app.clone(),
+      runtime_goal_for_docs.clone(),
+      None,
+      Some(2400),
+    ) {
+      if !slice.trim().is_empty() {
+        injected_context_parts.push(format!(
+          "Cognitive doc slice (append-only history):\n{}",
+          slice
+        ));
+      }
+    }
   }
   let injected_context_block = if injected_context_parts.is_empty() {
     "Injected external context:\n(none)".to_string()
@@ -6525,12 +6547,7 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     )
   };
 
-  let runtime_state = read_cognitive_runtime_state(&app);
-  let goal_for_docs = if runtime_state.goal_id.trim().is_empty() {
-    format!("tab{}_planning", args.tab_id)
-  } else {
-    runtime_state.goal_id
-  };
+  let goal_for_docs = runtime_goal_for_docs.clone();
   let planning_summary = format!(
     "primary_intent={} secondary_intent={} strategy={} model={} status_hint={} route={}",
     primary_intent,
