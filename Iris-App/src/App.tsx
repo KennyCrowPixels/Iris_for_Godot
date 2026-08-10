@@ -113,6 +113,46 @@ type IrisEvent =
   | { type: "Error"; payload: string }
   | { type: "Done"; payload: null };
 
+type CognitiveRuntimePhase =
+  | "idle"
+  | "planning"
+  | "executing"
+  | "qa"
+  | "paused"
+  | "completed"
+  | "failed";
+
+type CognitiveRuntimeStatePayload = {
+  phase: CognitiveRuntimePhase;
+  resumePhase?: CognitiveRuntimePhase | null;
+  goalId: string;
+  goalLabel: string;
+  currentStep: string;
+  activeModel: string;
+  lastTransitionAction: string;
+  lastTransitionAt: number;
+  startedAt: number;
+  completedAt: number;
+  failedAt: number;
+  pausedAt: number;
+  pauseReason: string;
+  failureReason: string;
+  iterationCount: number;
+};
+
+function parseRuntimeTabId(goalId: string): number | null {
+  const m = String(goalId || "").match(/^tab(\d+)_/i);
+  if (!m) return null;
+  const parsed = Number(m[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatRuntimePhaseLabel(phase: CognitiveRuntimePhase): string {
+  const raw = String(phase || "").replace(/_/g, " ").trim();
+  if (!raw) return "idle";
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
 function normalizeMessages(raw: any[] | undefined): Message[] {
   const out: Message[] = [];
   for (const m of raw || []) {
@@ -2426,6 +2466,8 @@ function capSnapshotMessages(
 function App() {
   const useRustEngine = true;
   const [rustEngineStatus, setRustEngineStatus] = useState("");
+  const [globalRuntimeState, setGlobalRuntimeState] = useState<CognitiveRuntimeStatePayload | null>(null);
+  const [runtimeStateByTab, setRuntimeStateByTab] = useState<Record<number, CognitiveRuntimeStatePayload>>({});
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
   const [input, setInput] = useState("");
@@ -3873,6 +3915,48 @@ function App() {
       if (unlistenFn) unlistenFn();
     };
   }, [activeTab]);
+
+  useEffect(() => {
+    const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+    if (!tauriInvoke || !useRustEngine) {
+      return;
+    }
+
+    let unlistenFn: (() => void) | null = null;
+
+    listen<CognitiveRuntimeStatePayload>("cognitive_runtime_state", (event) => {
+      const payload = event.payload as CognitiveRuntimeStatePayload;
+      if (!payload || typeof payload !== "object") return;
+
+      setGlobalRuntimeState(payload);
+
+      const tabId = parseRuntimeTabId(payload.goalId);
+      if (tabId != null) {
+        setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: payload }));
+      }
+    })
+      .then((off) => {
+        unlistenFn = off;
+      })
+      .catch((err) => {
+        console.warn("Failed to subscribe to cognitive runtime events", err);
+      });
+
+    invoke<CognitiveRuntimeStatePayload>("get_cognitive_runtime_state")
+      .then((state) => {
+        if (!state || typeof state !== "object") return;
+        setGlobalRuntimeState(state);
+        const tabId = parseRuntimeTabId(state.goalId);
+        if (tabId != null) {
+          setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: state }));
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, [useRustEngine]);
 
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
@@ -11599,6 +11683,27 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </span>
             </div>
           ) : null}
+
+          {(() => {
+            const tabState = runtimeStateByTab[activeTab];
+            const fallbackState = globalRuntimeState;
+            const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
+            const runtimeState = tabState || (fallbackState && (fallbackTabId == null || fallbackTabId === activeTab) ? fallbackState : null);
+            if (!runtimeState) return null;
+
+            const phaseLabel = formatRuntimePhaseLabel(runtimeState.phase);
+            const step = String(runtimeState.currentStep || "").trim();
+            const model = String(runtimeState.activeModel || "").trim();
+            const iter = Number.isFinite(runtimeState.iterationCount) ? runtimeState.iterationCount : 0;
+
+            return (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 11, color: isLightMode ? "#4b647c" : "#9fb2c9" }}>
+                  Runtime: {phaseLabel}{step ? ` | step: ${step}` : ""}{model ? ` | model: ${model}` : ""}{iter > 0 ? ` | iter: ${iter}` : ""}
+                </span>
+              </div>
+            );
+          })()}
 
           {!!pendingImages.length && (
             <div className="image-attachment-strip">
