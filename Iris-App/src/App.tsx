@@ -148,6 +148,23 @@ type RuntimeNotificationPrefs = {
   quietMode: boolean;
 };
 
+type CognitiveDocVersionPayload = {
+  goalId: string;
+  docType: string;
+  version: number;
+  ts: number;
+  author: string;
+  content: string;
+  metadata?: unknown;
+};
+
+type CognitiveDocNodePayload = {
+  goalId: string;
+  docType: string;
+  latestVersion: number;
+  latestTs: number;
+};
+
 function readRuntimeNotificationPrefs(): RuntimeNotificationPrefs {
   try {
     const raw = localStorage.getItem("iris_runtime_notification_prefs");
@@ -2511,8 +2528,14 @@ function App() {
   const [runtimeNotificationPrefs, setRuntimeNotificationPrefs] = useState<RuntimeNotificationPrefs>(() => readRuntimeNotificationPrefs());
   const [cognitiveGoalDraft, setCognitiveGoalDraft] = useState("");
   const [cognitiveDocTypeDraft, setCognitiveDocTypeDraft] = useState("planning_logs");
+  const [cognitiveDocMaxCharsDraft, setCognitiveDocMaxCharsDraft] = useState("6000");
   const [cognitiveDocSlice, setCognitiveDocSlice] = useState("");
   const [cognitiveDocAppendText, setCognitiveDocAppendText] = useState("");
+  const [cognitiveDocVersions, setCognitiveDocVersions] = useState<CognitiveDocVersionPayload[]>([]);
+  const [cognitiveDocNodes, setCognitiveDocNodes] = useState<CognitiveDocNodePayload[]>([]);
+  const [cognitiveDocSelectedVersion, setCognitiveDocSelectedVersion] = useState<number | null>(null);
+  const [cognitiveDocVersionPreview, setCognitiveDocVersionPreview] = useState("");
+  const [cognitiveDocStatus, setCognitiveDocStatus] = useState("");
   const [cognitiveDocBusy, setCognitiveDocBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
@@ -3328,23 +3351,88 @@ function App() {
     return `tab${activeTab}_planning`;
   }
 
-  async function loadCognitiveDocSliceFromSettings() {
-    if (cognitiveDocBusy) return;
+  function parseCognitiveDocMaxChars(): number {
+    const parsed = Number(cognitiveDocMaxCharsDraft);
+    if (!Number.isFinite(parsed)) return 6000;
+    const normalized = Math.floor(parsed);
+    return Math.min(20000, Math.max(240, normalized));
+  }
+
+  function updateCognitiveVersionPreview(versions: CognitiveDocVersionPayload[], selectedVersion: number | null) {
+    if (!versions.length) {
+      setCognitiveDocVersionPreview("");
+      setCognitiveDocSelectedVersion(null);
+      return;
+    }
+    const resolvedVersion = selectedVersion ?? versions[versions.length - 1].version;
+    const found = versions.find((v) => v.version === resolvedVersion) || versions[versions.length - 1];
+    setCognitiveDocSelectedVersion(found.version);
+    setCognitiveDocVersionPreview(found.content || "");
+  }
+
+  async function loadCognitiveDocSliceFromSettings(options?: { force?: boolean; docTypeOverride?: string }) {
+    if (cognitiveDocBusy && !options?.force) return;
     const goal = resolveCognitiveGoalForEditor();
-    const docType = cognitiveDocTypeDraft.trim();
+    const docType = String(options?.docTypeOverride ?? cognitiveDocTypeDraft).trim();
+    const maxChars = parseCognitiveDocMaxChars();
     try {
       setCognitiveDocBusy(true);
       const slice = await invoke<string>("read_cognitive_doc_context_slice", {
         goalId: goal,
         docType: docType ? docType : undefined,
-        maxChars: 6000,
+        maxChars,
       });
       setCognitiveDocSlice(String(slice || ""));
+      setCognitiveDocStatus(`Loaded context slice (${maxChars} char cap).`);
     } catch (err: any) {
       setCognitiveDocSlice(`Failed to load slice: ${String(err?.message || err || "unknown error")}`);
+      setCognitiveDocStatus("Failed to load context slice.");
     } finally {
       setCognitiveDocBusy(false);
     }
+  }
+
+  async function refreshCognitiveDocMetadataFromSettings(options?: { force?: boolean }) {
+    if (cognitiveDocBusy && !options?.force) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    try {
+      setCognitiveDocBusy(true);
+      const [nodes, versions, latest] = await Promise.all([
+        invoke<CognitiveDocNodePayload[]>("list_cognitive_doc_nodes", { goalId: goal }),
+        invoke<CognitiveDocVersionPayload[]>("list_cognitive_doc_versions", {
+          goalId: goal,
+          docType,
+          limit: 30,
+        }),
+        invoke<CognitiveDocVersionPayload | null>("get_latest_cognitive_doc_version", {
+          goalId: goal,
+          docType,
+        }),
+      ]);
+      const normalizedNodes = Array.isArray(nodes) ? nodes : [];
+      const normalizedVersions = Array.isArray(versions) ? versions : [];
+      setCognitiveDocNodes(normalizedNodes);
+      setCognitiveDocVersions(normalizedVersions);
+      if (latest && typeof latest === "object") {
+        updateCognitiveVersionPreview(normalizedVersions, latest.version);
+      } else {
+        updateCognitiveVersionPreview(normalizedVersions, cognitiveDocSelectedVersion);
+      }
+      setCognitiveDocStatus(`Loaded ${normalizedNodes.length} lane(s), ${normalizedVersions.length} version(s) for ${docType}.`);
+    } catch (err: any) {
+      setCognitiveDocStatus(`Metadata refresh failed: ${String(err?.message || err || "unknown error")}`);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
+
+  function handleCognitiveVersionSelection(nextVersion: number) {
+    if (!Number.isFinite(nextVersion)) return;
+    const found = cognitiveDocVersions.find((v) => v.version === nextVersion);
+    if (!found) return;
+    setCognitiveDocSelectedVersion(found.version);
+    setCognitiveDocVersionPreview(found.content || "");
   }
 
   async function appendCognitiveDocNoteFromSettings() {
@@ -3365,13 +3453,24 @@ function App() {
         },
       });
       setCognitiveDocAppendText("");
-      await loadCognitiveDocSliceFromSettings();
+      await refreshCognitiveDocMetadataFromSettings({ force: true });
+      await loadCognitiveDocSliceFromSettings({ force: true });
       showRuntimeToast("Cognitive document note appended.", 3200);
+      setCognitiveDocStatus(`Appended note to ${docType}.`);
     } catch (err: any) {
       showRuntimeToast(`Append failed: ${String(err?.message || err || "unknown")}`, 5000);
+      setCognitiveDocStatus("Append failed.");
     } finally {
       setCognitiveDocBusy(false);
     }
+  }
+
+  async function resetRuntimeFromSettings() {
+    if (runtimeControlBusy) return;
+    const approved = window.confirm("Reset runtime state to idle? This clears the active runtime phase state.");
+    if (!approved) return;
+    await runRuntimeControl("reset_idle");
+    showRuntimeToast("Runtime state reset to idle.", 3200);
   }
 
   useEffect(() => {
@@ -11744,6 +11843,16 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       style={{ marginTop: 4 }}
                     />
                   </label>
+                  <label>
+                    Context Slice Max Characters
+                    <input
+                      className="model-input"
+                      value={cognitiveDocMaxCharsDraft}
+                      onChange={(e) => setCognitiveDocMaxCharsDraft(e.target.value)}
+                      placeholder="6000"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button
                       className="setup-btn"
@@ -11756,17 +11865,83 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     <button
                       className="setup-btn"
                       type="button"
+                      onClick={() => { void refreshCognitiveDocMetadataFromSettings(); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Refresh Metadata
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
                       onClick={() => {
                         setCognitiveGoalDraft("");
                         setCognitiveDocTypeDraft("planning_logs");
+                        setCognitiveDocMaxCharsDraft("6000");
                         setCognitiveDocSlice("");
                         setCognitiveDocAppendText("");
+                        setCognitiveDocVersions([]);
+                        setCognitiveDocNodes([]);
+                        setCognitiveDocSelectedVersion(null);
+                        setCognitiveDocVersionPreview("");
+                        setCognitiveDocStatus("");
                       }}
                       disabled={cognitiveDocBusy}
                     >
-                      Reset Editor
+                      Reset Editor Fields
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void resetRuntimeFromSettings(); }}
+                      disabled={runtimeControlBusy}
+                    >
+                      Reset Runtime Idle
                     </button>
                   </div>
+                  <label>
+                    Available Lanes For Goal
+                    <select
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      style={{ marginTop: 4 }}
+                    >
+                      <option value={cognitiveDocTypeDraft}>{cognitiveDocTypeDraft || "planning_logs"}</option>
+                      {cognitiveDocNodes
+                        .filter((node) => !!node.docType)
+                        .map((node) => (
+                          <option key={`${node.docType}_${node.latestVersion}`} value={node.docType}>
+                            {node.docType} (latest v{node.latestVersion})
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label>
+                    Versions ({cognitiveDocVersions.length})
+                    <select
+                      className="model-input"
+                      value={cognitiveDocSelectedVersion == null ? "" : String(cognitiveDocSelectedVersion)}
+                      onChange={(e) => handleCognitiveVersionSelection(Number(e.target.value))}
+                      style={{ marginTop: 4 }}
+                    >
+                      <option value="">Select version</option>
+                      {cognitiveDocVersions
+                        .slice()
+                        .reverse()
+                        .map((version) => (
+                          <option key={version.version} value={String(version.version)}>
+                            v{version.version} by {version.author || "unknown"} @ {version.ts ? new Date(version.ts * 1000).toLocaleString() : "(n/a)"}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 100, resize: "vertical" }}
+                    readOnly
+                    value={cognitiveDocVersionPreview}
+                    placeholder="Selected version content appears here..."
+                  />
                   <textarea
                     className="chat-input"
                     style={{ minHeight: 120, resize: "vertical" }}
@@ -11789,6 +11964,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   >
                     Append Note
                   </button>
+                  <div style={{ fontSize: 11, opacity: 0.9 }}>
+                    {cognitiveDocStatus || "Use Refresh Metadata to inspect lanes and versions for the active goal."}
+                  </div>
                 </div>
               </div>
 
