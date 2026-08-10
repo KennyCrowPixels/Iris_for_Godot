@@ -290,6 +290,8 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const MODEL_TAG: &str = "iris-organizer:latest";
 const INTEGRITY_NORMAL_BAND: f32 = 0.80;
 const INTEGRITY_CAUTION_BAND: f32 = 0.60;
+const COGNITIVE_MAX_ACTIVE_SECS: i64 = 900;
+const COGNITIVE_MAX_ITERATIONS: u32 = 18;
 
 #[tauri::command]
 pub async fn submit_turn(
@@ -320,6 +322,19 @@ pub async fn submit_turn(
         reason: None,
       },
     );
+    if let Err(reason) = enforce_cognitive_runtime_policy(
+      &app,
+      &window,
+      &event_name,
+      payload.tab_id,
+      &goal_id,
+      "compile_agent_context",
+      None,
+    ) {
+      let _ = window.emit(&event_name, IrisEvent::Error(reason));
+      let _ = window.emit(&event_name, IrisEvent::Done);
+      return Ok(());
+    }
     let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> planning".to_string()));
 
     match compile_agent_context(&app, &payload).await {
@@ -336,6 +351,19 @@ pub async fn submit_turn(
             reason: None,
           },
         );
+        if let Err(reason) = enforce_cognitive_runtime_policy(
+          &app,
+          &window,
+          &event_name,
+          payload.tab_id,
+          &goal_id,
+          "execute_ollama_chat_stream",
+          Some(&selected_model),
+        ) {
+          let _ = window.emit(&event_name, IrisEvent::Error(reason));
+          let _ = window.emit(&event_name, IrisEvent::Done);
+          return Ok(());
+        }
         let _ = window.emit(&event_name, IrisEvent::Status(format!(
           "Runtime phase -> executing ({})",
           selected_model
@@ -392,18 +420,35 @@ pub async fn submit_turn(
             );
             let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> qa".to_string()));
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
-            let _ = transition_cognitive_runtime_state_internal(
-              &app,
-              &CognitiveRuntimeTransitionArgs {
-                action: "complete".to_string(),
-                goal_id: Some(goal_id.clone()),
-                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
-                current_step: Some("done".to_string()),
-                active_model: Some(request.model.clone()),
-                reason: None,
-              },
-            );
-            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> completed".to_string()));
+            if reply.trim().is_empty() {
+              let reason = "exit_criteria_failed: model produced empty final response".to_string();
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "fail".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("qa_exit_criteria".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: Some(reason.clone()),
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed (exit criteria)".to_string()));
+              let _ = window.emit(&event_name, IrisEvent::Error(reason));
+            } else {
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "complete".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("done".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: None,
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> completed".to_string()));
+            }
           }
           Err(err) => {
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, "");
@@ -2920,6 +2965,61 @@ fn transition_cognitive_runtime_state_internal(
   write_cognitive_runtime_state(&app, &next)?;
   let _ = app.emit("cognitive_runtime_state", &next);
   Ok(next)
+}
+
+fn evaluate_cognitive_runtime_policy(state: &CognitiveRuntimeState) -> Result<(), String> {
+  let now = now_ts();
+  if state.phase == CognitiveRuntimePhase::Planning
+    || state.phase == CognitiveRuntimePhase::Executing
+    || state.phase == CognitiveRuntimePhase::Qa
+  {
+    if state.started_at > 0 {
+      let active_secs = now.saturating_sub(state.started_at);
+      if active_secs > COGNITIVE_MAX_ACTIVE_SECS {
+        return Err(format!(
+          "anti_loop_guard: active runtime exceeded time budget ({}s > {}s)",
+          active_secs,
+          COGNITIVE_MAX_ACTIVE_SECS
+        ));
+      }
+    }
+    if state.iteration_count > COGNITIVE_MAX_ITERATIONS {
+      return Err(format!(
+        "anti_loop_guard: iteration budget exceeded ({} > {})",
+        state.iteration_count,
+        COGNITIVE_MAX_ITERATIONS
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn enforce_cognitive_runtime_policy(
+  app: &tauri::AppHandle,
+  window: &tauri::Window,
+  event_name: &str,
+  tab_id: u32,
+  goal_id: &str,
+  step: &str,
+  active_model: Option<&str>,
+) -> Result<(), String> {
+  let state = read_cognitive_runtime_state(app);
+  if let Err(reason) = evaluate_cognitive_runtime_policy(&state) {
+    let _ = transition_cognitive_runtime_state_internal(
+      app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "fail".to_string(),
+        goal_id: Some(goal_id.to_string()),
+        goal_label: Some(format!("Tab {} turn", tab_id)),
+        current_step: Some(step.to_string()),
+        active_model: active_model.map(|s| s.to_string()),
+        reason: Some(reason.clone()),
+      },
+    );
+    let _ = window.emit(&event_name, IrisEvent::Status(format!("Runtime phase -> failed ({})", reason)));
+    return Err(reason);
+  }
+  Ok(())
 }
 
 fn read_setup_flags(app: &tauri::AppHandle) -> SetupFlags {
