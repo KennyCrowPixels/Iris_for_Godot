@@ -38,7 +38,114 @@ const SUMMARY_MODEL = "iris-summarizer:latest";
 const DEBUG_MEMORY = false;
 
 type ModelStatus = "checking" | "ready" | "loading" | "error";
-type Message = { role: "user" | "llm"; text: string; images?: string[]; time?: number };
+type WorkLogEntry = {
+  ts: number;
+  text: string;
+};
+
+type IrisActionTrace = {
+  id: string;
+  ts: number;
+  action: string;
+  reason: string;
+  argsSummary: string;
+  outcome: string;
+};
+
+type IrisMessageThinkingLog = {
+  capturedAt: number;
+  prompt: string;
+  responseModel: string;
+  plannerPath: string;
+  plannerIntent: string;
+  plannerStrategy: string;
+  routeSummary: string;
+  selectedProfile: string;
+  profileReason: string;
+  plannerPhase: string;
+  plannerResumeHint: string;
+  checkpointCount: number;
+  suggestedGodotVersion: string;
+  runtimePhase: string;
+  workLog: WorkLogEntry[];
+  actionTrace: IrisActionTrace[];
+};
+
+type MessageLogViewerState = {
+  title: string;
+  timestamp: string;
+  log: IrisMessageThinkingLog | null;
+};
+
+type Message = { role: "user" | "llm"; text: string; images?: string[]; time?: number; thinkingLog?: unknown };
+type AutonomousTaskIntervalUnit = "seconds" | "minutes" | "hours" | "days" | "custom";
+
+type AutonomousTaskDraft = {
+  id: string;
+  prompt: string;
+  projectId: string | null;
+  networkAllowed: boolean;
+  intervalValue: string;
+  intervalUnit: AutonomousTaskIntervalUnit;
+  customSchedulePrompt: string;
+};
+
+const AUTONOMOUS_PANEL_PREFS_KEY = "iris_autonomous_panel_prefs";
+const AUTONOMOUS_TASKS_KEY = "iris_autonomous_tasks";
+
+function createBlankAutonomousTask(): AutonomousTaskDraft {
+  return {
+    id: makeId("auto_task"),
+    prompt: "",
+    projectId: null,
+    networkAllowed: false,
+    intervalValue: "",
+    intervalUnit: "minutes",
+    customSchedulePrompt: "",
+  };
+}
+
+function readAutonomousPanelPrefs(): { enabled: boolean; collapsed: boolean } {
+  try {
+    const raw = localStorage.getItem(AUTONOMOUS_PANEL_PREFS_KEY);
+    if (!raw) return { enabled: false, collapsed: false };
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: !!parsed?.enabled,
+      collapsed: !!parsed?.collapsed,
+    };
+  } catch {
+    return { enabled: false, collapsed: false };
+  }
+}
+
+function normalizeAutonomousTask(raw: any): AutonomousTaskDraft {
+  const intervalUnit = String(raw?.intervalUnit || "minutes").toLowerCase();
+  const allowedUnits: AutonomousTaskIntervalUnit[] = ["seconds", "minutes", "hours", "days", "custom"];
+  return {
+    id: String(raw?.id || makeId("auto_task")),
+    prompt: String(raw?.prompt || ""),
+    projectId: raw?.projectId ? String(raw.projectId) : null,
+    networkAllowed: !!raw?.networkAllowed,
+    intervalValue: String(raw?.intervalValue || ""),
+    intervalUnit: allowedUnits.includes(intervalUnit as AutonomousTaskIntervalUnit)
+      ? (intervalUnit as AutonomousTaskIntervalUnit)
+      : "minutes",
+    customSchedulePrompt: String(raw?.customSchedulePrompt || ""),
+  };
+}
+
+function readAutonomousTasksFromStorage(): AutonomousTaskDraft[] {
+  try {
+    const raw = localStorage.getItem(AUTONOMOUS_TASKS_KEY);
+    if (!raw) return [createBlankAutonomousTask()];
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed.map(normalizeAutonomousTask) : [];
+    return list.length ? list : [createBlankAutonomousTask()];
+  } catch {
+    return [createBlankAutonomousTask()];
+  }
+}
 type StartupStatus = {
   active: boolean;
   step: string;
@@ -219,7 +326,16 @@ function normalizeMessages(raw: any[] | undefined): Message[] {
         ? (m as any).images.filter((v: any) => typeof v === "string")
         : undefined;
       const time = Number.isFinite((m as any).time) ? Number((m as any).time) : undefined;
-      out.push({ role, text, ...(images && images.length ? { images } : {}), ...(time ? { time } : {}) });
+      const thinkingLog = (m as any).thinkingLog && typeof (m as any).thinkingLog === "object"
+        ? ((m as any).thinkingLog as IrisMessageThinkingLog)
+        : null;
+      out.push({
+        role,
+        text,
+        ...(images && images.length ? { images } : {}),
+        ...(time ? { time } : {}),
+        ...(thinkingLog ? { thinkingLog } : {}),
+      });
       continue;
     }
     // Legacy transcript that merges both speakers into one block:
@@ -385,11 +501,6 @@ type ActiveRoutine = {
   status: "pending_confirm" | "running" | "paused" | "done" | "cancelled" | "error";
 };
 
-type WorkLogEntry = {
-  ts: number;
-  text: string;
-};
-
 type McpToolDescriptor = {
   mcpId: string;
   mcpName: string;
@@ -433,15 +544,6 @@ type InferredActions = {
   desktop: ParsedExplicitDesktopCall | null;
   mcp: ParsedExplicitMcpCall | null;
   project: ParsedExplicitProjectCall | null;
-};
-
-type IrisActionTrace = {
-  id: string;
-  ts: number;
-  action: string;
-  reason: string;
-  argsSummary: string;
-  outcome: string;
 };
 
 type IrisToolScope = "internal" | "custom";
@@ -1731,23 +1833,25 @@ async function persistDirectReply(params: {
   replyText: string;
   associatedProjectId: string | null;
   promptHistory?: string[];
+  thinkingLog?: IrisMessageThinkingLog | null;
 }) {
-  const { requestTabId, tabs, userDisplayText, replyText, associatedProjectId, promptHistory } = params;
+  const { requestTabId, tabs, userDisplayText, replyText, associatedProjectId, promptHistory, thinkingLog } = params;
   const tabObj = tabs.find(t => t.id === requestTabId);
   const nowTs = Math.floor(Date.now() / 1000);
   const uiMsgs = (tabObj?.messages || []).map((m: any) => ({
     role: m.role,
     text: m.text,
     time: (m as any).time ?? nowTs,
+    ...(m?.thinkingLog ? { thinkingLog: m.thinkingLog } : {}),
   }));
-  const messagesForSnapshot: { role: 'user' | 'llm'; text: string; time: number }[] = [...uiMsgs];
+  const messagesForSnapshot: Array<{ role: 'user' | 'llm'; text: string; time: number; thinkingLog?: IrisMessageThinkingLog | null }> = [...uiMsgs];
   if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'user' ||
       messagesForSnapshot[messagesForSnapshot.length - 1].text !== userDisplayText) {
     messagesForSnapshot.push({ role: 'user', text: userDisplayText, time: nowTs });
   }
   if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'llm' ||
       messagesForSnapshot[messagesForSnapshot.length - 1].text !== replyText) {
-    messagesForSnapshot.push({ role: 'llm', text: replyText, time: nowTs });
+    messagesForSnapshot.push({ role: 'llm', text: replyText, time: nowTs, ...(thinkingLog ? { thinkingLog } : {}) });
   }
   await withTimeout(persistSnapshot(requestTabId, {
     title: tabObj?.title ?? `Tab #${requestTabId}`,
@@ -2506,15 +2610,17 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 function capSnapshotMessages(
-  messages: Array<{ role: 'user' | 'llm'; text: string; time: number }>,
+  messages: Array<{ role: 'user' | 'llm'; text: string; time: number; images?: string[]; thinkingLog?: unknown }>,
   maxMessages = 140,
   maxCharsPerMessage = 16000
-): Array<{ role: 'user' | 'llm'; text: string; time: number }> {
+): Array<{ role: 'user' | 'llm'; text: string; time: number; images?: string[]; thinkingLog?: unknown }> {
   const trimmedWindow = messages.slice(-maxMessages);
   return trimmedWindow.map((m) => ({
     role: m.role,
     text: typeof m.text === "string" ? m.text.slice(0, maxCharsPerMessage) : "",
     time: Number.isFinite(m.time) ? m.time : Math.floor(Date.now() / 1000),
+    ...(Array.isArray(m.images) && m.images.length ? { images: m.images } : {}),
+    ...(m.thinkingLog && typeof m.thinkingLog === "object" ? { thinkingLog: m.thinkingLog } : {}),
   }));
 }
 
@@ -2543,6 +2649,11 @@ function App() {
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [chatDragActive, setChatDragActive] = useState(false);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
+  const [messageLogViewer, setMessageLogViewer] = useState<MessageLogViewerState | null>(null);
+  const [autonomousPanelEnabled, setAutonomousPanelEnabled] = useState<boolean>(() => readAutonomousPanelPrefs().enabled);
+  const [autonomousPanelCollapsed, setAutonomousPanelCollapsed] = useState<boolean>(() => readAutonomousPanelPrefs().collapsed);
+  const [autonomousTasks, setAutonomousTasks] = useState<AutonomousTaskDraft[]>(() => readAutonomousTasksFromStorage());
+  const [autonomousDeleteConfirmId, setAutonomousDeleteConfirmId] = useState<string | null>(null);
   const [editingLastUserMsgIdx, setEditingLastUserMsgIdx] = useState<number | null>(null);
   const [editingLastUserMsgDraft, setEditingLastUserMsgDraft] = useState("");
   const [thinking, setThinking] = useState(false);
@@ -2576,6 +2687,8 @@ function App() {
   const rustDeltaDrainTimerByTabRef = useRef<Record<number, ReturnType<typeof setInterval> | null>>({});
   const rustStreamDoneByTabRef = useRef<Record<number, boolean>>({});
   const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
+  const workLogByTabRef = useRef<Record<number, WorkLogEntry[]>>({});
+  const actionTraceByTabRef = useRef<Record<number, IrisActionTrace[]>>({});
   const isMounted = useRef(true);
 
   const [useCoder, setUseCoder] = useState(false);
@@ -3297,6 +3410,46 @@ function App() {
       localStorage.setItem("iris_runtime_notification_prefs", JSON.stringify(runtimeNotificationPrefs));
     } catch {}
   }, [runtimeNotificationPrefs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTONOMOUS_PANEL_PREFS_KEY, JSON.stringify({
+        enabled: autonomousPanelEnabled,
+        collapsed: autonomousPanelCollapsed,
+      }));
+    } catch {}
+  }, [autonomousPanelEnabled, autonomousPanelCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTONOMOUS_TASKS_KEY, JSON.stringify(autonomousTasks));
+    } catch {}
+  }, [autonomousTasks]);
+
+  function updateAutonomousTask(taskId: string, patch: Partial<AutonomousTaskDraft>) {
+    setAutonomousTasks((prev) => prev.map((task) => (task.id === taskId ? { ...task, ...patch } : task)));
+  }
+
+  function addAutonomousTask() {
+    setAutonomousTasks((prev) => [...prev, createBlankAutonomousTask()]);
+  }
+
+  function confirmDeleteAutonomousTask(taskId: string) {
+    setAutonomousTasks((prev) => {
+      const next = prev.filter((task) => task.id !== taskId);
+      return next.length ? next : [createBlankAutonomousTask()];
+    });
+    setAutonomousDeleteConfirmId(null);
+  }
+
+  function resizeAutonomousPrompt(el: HTMLTextAreaElement | null) {
+    if (!el) return;
+    el.style.height = "auto";
+    const computed = window.getComputedStyle(el);
+    const lineHeight = Number.parseFloat(computed.lineHeight || "20") || 20;
+    const maxHeight = lineHeight * 7;
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+  }
 
   function showRuntimeToast(message: string, ms = 4500) {
     setHwToast(message);
@@ -4470,13 +4623,13 @@ function App() {
     const normalized = String(text || "").trim();
     if (!normalized) return;
     const ts = Date.now();
-    setWorkLogByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      if (existing.length > 0 && existing[existing.length - 1].text === normalized) {
-        return prev;
-      }
-      return { ...prev, [tabId]: [...existing, { ts, text: normalized }].slice(-24) };
-    });
+    const existing = Array.isArray(workLogByTabRef.current[tabId]) ? workLogByTabRef.current[tabId] : [];
+    if (existing.length > 0 && existing[existing.length - 1].text === normalized) {
+      return;
+    }
+    const next = [...existing, { ts, text: normalized }].slice(-24);
+    workLogByTabRef.current[tabId] = next;
+    setWorkLogByTab((prev) => ({ ...prev, [tabId]: next }));
   }
 
   function setThinkingProgress(tabId: number, step: string) {
@@ -4485,7 +4638,64 @@ function App() {
   }
 
   function clearWorkLog(tabId: number) {
+    workLogByTabRef.current[tabId] = [];
     setWorkLogByTab((prev) => ({ ...prev, [tabId]: [] }));
+  }
+
+  function clearActionTrace(tabId: number) {
+    actionTraceByTabRef.current[tabId] = [];
+    setActionTraceByTab((prev) => ({ ...prev, [tabId]: [] }));
+  }
+
+  function buildThinkingLogForReply(args: {
+    tabId: number;
+    plannerPath: string;
+    plannerIntent: string;
+    plannerStrategy: string;
+    routeSummary: string;
+    selectedProfile: string;
+    profileReason: string;
+    plannerPhase: string;
+    plannerResumeHint: string;
+    checkpointCount: number;
+    suggestedGodotVersion: string;
+    responseModel: string;
+    prompt: string;
+    workLogStartIndex: number;
+    actionTraceStartIndex: number;
+  }): IrisMessageThinkingLog {
+    const workLog = (workLogByTabRef.current[args.tabId] || []).slice(args.workLogStartIndex);
+    const actionTrace = (actionTraceByTabRef.current[args.tabId] || []).slice(args.actionTraceStartIndex);
+    const runtimeState = activeRuntimeStateForTab(args.tabId);
+    return {
+      capturedAt: Math.floor(Date.now() / 1000),
+      prompt: args.prompt,
+      responseModel: args.responseModel,
+      plannerPath: args.plannerPath,
+      plannerIntent: args.plannerIntent,
+      plannerStrategy: args.plannerStrategy,
+      routeSummary: args.routeSummary,
+      selectedProfile: args.selectedProfile,
+      profileReason: args.profileReason,
+      plannerPhase: args.plannerPhase,
+      plannerResumeHint: args.plannerResumeHint,
+      checkpointCount: args.checkpointCount,
+      suggestedGodotVersion: args.suggestedGodotVersion,
+      runtimePhase: runtimeState?.phase || "idle",
+      workLog,
+      actionTrace,
+    };
+  }
+
+  function openMessageThinkingLog(msg: Message, idx: number) {
+    const log = msg.thinkingLog && typeof msg.thinkingLog === "object"
+      ? (msg.thinkingLog as IrisMessageThinkingLog)
+      : null;
+    setMessageLogViewer({
+      title: `${assistantLabel} response #${idx + 1}`,
+      timestamp: formatMessageTimestamp(msg.time) || "(no timestamp)",
+      log,
+    });
   }
 
   function setRoutineStepStatus(stepId: string, patch: Partial<RoutineStep>) {
@@ -4868,6 +5078,8 @@ function App() {
 
     let preloadedSnapshot: Snapshot | null = null;
     clearWorkLog(requestTabId);
+    const turnWorkLogStartIndex = 0;
+    const turnActionTraceStartIndex = (actionTraceByTabRef.current[requestTabId] || []).length;
     setThinkingProgress(requestTabId, "Loading tab memory...");
     try {
       preloadedSnapshot = await readTabSnapshot(requestTabId);
@@ -7092,6 +7304,75 @@ function App() {
           }
         }
 
+        const likelyComprehensiveRequest = /\b(build|create|design|implement|project|campaign|system|workflow|architecture|roadmap|plan|script)\b/i.test(text)
+          && text.trim().length > 28;
+        const looksLikeSkeletonOnly = /\b(skeleton|outline|phase\s*1|phase\s*2|milestone|todo|next steps?)\b/i.test(streamedText)
+          && !/```/.test(streamedText);
+        const shouldRunAutonomousContinuation = !hasImages
+          && !quickMode
+          && streamedText.trim().length > 0
+          && likelyComprehensiveRequest
+          && (looksLikeSkeletonOnly || plannerPath === "v2");
+
+        if (shouldRunAutonomousContinuation) {
+          const maxAutonomyPasses = looksLikeSkeletonOnly ? 3 : 2;
+          let autonomousDraft = streamedText;
+          for (let pass = 1; pass <= maxAutonomyPasses; pass++) {
+            if (stoppedRef.current) break;
+            setThinkingProgress(requestTabId, `Autonomous continuation ${pass}/${maxAutonomyPasses}...`);
+            let continuationRaw = "";
+            await stream({
+              model: "iris-organizer:latest",
+              prompt: [
+                "You are Iris continuing work on a single user request.",
+                "Decide whether the current draft fully completes the user's request.",
+                "Output strictly one of:",
+                "COMPLETE:<final user-facing answer only>",
+                "CONTINUE:<improved user-facing answer that executes the next needed steps now; do not return only a plan>",
+                "No extra labels, no analysis sections.",
+                "",
+                `User request:\n${text}`,
+                "",
+                `Current draft:\n${autonomousDraft}`,
+              ].join("\n"),
+              options: {
+                num_ctx: plannerReviewNumCtx,
+                num_keep: 24,
+                num_predict: Math.max(700, Math.floor(organizerPredictBudget * 0.9)),
+                temperature: 0.2,
+                top_p: 0.9,
+                top_k: 40,
+                repeat_penalty: 1.06,
+              },
+              signal: controller.signal,
+              onFirstToken: (first) => {
+                continuationRaw += first;
+              },
+              onTokens: (delta) => {
+                continuationRaw += delta;
+              },
+            });
+
+            const normalized = continuationRaw.replace(/<\/?final>/gi, "").trim();
+            if (!normalized) break;
+            if (/^COMPLETE:/i.test(normalized)) {
+              const next = sanitizeAssistantOutput(normalized.replace(/^COMPLETE:\s*/i, "").trim());
+              if (next) autonomousDraft = next;
+              break;
+            }
+            if (/^CONTINUE:/i.test(normalized)) {
+              const next = sanitizeAssistantOutput(normalized.replace(/^CONTINUE:\s*/i, "").trim());
+              if (!next || next === autonomousDraft) break;
+              autonomousDraft = next;
+              continue;
+            }
+            const fallback = sanitizeAssistantOutput(normalized);
+            if (!fallback || fallback === autonomousDraft) break;
+            autonomousDraft = fallback;
+          }
+          streamedText = autonomousDraft;
+        }
+
         const iterationBudget = iterationBudgetForProfile(llmProfile);
         if (!hasImages && !quickMode && iterationBudget > 1 && streamedText.trim()) {
           let workingDraft = streamedText;
@@ -7166,12 +7447,31 @@ function App() {
       let artifacts = extractArtifacts(deliveredText);
       const filenameMatch = deliveredText.match(/(?:here's|file|save as|edit)\s+`([^`]+)`/i);
       if (filenameMatch && artifacts[0]) artifacts[0].filename = filenameMatch[1];
+      const thinkingLog = buildThinkingLogForReply({
+        tabId: requestTabId,
+        plannerPath,
+        plannerIntent: String(plannerV2?.primaryIntent || plannerV2?.primary_intent || "legacy"),
+        plannerStrategy: String(plannerV2?.strategy || "legacy"),
+        routeSummary: String(plannerV2?.routeSummary ?? plannerV2?.route_summary ?? plannerRouteSummary ?? ""),
+        selectedProfile: String(plannerV2?.selectedThinkingProfile ?? plannerV2?.selected_thinking_profile ?? plannerSelectedProfile ?? ""),
+        profileReason: String(plannerV2?.profileSelectionReason ?? plannerV2?.profile_selection_reason ?? plannerProfileReason ?? ""),
+        plannerPhase: String(plannerV2?.plannerPhase ?? plannerV2?.planner_phase ?? plannerPhase ?? ""),
+        plannerResumeHint: String(plannerV2?.plannerResumeHint ?? plannerV2?.planner_resume_hint ?? plannerResumeHint ?? ""),
+        checkpointCount: Array.isArray(plannerV2?.plannerPhaseCheckpoints ?? plannerV2?.planner_phase_checkpoints)
+          ? (plannerV2?.plannerPhaseCheckpoints ?? plannerV2?.planner_phase_checkpoints).length
+          : plannerCheckpointCount,
+        suggestedGodotVersion: plannerSuggestedGodotVersion,
+        responseModel: model,
+        prompt,
+        workLogStartIndex: turnWorkLogStartIndex,
+        actionTraceStartIndex: turnActionTraceStartIndex,
+      });
 
       updateTabMessages(requestTabId, msgs => {
         const copy = [...msgs];
         for (let i = copy.length - 1; i >= 0; --i) {
           if (copy[i].role === "llm") {
-            copy[i] = { ...copy[i], text: deliveredText };
+            copy[i] = { ...copy[i], text: deliveredText, thinkingLog };
             break;
           }
         }
@@ -7256,10 +7556,11 @@ function App() {
           role: m.role,
           text: m.text,
           time: (m as any).time ?? nowTs,
+          ...(m?.thinkingLog ? { thinkingLog: m.thinkingLog } : {}),
         }));
         const baseMsgs = uiMsgs;
 
-        const messagesForSnapshot: { role: 'user' | 'llm'; text: string; time: number }[] = [...baseMsgs];
+        const messagesForSnapshot: Array<{ role: 'user' | 'llm'; text: string; time: number; thinkingLog?: IrisMessageThinkingLog | null }> = [...baseMsgs];
 
         // Ensure last user message is present
         if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'user' ||
@@ -7270,7 +7571,7 @@ function App() {
         // Ensure last LLM message is present/updated
         if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'llm' ||
             messagesForSnapshot[messagesForSnapshot.length - 1].text !== deliveredText) {
-          messagesForSnapshot.push({ role: 'llm', text: deliveredText, time: nowTs });
+          messagesForSnapshot.push({ role: 'llm', text: deliveredText, time: nowTs, thinkingLog });
         }
 
         const boundedSnapshotMessages = capSnapshotMessages(messagesForSnapshot);
@@ -8490,10 +8791,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       ts: Math.floor(Date.now() / 1000),
       ...entry,
     };
-    setActionTraceByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      return { ...prev, [tabId]: [...existing, trace].slice(-60) };
-    });
+    const existing = Array.isArray(actionTraceByTabRef.current[tabId]) ? actionTraceByTabRef.current[tabId] : [];
+    const next = [...existing, trace].slice(-60);
+    actionTraceByTabRef.current[tabId] = next;
+    setActionTraceByTab((prev) => ({ ...prev, [tabId]: next }));
   }
 
   function applyFlowAdjustmentFeedback(tabId: number, text: string): string | null {
@@ -9291,6 +9592,22 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
               <div
                 className="dropdown-item"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const next = !autonomousPanelEnabled;
+                  setAutonomousPanelEnabled(next);
+                  if (next) {
+                    setAutonomousPanelCollapsed(false);
+                  }
+                  setOpenSubmenu(null);
+                  setOpenMenu(null);
+                }}
+              >
+                <span>{autonomousPanelEnabled ? "✓ " : ""}Autonomous Tasks Panel</span>
+              </div>
+
+              <div
+                className="dropdown-item"
                 onClick={async (e) => {
                   e.stopPropagation();
                   const next = !desktopDashboardEnabled;
@@ -9682,9 +9999,82 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         );
       })()}
 
+      {messageLogViewer && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(4, 10, 18, 0.58)",
+            zIndex: 70,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 18,
+          }}
+          onClick={() => setMessageLogViewer(null)}
+        >
+          <div
+            style={{
+              width: "min(900px, 92vw)",
+              maxHeight: "80vh",
+              overflow: "auto",
+              borderRadius: 12,
+              border: "1px solid var(--app-border)",
+              background: "var(--app-panel-bg)",
+              color: "var(--app-text)",
+              boxShadow: "0 18px 42px rgba(0,0,0,0.36)",
+              padding: 16,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700 }}>{messageLogViewer.title}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>{messageLogViewer.timestamp}</div>
+              </div>
+              <button type="button" className="setup-btn" onClick={() => setMessageLogViewer(null)}>Close</button>
+            </div>
+            {!messageLogViewer.log ? (
+              <div style={{ fontSize: 13, opacity: 0.84 }}>No thinking log was captured for this message.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 12, fontSize: 12, lineHeight: 1.5 }}>
+                <div><strong>Planner:</strong> {messageLogViewer.log.plannerPath || "(n/a)"} | {messageLogViewer.log.plannerIntent || "(n/a)"} | {messageLogViewer.log.plannerStrategy || "(n/a)"}</div>
+                <div><strong>Route:</strong> {messageLogViewer.log.routeSummary || "(n/a)"}</div>
+                <div><strong>Profile:</strong> {messageLogViewer.log.selectedProfile || "(n/a)"}{messageLogViewer.log.profileReason ? ` | ${messageLogViewer.log.profileReason}` : ""}</div>
+                <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}</div>
+                <div><strong>Phase hints:</strong> {messageLogViewer.log.plannerPhase || "(n/a)"}{messageLogViewer.log.plannerResumeHint ? ` | ${messageLogViewer.log.plannerResumeHint}` : ""}{messageLogViewer.log.checkpointCount ? ` | checkpoints: ${messageLogViewer.log.checkpointCount}` : ""}</div>
+                <div>
+                  <strong>Work log</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
+                    {messageLogViewer.log.workLog.length
+                      ? messageLogViewer.log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n")
+                      : "(empty)"}
+                  </div>
+                </div>
+                <div>
+                  <strong>Action trace</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
+                    {messageLogViewer.log.actionTrace.length
+                      ? messageLogViewer.log.actionTrace.map((entry) => `${new Date(entry.ts * 1000).toLocaleTimeString()} | ${entry.action} | ${entry.reason} | ${entry.outcome}`).join("\n")
+                      : "(empty)"}
+                  </div>
+                </div>
+                <div>
+                  <strong>Prompt snapshot</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, maxHeight: 180, overflow: "auto", opacity: 0.95 }}>
+                    {messageLogViewer.log.prompt || "(empty)"}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {currentTab?.type === "chat" && (
-        <div className="chat-history" ref={historyRef}>
-          {chatMessages.map((msg, idx) => {
+        <div className={`chat-workspace${autonomousPanelEnabled ? " with-autonomous" : ""}`}>
+          <div className="chat-history" ref={historyRef}>
+            {chatMessages.map((msg, idx) => {
             const key = `${activeTab}_${idx}`;
             const isHovered = hoveredMessageKey === key;
             const isLastUserMessage = msg.role === "user" && idx === lastUserMessageIdx;
@@ -9695,89 +10085,225 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               typeof msg.text === "string" &&
               msg.text.startsWith("[Godot Runtime Error]");
 
-            return (
-              <div
-                className={`bubble ${msg.role}`}
-                key={idx}
-                style={isGodotError ? {
-                  border: "1px solid rgba(220, 93, 93, 0.72)",
-                  background: "rgba(68, 16, 16, 0.68)",
-                } : undefined}
-                onMouseEnter={() => setHoveredMessageKey(key)}
-                onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
-              >
-                <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
-                  {timestamp ? <span>{timestamp}</span> : null}
-                  <button
-                    type="button"
-                    className="bubble-copy-btn"
-                    onClick={() => void copyChatMessageText(msg.text)}
-                  >
-                    Copy
-                  </button>
-                  {isLastUserMessage && !isEditingThis && (
+              return (
+                <div
+                  className={`bubble ${msg.role}`}
+                  key={idx}
+                  style={isGodotError ? {
+                    border: "1px solid rgba(220, 93, 93, 0.72)",
+                    background: "rgba(68, 16, 16, 0.68)",
+                  } : undefined}
+                  onMouseEnter={() => setHoveredMessageKey(key)}
+                  onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
+                >
+                  <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
+                    {timestamp ? <span>{timestamp}</span> : null}
                     <button
                       type="button"
-                      className="bubble-edit-btn"
-                      onClick={() => {
-                        setEditingLastUserMsgIdx(idx);
-                        setEditingLastUserMsgDraft(msg.text || "");
-                      }}
+                      className="bubble-copy-btn"
+                      onClick={() => void copyChatMessageText(msg.text)}
                     >
-                      Edit
+                      Copy
                     </button>
-                  )}
-                </div>
-
-                <strong>
-                  {msg.role === "user" ? "You:" : (isGodotError ? "Godot Monitor:" : `${assistantLabel}:`)}
-                </strong>{" "}
-
-                {isEditingThis ? (
-                  <div className="bubble-edit-wrap">
-                    <textarea
-                      className="bubble-edit-input"
-                      value={editingLastUserMsgDraft}
-                      onChange={(e) => setEditingLastUserMsgDraft(e.target.value)}
-                      rows={3}
-                    />
-                    <div className="bubble-edit-actions">
+                    {msg.role === "llm" && (
                       <button
                         type="button"
-                        className="setup-btn primary"
-                        onClick={() => editAndResendLastUserMessage(editingLastUserMsgDraft)}
+                        className="bubble-copy-btn"
+                        onClick={() => openMessageThinkingLog(msg as Message, idx)}
                       >
-                        Save + Resend
+                        Log
                       </button>
+                    )}
+                    {isLastUserMessage && !isEditingThis && (
                       <button
                         type="button"
-                        className="setup-btn"
+                        className="bubble-edit-btn"
                         onClick={() => {
-                          setEditingLastUserMsgIdx(null);
-                          setEditingLastUserMsgDraft("");
+                          setEditingLastUserMsgIdx(idx);
+                          setEditingLastUserMsgDraft(msg.text || "");
                         }}
                       >
-                        Cancel
+                        Edit
                       </button>
-                    </div>
+                    )}
                   </div>
-                ) : (
-                  <ReactMarkdown>{msg.text}</ReactMarkdown>
-                )}
 
-                {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
-                  <div className="bubble-image-strip">
-                    {((msg as any).images as string[]).map((src, imgIdx) => (
-                      <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
-                        <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
+                  <strong>
+                    {msg.role === "user" ? "You:" : (isGodotError ? "Godot Monitor:" : `${assistantLabel}:`)}
+                  </strong>{" "}
+
+                  {isEditingThis ? (
+                    <div className="bubble-edit-wrap">
+                      <textarea
+                        className="bubble-edit-input"
+                        value={editingLastUserMsgDraft}
+                        onChange={(e) => setEditingLastUserMsgDraft(e.target.value)}
+                        rows={3}
+                      />
+                      <div className="bubble-edit-actions">
+                        <button
+                          type="button"
+                          className="setup-btn primary"
+                          onClick={() => editAndResendLastUserMessage(editingLastUserMsgDraft)}
+                        >
+                          Save + Resend
+                        </button>
+                        <button
+                          type="button"
+                          className="setup-btn"
+                          onClick={() => {
+                            setEditingLastUserMsgIdx(null);
+                            setEditingLastUserMsgDraft("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                  )}
+
+                  {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
+                    <div className="bubble-image-strip">
+                      {((msg as any).images as string[]).map((src, imgIdx) => (
+                        <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
+                          <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            <div ref={chatEndRef} />
+          </div>
+
+          {autonomousPanelEnabled && (
+            <aside className={`autonomous-panel${autonomousPanelCollapsed ? " collapsed" : ""}`}>
+              {!autonomousPanelCollapsed && (
+                <>
+                  <div className="autonomous-panel-header">
+                    <div>
+                      <strong>Autonomous Tasks</strong>
+                      <div className="autonomous-panel-subtitle">Plan goal- or time-driven self-wake tasks.</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="setup-btn"
+                      onClick={() => setAutonomousPanelCollapsed(true)}
+                    >
+                      Hide
+                    </button>
+                  </div>
+
+                  <div className="autonomous-panel-list">
+                    {autonomousTasks.map((task, idx) => (
+                      <div key={task.id} className="autonomous-task-card">
+                        <div className="autonomous-task-top">
+                          <span>Task {idx + 1}</span>
+                          <button
+                            type="button"
+                            className="autonomous-task-delete"
+                            onClick={() => setAutonomousDeleteConfirmId(task.id)}
+                            title="Delete task"
+                          >
+                            ×
+                          </button>
+                        </div>
+
+                        <textarea
+                          className="autonomous-task-prompt"
+                          value={task.prompt}
+                          rows={5}
+                          onChange={(e) => updateAutonomousTask(task.id, { prompt: e.target.value })}
+                          onInput={(e) => resizeAutonomousPrompt(e.currentTarget)}
+                          placeholder="Primary prompt for this automated task..."
+                        />
+
+                        <div className="autonomous-task-row">
+                          <label>Project</label>
+                          <select
+                            value={task.projectId || ""}
+                            onChange={(e) => updateAutonomousTask(task.id, { projectId: e.target.value || null })}
+                          >
+                            <option value="">No Project</option>
+                            {repoStore.projects.filter((p) => p.enabled).map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="autonomous-task-row split">
+                          <button
+                            type="button"
+                            className={`setup-btn${task.networkAllowed ? " primary" : ""}`}
+                            onClick={() => updateAutonomousTask(task.id, { networkAllowed: !task.networkAllowed })}
+                          >
+                            Network: {task.networkAllowed ? "Allowed" : "Blocked"}
+                          </button>
+                          <div className="autonomous-task-time-wrap">
+                            <input
+                              type="number"
+                              min="0"
+                              step="1"
+                              value={task.intervalValue}
+                              onChange={(e) => updateAutonomousTask(task.id, { intervalValue: e.target.value })}
+                              placeholder="Time"
+                            />
+                            <select
+                              value={task.intervalUnit}
+                              onChange={(e) => updateAutonomousTask(task.id, { intervalUnit: e.target.value as AutonomousTaskIntervalUnit })}
+                            >
+                              <option value="seconds">Seconds</option>
+                              <option value="minutes">Minutes</option>
+                              <option value="hours">Hours</option>
+                              <option value="days">Days</option>
+                              <option value="custom">Custom</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {task.intervalUnit === "custom" && (
+                          <input
+                            className="autonomous-task-custom"
+                            value={task.customSchedulePrompt}
+                            onChange={(e) => updateAutonomousTask(task.id, { customSchedulePrompt: e.target.value })}
+                            placeholder="Custom schedule prompt (for example: every Tuesday at 9 AM)"
+                          />
+                        )}
+
+                        {autonomousDeleteConfirmId === task.id && (
+                          <div className="autonomous-delete-confirm">
+                            <span>Delete this task?</span>
+                            <div>
+                              <button type="button" className="setup-btn" onClick={() => setAutonomousDeleteConfirmId(null)}>Cancel</button>
+                              <button type="button" className="setup-btn primary" onClick={() => confirmDeleteAutonomousTask(task.id)}>Delete</button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
-                )}
-              </div>
-            );
-          })}
-          <div ref={chatEndRef} />
+
+                  <button type="button" className="setup-btn primary autonomous-add-btn" onClick={addAutonomousTask}>
+                    + Add Task
+                  </button>
+                </>
+              )}
+            </aside>
+          )}
+
+          {autonomousPanelEnabled && autonomousPanelCollapsed && (
+            <button
+              type="button"
+              className="autonomous-reveal-handle"
+              onClick={() => setAutonomousPanelCollapsed(false)}
+              title="Show autonomous tasks panel"
+            >
+              ◀
+            </button>
+          )}
         </div>
       )}
       {!hasChatTabs && currentTab?.type !== "settings" && (

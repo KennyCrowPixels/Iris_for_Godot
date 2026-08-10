@@ -148,6 +148,8 @@ pub struct ChatMessage {
     pub text: String,
     #[serde(default)]
     pub time: i64, // unix seconds
+  #[serde(default, rename = "thinkingLog", alias = "thinking_log")]
+  pub thinking_log: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1669,6 +1671,7 @@ fn persist_rust_turn_snapshot(
       role: "user".to_string(),
       text: user_text.to_string(),
       time: ts,
+      thinking_log: None,
     });
   }
   if !assistant_text.trim().is_empty() {
@@ -1676,6 +1679,7 @@ fn persist_rust_turn_snapshot(
       role: "llm".to_string(),
       text: assistant_text.to_string(),
       time: ts,
+      thinking_log: None,
     });
   }
   if snap.title.trim().is_empty() {
@@ -6261,7 +6265,7 @@ pub fn update_tab_memory(app: tauri::AppHandle, args: UpdateTabMemoryArgs) -> Re
     mem.micro_summary = args.micro_summary;
     mem.dialogue_bullets = args.dialogue_bullets;
     let ts = now_ts();
-    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts });
+    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts, thinking_log: None });
     let mut arts = args.artifacts;
     for a in arts.iter_mut() { a.ts = ts; }
     mem.artifacts.extend(arts);
@@ -7208,13 +7212,13 @@ fn normalize_messages(msgs: &[ChatMessage]) -> (Vec<ChatMessage>, bool) {
   for m in msgs.iter() {
     let role_l = m.role.to_lowercase();
     if is_standard_role(&role_l) {
-      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts(), thinking_log: None });
     } else if let Some((u, a)) = split_legacy_block(&m.text) {
-      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts() }); }
-      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts() }); }
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts(), thinking_log: None }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts(), thinking_log: None }); }
       changed = true;
     } else {
-      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts(), thinking_log: None });
       if role_l != "llm" { changed = true; }
     }
   }
