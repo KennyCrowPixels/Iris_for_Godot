@@ -150,6 +150,124 @@ pub struct ChatMessage {
     pub time: i64, // unix seconds
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveRuntimePhase {
+  Idle,
+  Planning,
+  Executing,
+  Qa,
+  Paused,
+  Completed,
+  Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeState {
+  pub phase: CognitiveRuntimePhase,
+  pub resume_phase: Option<CognitiveRuntimePhase>,
+  pub goal_id: String,
+  pub goal_label: String,
+  pub current_step: String,
+  pub active_model: String,
+  pub last_transition_action: String,
+  pub last_transition_at: i64,
+  pub started_at: i64,
+  pub completed_at: i64,
+  pub failed_at: i64,
+  pub paused_at: i64,
+  pub pause_reason: String,
+  pub failure_reason: String,
+  pub iteration_count: u32,
+}
+
+impl Default for CognitiveRuntimeState {
+  fn default() -> Self {
+    Self {
+      phase: CognitiveRuntimePhase::Idle,
+      resume_phase: None,
+      goal_id: String::new(),
+      goal_label: String::new(),
+      current_step: String::new(),
+      active_model: String::new(),
+      last_transition_action: "init".to_string(),
+      last_transition_at: now_ts(),
+      started_at: 0,
+      completed_at: 0,
+      failed_at: 0,
+      paused_at: 0,
+      pause_reason: String::new(),
+      failure_reason: String::new(),
+      iteration_count: 0,
+    }
+  }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeTransitionArgs {
+  pub action: String,
+  #[serde(default)]
+  pub goal_id: Option<String>,
+  #[serde(default)]
+  pub goal_label: Option<String>,
+  #[serde(default)]
+  pub current_step: Option<String>,
+  #[serde(default)]
+  pub active_model: Option<String>,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CognitiveRuntimeAction {
+  StartPlanning,
+  StartExecuting,
+  StartQa,
+  Pause,
+  Resume,
+  Complete,
+  Fail,
+  ResetIdle,
+  UpdateProgress,
+}
+
+impl CognitiveRuntimeAction {
+  fn parse(raw: &str) -> Result<Self, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+      "start_planning" => Ok(Self::StartPlanning),
+      "start_executing" => Ok(Self::StartExecuting),
+      "start_qa" => Ok(Self::StartQa),
+      "pause" => Ok(Self::Pause),
+      "resume" => Ok(Self::Resume),
+      "complete" => Ok(Self::Complete),
+      "fail" => Ok(Self::Fail),
+      "reset_idle" => Ok(Self::ResetIdle),
+      "update_progress" => Ok(Self::UpdateProgress),
+      _ => Err(format!(
+        "Unknown cognitive runtime action '{}'. Expected one of: start_planning, start_executing, start_qa, pause, resume, complete, fail, reset_idle, update_progress",
+        raw
+      )),
+    }
+  }
+
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::StartPlanning => "start_planning",
+      Self::StartExecuting => "start_executing",
+      Self::StartQa => "start_qa",
+      Self::Pause => "pause",
+      Self::Resume => "resume",
+      Self::Complete => "complete",
+      Self::Fail => "fail",
+      Self::ResetIdle => "reset_idle",
+      Self::UpdateProgress => "update_progress",
+    }
+  }
+}
+
 
 
 use std::{fs, path::PathBuf};
@@ -2532,6 +2650,190 @@ fn tab_file(app: &tauri::AppHandle, tab_id: u32) -> Result<PathBuf, String> {
 fn setup_flags_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   let dir = memory_dir(app)?;
   Ok(dir.join("setup_flags.json"))
+}
+
+fn cognitive_runtime_state_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  Ok(dir.join("cognitive_runtime_state.json"))
+}
+
+fn read_cognitive_runtime_state(app: &tauri::AppHandle) -> CognitiveRuntimeState {
+  let path = match cognitive_runtime_state_file(app) {
+    Ok(p) => p,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  if !path.exists() {
+    return CognitiveRuntimeState::default();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  serde_json::from_str::<CognitiveRuntimeState>(&raw).unwrap_or_default()
+}
+
+fn write_cognitive_runtime_state(app: &tauri::AppHandle, state: &CognitiveRuntimeState) -> Result<(), String> {
+  let path = cognitive_runtime_state_file(app)?;
+  let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+  atomic_write_json(&path, &json)
+}
+
+fn transition_phase(current: CognitiveRuntimePhase, action: CognitiveRuntimeAction) -> Result<CognitiveRuntimePhase, String> {
+  use CognitiveRuntimeAction::*;
+  use CognitiveRuntimePhase::*;
+
+  match (current, action) {
+    (Idle, StartPlanning) => Ok(Planning),
+    (Idle, ResetIdle) => Ok(Idle),
+
+    (Planning, StartExecuting) => Ok(Executing),
+    (Planning, Pause) => Ok(Paused),
+    (Planning, Fail) => Ok(Failed),
+    (Planning, ResetIdle) => Ok(Idle),
+    (Planning, UpdateProgress) => Ok(Planning),
+
+    (Executing, StartQa) => Ok(Qa),
+    (Executing, Pause) => Ok(Paused),
+    (Executing, Fail) => Ok(Failed),
+    (Executing, ResetIdle) => Ok(Idle),
+    (Executing, UpdateProgress) => Ok(Executing),
+
+    (Qa, StartExecuting) => Ok(Executing),
+    (Qa, Pause) => Ok(Paused),
+    (Qa, Complete) => Ok(Completed),
+    (Qa, Fail) => Ok(Failed),
+    (Qa, ResetIdle) => Ok(Idle),
+    (Qa, UpdateProgress) => Ok(Qa),
+
+    (Paused, Resume) => Ok(Paused),
+    (Paused, Fail) => Ok(Failed),
+    (Paused, ResetIdle) => Ok(Idle),
+    (Paused, UpdateProgress) => Ok(Paused),
+
+    (Completed, ResetIdle) => Ok(Idle),
+    (Failed, ResetIdle) => Ok(Idle),
+
+    (phase, attempted) => Err(format!(
+      "Invalid cognitive runtime transition: phase={:?}, action={}",
+      phase,
+      attempted.as_str()
+    )),
+  }
+}
+
+fn apply_cognitive_runtime_transition(
+  mut state: CognitiveRuntimeState,
+  args: &CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let action = CognitiveRuntimeAction::parse(&args.action)?;
+  let now = now_ts();
+  let previous_phase = state.phase.clone();
+  let next_phase = transition_phase(previous_phase.clone(), action)?;
+
+  if let Some(goal_id) = &args.goal_id {
+    state.goal_id = goal_id.trim().to_string();
+  }
+  if let Some(goal_label) = &args.goal_label {
+    state.goal_label = goal_label.trim().to_string();
+  }
+  if let Some(step) = &args.current_step {
+    state.current_step = step.trim().to_string();
+  }
+  if let Some(model) = &args.active_model {
+    state.active_model = model.trim().to_string();
+  }
+
+  match action {
+    CognitiveRuntimeAction::StartPlanning => {
+      state.phase = next_phase;
+      state.resume_phase = None;
+      state.started_at = now;
+      state.completed_at = 0;
+      state.failed_at = 0;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+      state.failure_reason.clear();
+      state.iteration_count = 0;
+      if state.goal_id.is_empty() {
+        state.goal_id = format!("goal_{}", now);
+      }
+      if state.goal_label.is_empty() {
+        state.goal_label = "Autonomous Goal".to_string();
+      }
+    }
+    CognitiveRuntimeAction::StartExecuting | CognitiveRuntimeAction::StartQa => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+      if matches!(action, CognitiveRuntimeAction::StartExecuting) {
+        state.iteration_count = state.iteration_count.saturating_add(1);
+      }
+    }
+    CognitiveRuntimeAction::Pause => {
+      state.resume_phase = Some(previous_phase);
+      state.phase = next_phase;
+      state.paused_at = now;
+      state.pause_reason = args.reason.clone().unwrap_or_else(|| "paused".to_string());
+    }
+    CognitiveRuntimeAction::Resume => {
+      let resume_target = state
+        .resume_phase
+        .clone()
+        .ok_or_else(|| "Cannot resume cognitive runtime: no saved resume phase".to_string())?;
+      if resume_target != CognitiveRuntimePhase::Planning && resume_target != CognitiveRuntimePhase::Executing && resume_target != CognitiveRuntimePhase::Qa {
+        return Err(format!(
+          "Cannot resume cognitive runtime: unsupported resume phase {:?}",
+          resume_target
+        ));
+      }
+      state.phase = resume_target;
+      state.resume_phase = None;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+    }
+    CognitiveRuntimeAction::Complete => {
+      state.phase = next_phase;
+      state.completed_at = now;
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::Fail => {
+      state.phase = next_phase;
+      state.failed_at = now;
+      state.failure_reason = args.reason.clone().unwrap_or_else(|| "failed".to_string());
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::ResetIdle => {
+      state = CognitiveRuntimeState::default();
+      state.last_transition_at = now;
+    }
+    CognitiveRuntimeAction::UpdateProgress => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+    }
+  }
+
+  state.last_transition_action = action.as_str().to_string();
+  state.last_transition_at = now;
+  Ok(state)
+}
+
+#[tauri::command]
+pub fn get_cognitive_runtime_state(app: tauri::AppHandle) -> Result<CognitiveRuntimeState, String> {
+  Ok(read_cognitive_runtime_state(&app))
+}
+
+#[tauri::command]
+pub fn transition_cognitive_runtime_state(
+  app: tauri::AppHandle,
+  args: CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let current = read_cognitive_runtime_state(&app);
+  let next = apply_cognitive_runtime_transition(current, &args)?;
+  write_cognitive_runtime_state(&app, &next)?;
+  Ok(next)
 }
 
 fn read_setup_flags(app: &tauri::AppHandle) -> SetupFlags {

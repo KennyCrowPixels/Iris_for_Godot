@@ -41,6 +41,8 @@ fn main() {
             commands::set_setup_flags,
             commands::download_and_install_ollama,
             commands::check_models_ready,
+            commands::get_cognitive_runtime_state,
+            commands::transition_cognitive_runtime_state,
             commands::apply_model_profile,
             commands::pull_and_create_models,
             commands::restart_app,
