@@ -3267,6 +3267,43 @@ pub fn read_cognitive_doc_context_slice(
 }
 
 #[tauri::command]
+pub fn clear_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+) -> Result<usize, String> {
+  let mut cleared = 0usize;
+  if let Some(kind) = doc_type {
+    let target = cognitive_doc_versions_file(&app, &goal_id, &kind)?;
+    if target.exists() {
+      fs::remove_file(&target)
+        .map_err(|e| format!("Failed removing {}: {}", target.display(), e))?;
+      cleared = 1;
+    }
+    return Ok(cleared);
+  }
+
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      fs::remove_file(&path)
+        .map_err(|e| format!("Failed removing {}: {}", path.display(), e))?;
+      cleared = cleared.saturating_add(1);
+    }
+  }
+
+  Ok(cleared)
+}
+
+#[tauri::command]
 pub fn transition_cognitive_runtime_state(
   app: tauri::AppHandle,
   args: CognitiveRuntimeTransitionArgs,

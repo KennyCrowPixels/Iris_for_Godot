@@ -3471,6 +3471,36 @@ function App() {
     if (!approved) return;
     await runRuntimeControl("reset_idle");
     showRuntimeToast("Runtime state reset to idle.", 3200);
+    setCognitiveDocStatus("Runtime state reset to idle.");
+  }
+
+  async function clearCognitiveDocHistoryFromSettings(scope: "lane" | "goal") {
+    if (cognitiveDocBusy) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    const question = scope === "lane"
+      ? `Clear cognitive doc history for lane '${docType}' under goal '${goal}'?`
+      : `Clear ALL cognitive doc lanes for goal '${goal}'?`;
+    const approved = window.confirm(question);
+    if (!approved) return;
+    try {
+      setCognitiveDocBusy(true);
+      const cleared = await invoke<number>("clear_cognitive_doc_versions", {
+        goalId: goal,
+        docType: scope === "lane" ? docType : undefined,
+      });
+      setCognitiveDocSlice("");
+      setCognitiveDocVersionPreview("");
+      setCognitiveDocStatus(`Cleared ${Number(cleared) || 0} file(s) from ${scope === "lane" ? `lane ${docType}` : `goal ${goal}`}.`);
+      showRuntimeToast(`Cognitive doc ${scope === "lane" ? "lane" : "goal"} history cleared.`, 4200);
+      await refreshCognitiveDocMetadataFromSettings({ force: true });
+    } catch (err: any) {
+      const message = String(err?.message || err || "unknown error");
+      setCognitiveDocStatus(`Clear failed: ${message}`);
+      showRuntimeToast(`Cognitive doc clear failed: ${message}`, 5200);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -11896,6 +11926,24 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       disabled={runtimeControlBusy}
                     >
                       Reset Runtime Idle
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void clearCognitiveDocHistoryFromSettings("lane"); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Clear Lane History
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void clearCognitiveDocHistoryFromSettings("goal"); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Clear Goal History
                     </button>
                   </div>
                   <label>
