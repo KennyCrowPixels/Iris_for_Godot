@@ -2918,6 +2918,7 @@ fn transition_cognitive_runtime_state_internal(
   let current = read_cognitive_runtime_state(&app);
   let next = apply_cognitive_runtime_transition(current, &args)?;
   write_cognitive_runtime_state(&app, &next)?;
+  let _ = app.emit("cognitive_runtime_state", &next);
   Ok(next)
 }
 
