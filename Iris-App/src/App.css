@@ -287,6 +287,8 @@ button {
   word-break: break-word;
   box-shadow: none;
   max-width: 75%;
+  min-width: clamp(196px, 32%, 280px);
+  width: fit-content;
 }
 
 .bubble.user {
@@ -305,6 +307,7 @@ button {
   right: 10px;
   display: flex;
   align-items: center;
+  white-space: nowrap;
   gap: 8px;
   font-size: 11px;
   color: rgba(230, 230, 230, 0.72);
@@ -312,6 +315,13 @@ button {
   transform: translateY(-2px);
   transition: opacity 0.18s ease, transform 0.18s ease;
   pointer-events: none;
+}
+
+@media (max-width: 760px) {
+  .bubble {
+    min-width: 150px;
+    max-width: 88%;
+  }
 }
 
 .bubble-meta.show {
@@ -759,7 +769,11 @@ button {
   margin-right: 0;
   position: relative;
   z-index: 1;
-  min-width: 84px;
+  min-width: 110px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tab:active {

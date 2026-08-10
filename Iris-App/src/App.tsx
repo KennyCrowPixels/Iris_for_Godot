@@ -1796,6 +1796,21 @@ type ModelfileDataFE = {
   params: ModelfileParamFE[];
 };
 
+type ModelfileSnapshot = {
+  fromModel: string;
+  params: ModelfileParamFE[];
+  systemPrompt: string;
+  nickname: string;
+  ts: number;
+  reason: string;
+};
+
+type ModelfileChangeEntry = {
+  ts: number;
+  event: string;
+  detail: string;
+};
+
 type CustomModelDef = { id: string; filename: string; nickname: string; enabled: boolean; note: string };
 type ModelConfigFE = {
   coderEnabled: boolean;
@@ -1813,8 +1828,123 @@ type PendingImage = {
   dataUrl: string;
 };
 
+type ProfileContextPlan = {
+  organizer: number;
+  coder: number;
+  summarizer: number;
+  vision: number;
+  plannerBase: number;
+  plannerCap: number;
+};
+
+function profileContextPlan(profile: LlmProfile): ProfileContextPlan {
+  switch (profile) {
+    case "Ultra":
+      return { organizer: 16384, coder: 12288, summarizer: 4096, vision: 8192, plannerBase: 4200, plannerCap: 5600 };
+    case "High":
+      return { organizer: 12288, coder: 8192, summarizer: 3072, vision: 6144, plannerBase: 3200, plannerCap: 4600 };
+    case "MediumHigh":
+      return { organizer: 8192, coder: 6144, summarizer: 2560, vision: 4096, plannerBase: 2600, plannerCap: 3600 };
+    case "Medium":
+      return { organizer: 6144, coder: 4096, summarizer: 2048, vision: 3072, plannerBase: 2000, plannerCap: 2800 };
+    case "Low":
+      return { organizer: 3072, coder: 2048, summarizer: 1280, vision: 2048, plannerBase: 1300, plannerCap: 1700 };
+    case "Minimal":
+    default:
+      return { organizer: 2048, coder: 1536, summarizer: 1024, vision: 1536, plannerBase: 900, plannerCap: 1200 };
+  }
+}
+
+function derivePlannerTokenBudget(profile: LlmProfile, organizerNumCtx: number): number {
+  const plan = profileContextPlan(profile);
+  const scaled = Math.round(organizerNumCtx * 0.35);
+  return Math.max(plan.plannerBase, Math.min(plan.plannerCap, scaled));
+}
+
+function readNumericParam(params: ModelfileParamFE[], key: string, fallback: number): number {
+  const raw = params.find((p) => p.key === key)?.value;
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function modelfileRoleFromFilename(filename: string): "organizer" | "coder" | "summarizer" | "vision" {
+  const lower = String(filename || "").toLowerCase();
+  if (lower.includes("coder")) return "coder";
+  if (lower.includes("summarizer")) return "summarizer";
+  if (lower.includes("vision")) return "vision";
+  return "organizer";
+}
+
+function parseModelSizeBillions(modelName: string): number | null {
+  const lower = String(modelName || "").toLowerCase();
+  const m = lower.match(/(\d+(?:\.\d+)?)\s*b\b/);
+  if (!m) return null;
+  const parsed = Number.parseFloat(m[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function computeAutoModelCtx(baseCtx: number, modelName: string): number {
+  const sizeB = parseModelSizeBillions(modelName);
+  const factor =
+    sizeB == null ? 1.0 :
+    sizeB >= 30 ? 0.45 :
+    sizeB >= 20 ? 0.55 :
+    sizeB >= 13 ? 0.7 :
+    sizeB >= 8 ? 0.85 :
+    sizeB >= 4 ? 1.0 :
+    sizeB >= 2 ? 1.15 : 1.25;
+  const scaled = Math.round((baseCtx * factor) / 256) * 256;
+  return Math.max(1024, Math.min(32768, scaled));
+}
+
+function upsertModelfileParams(params: ModelfileParamFE[], updates: Record<string, string>): ModelfileParamFE[] {
+  const next = params.map((p) => ({ ...p }));
+  const idx = new Map<string, number>();
+  next.forEach((p, i) => idx.set(p.key, i));
+  for (const [key, value] of Object.entries(updates)) {
+    if (idx.has(key)) {
+      const i = idx.get(key)!;
+      next[i] = { ...next[i], value };
+    } else {
+      next.push({ key, value });
+    }
+  }
+  return next;
+}
+
+function autoTuneModelfileParams(params: {
+  filename: string;
+  fromModel: string;
+  profile: LlmProfile;
+  currentParams: ModelfileParamFE[];
+}): ModelfileParamFE[] {
+  const { filename, fromModel, profile, currentParams } = params;
+  const role = modelfileRoleFromFilename(filename);
+  const plan = profileContextPlan(profile);
+  const baseCtx =
+    role === "coder" ? plan.coder :
+    role === "summarizer" ? plan.summarizer :
+    role === "vision" ? plan.vision :
+    plan.organizer;
+  const numCtx = computeAutoModelCtx(baseCtx, fromModel);
+
+  const presets = role === "coder"
+    ? { num_keep: "48", num_predict: "900", temperature: "0.20", top_p: "0.90", top_k: "40", repeat_penalty: "1.06", repeat_last_n: "160" }
+    : role === "summarizer"
+    ? { num_keep: "24", num_predict: "220", temperature: "0.09", top_p: "0.60", top_k: "24", repeat_penalty: "1.10", repeat_last_n: "128" }
+    : role === "vision"
+    ? { num_keep: "48", num_predict: "1000", temperature: "0.32", top_p: "0.90", top_k: "40", repeat_penalty: "1.07", repeat_last_n: "192" }
+    : { num_keep: "48", num_predict: "1100", temperature: "0.24", top_p: "0.90", top_k: "40", repeat_penalty: "1.06", repeat_last_n: "160" };
+
+  return upsertModelfileParams(currentParams, {
+    num_ctx: String(numCtx),
+    ...presets,
+  });
+}
+
 /** Returns capability flags and token budget for the given profile. */
 function profileCapabilities(profile: LlmProfile) {
+  const contextPlan = profileContextPlan(profile);
   const tier =
     profile === "Ultra" ? 4 :
     profile === "High" ? 3 :
@@ -1828,7 +1958,7 @@ function profileCapabilities(profile: LlmProfile) {
     fullRagEnabled: tier >= 2,     // MediumHigh and above
     multiMcpEnabled: tier >= 2,    // MediumHigh and above
     deepReasoningEnabled: tier >= 2,
-    tokenBudget: tier >= 3 ? 3600 : tier === 2 ? 2400 : 1200,
+    tokenBudget: contextPlan.plannerBase,
   };
 }
 
@@ -1891,6 +2021,7 @@ type FootprintLevel = "Very Light" | "Light" | "Balanced" | "Heavy" | "Very Heav
 function computeEffectiveContextFootprint(params: {
   profile: LlmProfile;
   tokenBudget: number;
+  plannerBudget: number;
   reposOn: boolean;
   mcpOn: boolean;
   multiMcp: boolean;
@@ -1902,6 +2033,7 @@ function computeEffectiveContextFootprint(params: {
   const {
     profile,
     tokenBudget,
+    plannerBudget,
     reposOn,
     mcpOn,
     multiMcp,
@@ -1918,7 +2050,7 @@ function computeEffectiveContextFootprint(params: {
     profile === "Medium" ? 1.2 :
     profile === "Low" ? 0.8 : 0.5;
 
-  const tokenLoad = Math.max(0, (tokenBudget - 1200) / 1200) * 0.8;
+  const tokenLoad = Math.max(0, (tokenBudget - 2048) / 2048) * 0.8;
   const repoLoad = reposOn ? (fullRag ? 1.2 : 0.7) : 0.0;
   const mcpLoad = mcpOn ? (multiMcp ? 1.1 : 0.6) : 0.0;
   const reasoningLoad = deepReasoning ? 0.8 : 0.25;
@@ -1935,7 +2067,8 @@ function computeEffectiveContextFootprint(params: {
 
   const rationale = [
     `Profile=${profile}`,
-    `TokenBudget=${tokenBudget}`,
+    `ModelCtx=${tokenBudget}`,
+    `PlannerBudget=${plannerBudget}`,
     `Repos=${reposOn ? "ON" : "OFF"}`,
     `MCP=${mcpOn ? (multiMcp ? "ON (multi)" : "ON (single)") : "OFF"}`,
     `Planner=${interpretV2On ? "ON" : "OFF"}`,
@@ -2153,6 +2286,12 @@ function nextChatLabelNumber(allTabs: Tab[]): number {
   let n = 1;
   while (used.has(n)) n++;
   return n;
+}
+
+function displayChatTabTitle(title: string): string {
+  const raw = String(title || "").trim();
+  if (raw.length <= 10) return raw;
+  return `${raw.slice(0, 7)}...`;
 }
 
 type MemoryDebugState = {
@@ -2555,9 +2694,17 @@ function App() {
   const [modelfileFromEdits, setModelfileFromEdits] = useState<Record<string, string>>({});
   const [modelfileSubTab, setModelfileSubTab] = useState<string>("modelfile_organizer.txt");
   const [modelfileSaving, setModelfileSaving] = useState<Record<string, boolean>>({});
+  const [modelfileSavedStatus, setModelfileSavedStatus] = useState<Record<string, boolean>>({});
+  const [modelfileDirty, setModelfileDirty] = useState<Record<string, boolean>>({});
+  const [modelfileHistory, setModelfileHistory] = useState<Record<string, ModelfileSnapshot[]>>({});
   const [modelfileLoadError, setModelfileLoadError] = useState<string | null>(null);
   const [modelfileFilenames, setModelfileFilenames] = useState<string[]>([]);
   const modelfileLoadedRef = useRef(false);
+  const modelfileBaselineHashRef = useRef<Record<string, string>>({});
+  const modelfileChangeLogRef = useRef<Record<string, ModelfileChangeEntry[]>>({});
+
+  const MODEFILE_HISTORY_STORAGE_KEY = "iris.modelfiles.history.v1";
+  const MODEFILE_CHANGELOG_STORAGE_KEY = "iris.modelfiles.changelog.v1";
 
   const currentTab = tabs.find(t => t.id === activeTab);
   const hasChatTabs = tabs.some(t => t.type === "chat");
@@ -2671,6 +2818,130 @@ function App() {
     ? repoStore.sshs.filter((s) => s.enabled && !!s.host.trim() && activeProjectSshIds.has(String(s.id)))
     : [];
   const showChatBridgeControls = currentTab?.type === "chat" && (launchableProjectMcps.length > 0 || launchableProjectSsh.length > 0);
+
+  function modelfileHash(snapshot: { fromModel: string; params: ModelfileParamFE[]; systemPrompt: string; nickname: string }): string {
+    const normalizedParams = [...(snapshot.params || [])]
+      .map((p) => ({ key: String(p.key || ""), value: String(p.value || "") }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+    return JSON.stringify({
+      fromModel: String(snapshot.fromModel || "").trim(),
+      systemPrompt: String(snapshot.systemPrompt || ""),
+      nickname: String(snapshot.nickname || ""),
+      params: normalizedParams,
+    });
+  }
+
+  function currentModelfileSnapshot(filename: string, reason: string): ModelfileSnapshot {
+    const data = modelfileDatas[filename];
+    return {
+      fromModel: String(modelfileFromEdits[filename] ?? data?.fromModel ?? ""),
+      params: (modelfileEdits[filename] || data?.params || []).map((p) => ({ ...p })),
+      systemPrompt: String(data?.systemPrompt || ""),
+      nickname: String(data?.nickname || ""),
+      ts: Math.floor(Date.now() / 1000),
+      reason,
+    };
+  }
+
+  function appendModelfileChangeLog(filename: string, event: string, detail: string) {
+    const existing = modelfileChangeLogRef.current[filename] || [];
+    const next = [...existing, { ts: Math.floor(Date.now() / 1000), event, detail }].slice(-300);
+    modelfileChangeLogRef.current = { ...modelfileChangeLogRef.current, [filename]: next };
+    try {
+      localStorage.setItem(MODEFILE_CHANGELOG_STORAGE_KEY, JSON.stringify(modelfileChangeLogRef.current));
+    } catch {}
+  }
+
+  function markModelfileDirtyState(filename: string) {
+    setModelfileDirty((prev) => ({ ...prev, [filename]: true }));
+    setModelfileSavedStatus((prev) => ({ ...prev, [filename]: false }));
+  }
+
+  function recordModelfileStep(filename: string, reason: string) {
+    const snap = currentModelfileSnapshot(filename, reason);
+    const snapHash = modelfileHash(snap);
+    setModelfileHistory((prev) => {
+      const stack = prev[filename] || [];
+      const last = stack.length ? stack[stack.length - 1] : null;
+      if (last && modelfileHash(last) === snapHash) {
+        return prev;
+      }
+      const nextStack = [...stack, snap].slice(-240);
+      return { ...prev, [filename]: nextStack };
+    });
+    appendModelfileChangeLog(filename, "edit", reason);
+  }
+
+  function applyModelfileSnapshot(filename: string, snap: ModelfileSnapshot) {
+    setModelfileFromEdits((prev) => ({ ...prev, [filename]: snap.fromModel }));
+    setModelfileEdits((prev) => ({ ...prev, [filename]: snap.params.map((p) => ({ ...p })) }));
+    setModelfileDatas((prev) => {
+      const current = prev[filename];
+      if (!current) return prev;
+      return {
+        ...prev,
+        [filename]: {
+          ...current,
+          nickname: snap.nickname,
+          displayName: snap.nickname || current.displayName,
+          systemPrompt: snap.systemPrompt,
+          fromModel: snap.fromModel,
+          params: snap.params.map((p) => ({ ...p })),
+        },
+      };
+    });
+    markModelfileDirtyState(filename);
+  }
+
+  function undoModelfileStep(filename: string) {
+    const stack = modelfileHistory[filename] || [];
+    if (!stack.length) return;
+    const popped = stack[stack.length - 1];
+    setModelfileHistory((prev) => ({
+      ...prev,
+      [filename]: (prev[filename] || []).slice(0, -1),
+    }));
+    applyModelfileSnapshot(filename, popped);
+    appendModelfileChangeLog(filename, "undo", popped.reason || "undo");
+  }
+
+  function clearModelfileDraft(filename: string) {
+    const data = modelfileDatas[filename];
+    if (!data) return;
+    recordModelfileStep(filename, "clear-draft");
+    setModelfileFromEdits((prev) => ({ ...prev, [filename]: "" }));
+    setModelfileEdits((prev) => ({
+      ...prev,
+      [filename]: (prev[filename] || data.params || []).map((p) => ({ ...p, value: "" })),
+    }));
+    setModelfileDatas((prev) => ({
+      ...prev,
+      [filename]: {
+        ...(prev[filename] || data),
+        nickname: "",
+        systemPrompt: "",
+      },
+    }));
+    markModelfileDirtyState(filename);
+    appendModelfileChangeLog(filename, "clear", "Cleared draft values");
+  }
+
+  function applyAutomaticModelfileSettings(filename: string) {
+    const data = modelfileDatas[filename];
+    if (!data) return;
+    recordModelfileStep(filename, "automatic-tune");
+    const fromModel = String(modelfileFromEdits[filename] ?? data.fromModel ?? "");
+    const currentParams = modelfileEdits[filename] || data.params || [];
+    const tuned = autoTuneModelfileParams({
+      filename,
+      fromModel,
+      profile: llmProfile,
+      currentParams,
+    });
+    setModelfileEdits((prev) => ({ ...prev, [filename]: tuned }));
+    markModelfileDirtyState(filename);
+    appendModelfileChangeLog(filename, "automatic", `Auto-tuned for ${fromModel || "profile defaults"}`);
+  }
 
   function isProjectBridgeConnected(project: ProjectDef | null): boolean {
     if (!project) return false;
@@ -2839,13 +3110,21 @@ function App() {
     ...(modelConfig.summarizerEnabled ? ["iris-summarizer"] : []),
   ];
   const configuredRouteSummary = `Configured route: ${configuredRouteModels.join(" -> ")}`;
+  const contextPlan = profileContextPlan(llmProfile);
   const organizerFilename = modelfileFilenames.find((name) => name.toLowerCase().includes("organizer")) || "modelfile_organizer.txt";
+  const coderFilename = modelfileFilenames.find((name) => name.toLowerCase().includes("coder")) || "modelfile_coder.txt";
+  const summarizerFilename = modelfileFilenames.find((name) => name.toLowerCase().includes("summarizer")) || "modelfile_summarizer.txt";
+  const visionFilename = modelfileFilenames.find((name) => name.toLowerCase().includes("vision")) || "modelfile_vision.txt";
   const organizerParamsLive = modelfileEdits[organizerFilename] || modelfileDatas[organizerFilename]?.params || [];
-  const organizerNumCtxRaw = organizerParamsLive.find((p) => p.key === "num_ctx")?.value;
-  const organizerNumCtxLive = Number.parseInt(String(organizerNumCtxRaw ?? ""), 10);
-  const liveTokenBudget = Number.isFinite(organizerNumCtxLive) && organizerNumCtxLive > 0
-    ? organizerNumCtxLive
-    : llmCapabilities.tokenBudget;
+  const coderParamsLive = modelfileEdits[coderFilename] || modelfileDatas[coderFilename]?.params || [];
+  const summarizerParamsLive = modelfileEdits[summarizerFilename] || modelfileDatas[summarizerFilename]?.params || [];
+  const visionParamsLive = modelfileEdits[visionFilename] || modelfileDatas[visionFilename]?.params || [];
+  const organizerNumCtxLive = readNumericParam(organizerParamsLive, "num_ctx", contextPlan.organizer);
+  const coderNumCtxLive = readNumericParam(coderParamsLive, "num_ctx", contextPlan.coder);
+  const summarizerNumCtxLive = readNumericParam(summarizerParamsLive, "num_ctx", contextPlan.summarizer);
+  const visionNumCtxLive = readNumericParam(visionParamsLive, "num_ctx", contextPlan.vision);
+  const liveTokenBudget = organizerNumCtxLive;
+  const livePlannerTokenBudget = derivePlannerTokenBudget(llmProfile, organizerNumCtxLive);
   const reposContextActive = llmCapabilities.reposAvailable && reposEnabled;
   const mcpContextActive = llmCapabilities.mcpAvailable && mcpEnabled;
   const safeStringify = (v: unknown) => {
@@ -2858,6 +3137,7 @@ function App() {
   const effectiveFootprint = computeEffectiveContextFootprint({
     profile: llmProfile,
     tokenBudget: liveTokenBudget,
+    plannerBudget: livePlannerTokenBudget,
     reposOn: reposContextActive,
     mcpOn: mcpContextActive,
     multiMcp: llmCapabilities.multiMcpEnabled,
@@ -3940,6 +4220,11 @@ function App() {
       const requestTabId = activeTab;
       const userDisplayText = inputText || `Attached ${images.length} image${images.length === 1 ? "" : "s"}.`;
       updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, images));
+      if (inputText) {
+        updateTabPromptHistory(requestTabId, inputText);
+      }
+      promptHistoryIndexRef.current = -1;
+      promptHistoryDraftRef.current = "";
 
       setInput("");
       queueMicrotask(() => { if (inputRef.current) inputRef.current.style.height = "auto"; });
@@ -4195,8 +4480,7 @@ function App() {
     if (interpretV2Enabled && !quickMode) {
       setThinkingProgress(requestTabId, "Interpreting request...");
       try {
-        const caps = profileCapabilities(llmProfile);
-        const tb = caps.tokenBudget;
+        const tb = livePlannerTokenBudget;
         const enabledCustom = modelConfig.customModels.filter((m) => m.enabled);
         const enabledCustomModels = enabledCustom.map((m) => m.filename.replace(/\.txt$/i, ""));
         const dispatchNote = [
@@ -5138,8 +5422,7 @@ function App() {
       // get_compiled_context: use planner-prepared context when available; otherwise legacy fetch.
       if (!plannerV2?.compiledContext) {
         try {
-          const _caps = profileCapabilities(llmProfile);
-          const _tb = _caps.tokenBudget;
+          const _tb = livePlannerTokenBudget;
           const attempts: any[] = [
             { tabId: requestTabId, tokenBudget: _tb },
             { tab_id: requestTabId, token_budget: _tb },
@@ -5879,21 +6162,25 @@ function App() {
         engineeringTask: engineeringTaskRequest,
         profile: llmProfile,
       });
+      const plannerReviewNumCtx = Math.max(
+        1024,
+        Math.min(organizerNumCtxLive, Math.max(4096, Math.round(livePlannerTokenBudget * 1.4)))
+      );
       const organizerOpts = {
-        num_ctx: 768, num_keep: 24, num_predict: organizerPredictBudget,
+        num_ctx: organizerNumCtxLive, num_keep: 24, num_predict: organizerPredictBudget,
         temperature: 0.25, top_p: 0.9, top_k: 40,
         repeat_penalty: 1.06,
         num_thread: 8, num_batch: 80, num_gpu: 999
       };
       const coderOpts = {
-        num_ctx: 1024, num_keep: 32, num_predict: 384,
+        num_ctx: coderNumCtxLive, num_keep: 32, num_predict: 384,
         temperature: 0.20, top_p: 0.90, top_k: 40,
         repeat_penalty: 1.06, repeat_last_n: 128,
         num_thread: 8, num_batch: 8, num_gpu: 100
       };
       // Vision model optimization: use smaller context for faster image analysis
       const visionOpts = {
-        num_ctx: 2048, num_keep: 0, num_predict: 512,
+        num_ctx: visionNumCtxLive, num_keep: 0, num_predict: 512,
         temperature: 0.32, top_p: 0.9, top_k: 40,
         repeat_penalty: 1.06,
         num_thread: 8, num_batch: 8, num_gpu: 999  // Max GPU for vision
@@ -6099,7 +6386,8 @@ function App() {
           if (llmProfile === "Low" || llmProfile === "Minimal") {
             const footprint = computeEffectiveContextFootprint({
               profile: llmProfile,
-              tokenBudget: profileCapabilities(llmProfile).tokenBudget,
+              tokenBudget: liveTokenBudget,
+              plannerBudget: livePlannerTokenBudget,
               reposOn: reposContextActive,
               mcpOn: mcpContextActive,
               multiMcp: false,
@@ -6216,7 +6504,7 @@ function App() {
                   "If no tool can help, output exactly: NO_TOOL_CALL",
                 ].join("\n\n"),
                 options: {
-                  num_ctx: 1024,
+                  num_ctx: plannerReviewNumCtx,
                   num_keep: 24,
                   num_predict: 220,
                   temperature: 0.1,
@@ -6360,7 +6648,7 @@ function App() {
               model: "iris-organizer:latest",
               prompt: reviewPrompt,
               options: {
-                num_ctx: 1024,
+                num_ctx: plannerReviewNumCtx,
                 num_keep: 24,
                 num_predict: 600,
                 temperature: 0.15,
@@ -6840,6 +7128,51 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
   }
 
   useEffect(() => {
+    try {
+      const rawHistory = localStorage.getItem(MODEFILE_HISTORY_STORAGE_KEY);
+      if (rawHistory) {
+        const parsed = JSON.parse(rawHistory);
+        if (parsed && typeof parsed === "object") {
+          setModelfileHistory(parsed as Record<string, ModelfileSnapshot[]>);
+        }
+      }
+    } catch {}
+    try {
+      const rawLog = localStorage.getItem(MODEFILE_CHANGELOG_STORAGE_KEY);
+      if (rawLog) {
+        const parsed = JSON.parse(rawLog);
+        if (parsed && typeof parsed === "object") {
+          modelfileChangeLogRef.current = parsed as Record<string, ModelfileChangeEntry[]>;
+        }
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MODEFILE_HISTORY_STORAGE_KEY, JSON.stringify(modelfileHistory));
+    } catch {}
+  }, [modelfileHistory]);
+
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      for (const filename of modelfileFilenames) {
+        const snap = currentModelfileSnapshot(filename, "session-close");
+        const currentHash = modelfileHash(snap);
+        const baselineHash = modelfileBaselineHashRef.current[filename] || "";
+        const changed = baselineHash !== currentHash;
+        appendModelfileChangeLog(filename, "session_close", changed ? "changed" : "unchanged");
+      }
+      try {
+        localStorage.setItem(MODEFILE_HISTORY_STORAGE_KEY, JSON.stringify(modelfileHistory));
+        localStorage.setItem(MODEFILE_CHANGELOG_STORAGE_KEY, JSON.stringify(modelfileChangeLogRef.current));
+      } catch {}
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [modelfileFilenames, modelfileHistory, modelfileDatas, modelfileEdits, modelfileFromEdits]);
+
+  useEffect(() => {
     if (settingsTab !== "LLMs" || modelfileLoadedRef.current) return;
     let cancelled = false;
 
@@ -6887,15 +7220,28 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         const dataMap: Record<string, ModelfileDataFE> = {};
         const paramsMap: Record<string, ModelfileParamFE[]> = {};
         const fromMap: Record<string, string> = {};
+        const baselineHashMap: Record<string, string> = {};
+        const cleanFlags: Record<string, boolean> = {};
         for (const row of rows) {
           dataMap[row.filename] = row;
           paramsMap[row.filename] = row.params.map((p) => ({ ...p }));
           fromMap[row.filename] = row.fromModel;
+          baselineHashMap[row.filename] = modelfileHash({
+            fromModel: row.fromModel,
+            params: row.params,
+            systemPrompt: row.systemPrompt,
+            nickname: row.nickname,
+          });
+          cleanFlags[row.filename] = false;
+          appendModelfileChangeLog(row.filename, "session_open", "loaded");
         }
 
         setModelfileDatas(dataMap);
         setModelfileEdits(paramsMap);
         setModelfileFromEdits(fromMap);
+        setModelfileDirty(cleanFlags);
+        setModelfileSavedStatus(cleanFlags);
+        modelfileBaselineHashRef.current = baselineHashMap;
         setModelfileFilenames(ordered);
         if (ordered.length > 0) setModelfileSubTab(ordered[0]);
         modelfileLoadedRef.current = true;
@@ -6912,10 +7258,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
   }, [settingsTab]);
 
   function updateModelfileParam(filename: string, key: string, nextValue: string) {
+    recordModelfileStep(filename, `param:${key}`);
     setModelfileEdits((prev) => ({
       ...prev,
       [filename]: (prev[filename] || []).map((p) => (p.key === key ? { ...p, value: nextValue } : p)),
     }));
+    markModelfileDirtyState(filename);
   }
 
   async function saveModelfile(filename: string, opts?: { systemPrompt?: string; nickname?: string }) {
@@ -6963,6 +7311,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           },
         };
       });
+      const savedSnapshot: ModelfileSnapshot = {
+        fromModel,
+        params: params.map((p) => ({ ...p })),
+        systemPrompt: String(opts?.systemPrompt ?? modelfileDatas[filename]?.systemPrompt ?? ""),
+        nickname: String(opts?.nickname ?? modelfileDatas[filename]?.nickname ?? ""),
+        ts: Math.floor(Date.now() / 1000),
+        reason: "save",
+      };
+      modelfileBaselineHashRef.current = {
+        ...modelfileBaselineHashRef.current,
+        [filename]: modelfileHash(savedSnapshot),
+      };
+      setModelfileDirty((prev) => ({ ...prev, [filename]: false }));
+      setModelfileSavedStatus((prev) => ({ ...prev, [filename]: true }));
+      appendModelfileChangeLog(filename, "save", "Saved modelfile");
       setModelfileLoadError(null);
     } catch (err: any) {
       alert("Failed to save modelfile: " + (err?.message || String(err)));
@@ -6990,6 +7353,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       setModelfileDatas((prev) => ({ ...prev, [filename]: loaded }));
       setModelfileEdits((prev) => ({ ...prev, [filename]: loaded.params.map((p) => ({ ...p })) }));
       setModelfileFromEdits((prev) => ({ ...prev, [filename]: loaded.fromModel }));
+      setModelfileDirty((prev) => ({ ...prev, [filename]: false }));
+      setModelfileSavedStatus((prev) => ({ ...prev, [filename]: false }));
+      modelfileBaselineHashRef.current = {
+        ...modelfileBaselineHashRef.current,
+        [filename]: modelfileHash({
+          fromModel: loaded.fromModel,
+          params: loaded.params,
+          systemPrompt: loaded.systemPrompt,
+          nickname: loaded.nickname,
+        }),
+      };
+      appendModelfileChangeLog(filename, "create", "Created custom modelfile");
       setModelfileFilenames((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
       setModelfileSubTab(filename);
 
@@ -7030,6 +7405,22 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         delete next[model.filename];
         return next;
       });
+      setModelfileDirty((prev) => {
+        const next = { ...prev };
+        delete next[model.filename];
+        return next;
+      });
+      setModelfileSavedStatus((prev) => {
+        const next = { ...prev };
+        delete next[model.filename];
+        return next;
+      });
+      setModelfileHistory((prev) => {
+        const next = { ...prev };
+        delete next[model.filename];
+        return next;
+      });
+      appendModelfileChangeLog(model.filename, "delete", "Deleted custom modelfile");
       setModelfileFilenames((prev) => prev.filter((n) => n !== model.filename));
       if (modelfileSubTab === model.filename) {
         setModelfileSubTab("modelfile_organizer.txt");
@@ -8499,7 +8890,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   }}
                 />
               ) : (
-                tab.title
+                <span title={tab.title}>
+                  {tab.type === "chat" ? displayChatTabTitle(tab.title) : tab.title}
+                </span>
               )}
             </button>
             {(tab.type === "chat" || tab.type === "settings" || tab.type === "tools" || tab.type === "agent-stats") && (
@@ -10619,16 +11012,61 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
                 {!!modelfileSubTab && modelfileDatas[modelfileSubTab] && (
                   <div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+                      <button
+                        className="setup-btn"
+                        onClick={() => applyAutomaticModelfileSettings(modelfileSubTab)}
+                        title="Auto-detect practical settings from active profile and base model size"
+                      >
+                        Automatic
+                      </button>
+                      <button
+                        className="setup-btn"
+                        disabled={!((modelfileHistory[modelfileSubTab] || []).length)}
+                        onClick={() => undoModelfileStep(modelfileSubTab)}
+                        title="Undo one recorded modelfile edit step"
+                      >
+                        Undo
+                      </button>
+                      <button
+                        className="setup-btn"
+                        onClick={() => clearModelfileDraft(modelfileSubTab)}
+                        title="Clear current draft values for this modelfile"
+                      >
+                        Clear
+                      </button>
+                      <button
+                        className="setup-btn primary"
+                        disabled={!!modelfileSaving[modelfileSubTab] || (!!modelfileSavedStatus[modelfileSubTab] && !modelfileDirty[modelfileSubTab])}
+                        style={!!modelfileSavedStatus[modelfileSubTab] && !modelfileDirty[modelfileSubTab]
+                          ? { background: "#6a6f78", borderColor: "#6a6f78", color: "#e7eaef", cursor: "default" }
+                          : undefined}
+                        onClick={() => saveModelfile(modelfileSubTab, {
+                          systemPrompt: ["modelfile_organizer.txt", "modelfile_coder.txt", "modelfile_summarizer.txt", "modelfile_vision.txt"].includes(modelfileSubTab)
+                            ? undefined
+                            : modelfileDatas[modelfileSubTab]?.systemPrompt,
+                          nickname: ["modelfile_organizer.txt", "modelfile_coder.txt", "modelfile_summarizer.txt", "modelfile_vision.txt"].includes(modelfileSubTab)
+                            ? undefined
+                            : modelfileDatas[modelfileSubTab]?.nickname,
+                        })}
+                      >
+                        {modelfileSaving[modelfileSubTab]
+                          ? "Saving..."
+                          : (!!modelfileSavedStatus[modelfileSubTab] && !modelfileDirty[modelfileSubTab] ? "Saved!" : "Save Modelfile")}
+                      </button>
+                    </div>
                     <div style={{ marginBottom: 10 }}>
                       <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>FROM model</label>
                       <input
                         value={modelfileFromEdits[modelfileSubTab] || ""}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          recordModelfileStep(modelfileSubTab, "from-model");
                           setModelfileFromEdits((prev) => ({
                             ...prev,
                             [modelfileSubTab]: e.target.value,
-                          }))
-                        }
+                          }));
+                          markModelfileDirtyState(modelfileSubTab);
+                        }}
                         style={{ width: "100%", maxWidth: 520, padding: "8px 10px", borderRadius: 6, background: "var(--app-input-bg)", color: "var(--app-text)", border: "1px solid var(--app-border)" }}
                       />
                       {!(["modelfile_organizer.txt", "modelfile_coder.txt", "modelfile_summarizer.txt", "modelfile_vision.txt"].includes(modelfileSubTab)) && (
@@ -10637,6 +11075,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           <input
                             value={modelfileDatas[modelfileSubTab]?.nickname || ""}
                             onChange={(e) => {
+                              recordModelfileStep(modelfileSubTab, "nickname");
                               const nextNick = e.target.value;
                               setModelfileDatas((prev) => ({
                                 ...prev,
@@ -10646,6 +11085,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                                   displayName: nextNick || prev[modelfileSubTab]?.displayName || modelfileSubTab,
                                 },
                               }));
+                              markModelfileDirtyState(modelfileSubTab);
                             }}
                             style={{ width: "100%", maxWidth: 520, padding: "8px 10px", borderRadius: 6, background: "var(--app-input-bg)", color: "var(--app-text)", border: "1px solid var(--app-border)" }}
                           />
@@ -10655,6 +11095,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                             rows={6}
                             value={modelfileDatas[modelfileSubTab]?.systemPrompt || ""}
                             onChange={(e) => {
+                              recordModelfileStep(modelfileSubTab, "system-prompt");
                               const nextPrompt = e.target.value;
                               setModelfileDatas((prev) => ({
                                 ...prev,
@@ -10663,6 +11104,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                                   systemPrompt: nextPrompt,
                                 },
                               }));
+                              markModelfileDirtyState(modelfileSubTab);
                             }}
                             style={{ width: "100%", boxSizing: "border-box", borderRadius: 6, border: "1px solid var(--app-border)", background: "var(--app-input-bg)", color: "var(--app-text)", padding: 8 }}
                           />
@@ -10707,21 +11149,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                         </div>
                       ))}
                     </div>
-
-                    <button
-                      className="setup-btn primary"
-                      disabled={!!modelfileSaving[modelfileSubTab]}
-                      onClick={() => saveModelfile(modelfileSubTab, {
-                        systemPrompt: ["modelfile_organizer.txt", "modelfile_coder.txt", "modelfile_summarizer.txt", "modelfile_vision.txt"].includes(modelfileSubTab)
-                          ? undefined
-                          : modelfileDatas[modelfileSubTab]?.systemPrompt,
-                        nickname: ["modelfile_organizer.txt", "modelfile_coder.txt", "modelfile_summarizer.txt", "modelfile_vision.txt"].includes(modelfileSubTab)
-                          ? undefined
-                          : modelfileDatas[modelfileSubTab]?.nickname,
-                      })}
-                    >
-                      {modelfileSaving[modelfileSubTab] ? "Saving..." : "Save Modelfile"}
-                    </button>
                   </div>
                 )}
               </div>
@@ -10753,11 +11180,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   </div>
                   <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#2f465f" : "#9fb2c9" }}>
                     This score estimates cognitive bandwidth load for the active profile and tools. Inputs:
-                    profile base + live token budget (`num_ctx` from Organizer, if edited) + repo load + MCP load + planner + network.
+                    profile base + live Organizer context (`num_ctx`) + planner memory budget + repo load + MCP load + planner + network.
                     Lower scores favor responsiveness on constrained hardware; higher scores favor richer context handling.
                   </div>
                   <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#2f465f" : "#9fb2c9" }}>
                     This score represents the estimated VRAM and cognitive load on your system. Higher scores allow for deeper project memory but may increase response latency.
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 12, color: isLightMode ? "#2f465f" : "#9fb2c9", lineHeight: 1.45 }}>
+                    Active context windows (live): Organizer {organizerNumCtxLive.toLocaleString()} · Coder {coderNumCtxLive.toLocaleString()} · Summarizer {summarizerNumCtxLive.toLocaleString()} · Vision {visionNumCtxLive.toLocaleString()}.
+                    Planner memory budget: {livePlannerTokenBudget.toLocaleString()} tokens.
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#2f465f" : "#9fb2c9", lineHeight: 1.45 }}>
+                    Recommended profile baseline: Organizer {contextPlan.organizer.toLocaleString()} · Coder {contextPlan.coder.toLocaleString()} · Summarizer {contextPlan.summarizer.toLocaleString()} · Vision {contextPlan.vision.toLocaleString()}.
                   </div>
                 </div>
                 <div style={{ marginBottom: 8, color: "var(--app-text)", fontWeight: 600, fontSize: 13 }}>Performance Guide</div>
@@ -10772,32 +11206,32 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
                   <div className="perf-guide-cell perf-guide-profile ultra">Ultra</div>
                   <div className="perf-guide-cell">VRAM ≥ 16 GB (e.g., RTX 3090 / 4090)</div>
-                  <div className="perf-guide-cell">Fastest, highest quality, max context (8K+)</div>
+                  <div className="perf-guide-cell">Fastest quality, very large context (16K organizer baseline)</div>
                   <div className="perf-guide-cell">Full RAG · Multi-MCP · Deep reasoning loops</div>
 
                   <div className="perf-guide-cell perf-guide-profile high">High</div>
                   <div className="perf-guide-cell">VRAM ≥ 12 GB (e.g., RTX 3060 12 GB / 4070 Ti)</div>
-                  <div className="perf-guide-cell">Excellent quality, large context (4K)</div>
+                  <div className="perf-guide-cell">Excellent quality, large context (12K organizer baseline)</div>
                   <div className="perf-guide-cell">Full RAG · Multi-MCP · Extended loops</div>
 
                   <div className="perf-guide-cell perf-guide-profile mediumhigh">Medium-High</div>
                   <div className="perf-guide-cell">VRAM ≈ 8 GB + RAM ≥ 32 GB — Developer Baseline</div>
-                  <div className="perf-guide-cell">Solid 7B performance, 3–4K context window</div>
+                  <div className="perf-guide-cell">Solid 7B performance, 8K organizer baseline</div>
                   <div className="perf-guide-cell">Full RAG · Multi-MCP · Standard loops</div>
 
                   <div className="perf-guide-cell perf-guide-profile medium">Medium</div>
                   <div className="perf-guide-cell">VRAM 6–8 GB + RAM ≥ 16 GB</div>
-                  <div className="perf-guide-cell">Balanced 3B–7B models, 1.5–2K context</div>
+                  <div className="perf-guide-cell">Balanced 3B–7B models, 6K organizer baseline</div>
                   <div className="perf-guide-cell">Basic Repo context · Single-tool MCP</div>
 
                   <div className="perf-guide-cell perf-guide-profile low">Low</div>
                   <div className="perf-guide-cell">VRAM ≤ 4 GB or RAM &lt; 16 GB</div>
-                  <div className="perf-guide-cell">Lightweight 1.5–3B models, 1K context</div>
+                  <div className="perf-guide-cell">Lightweight 1.5–3B models, 3K organizer baseline</div>
                   <div className="perf-guide-cell">Repos OFF · MCP OFF (auto-gated)</div>
 
                   <div className="perf-guide-cell perf-guide-profile minimal">Minimal</div>
                   <div className="perf-guide-cell">CPU only / no dedicated GPU</div>
-                  <div className="perf-guide-cell">Smallest footprint, slow generation</div>
+                  <div className="perf-guide-cell">Smallest footprint, 2K organizer baseline</div>
                   <div className="perf-guide-cell">Repos OFF · MCP OFF (auto-gated)</div>
                 </div>
               </div>
@@ -11194,12 +11628,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             onInput={autoResize}
             onPaste={(e) => { void handleChatPaste(e); }}
             onKeyDown={(e) => {
-              if (e.key === "ArrowUp" && !e.shiftKey) {
+              const target = e.currentTarget;
+              const caretStart = target.selectionStart ?? 0;
+              const caretEnd = target.selectionEnd ?? caretStart;
+              const hasSelection = caretEnd !== caretStart;
+              const beforeCaret = target.value.slice(0, caretStart);
+              const afterCaret = target.value.slice(caretStart);
+              const atFirstLine = beforeCaret.indexOf("\n") === -1;
+              const atLastLine = afterCaret.indexOf("\n") === -1;
+
+              if (e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !hasSelection && atFirstLine) {
                 e.preventDefault();
                 recallPromptHistory("older");
                 return;
               }
-              if (e.key === "ArrowDown" && !e.shiftKey && promptHistoryIndexRef.current >= 0) {
+              if (e.key === "ArrowDown" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !hasSelection && atLastLine && promptHistoryIndexRef.current >= 0) {
                 e.preventDefault();
                 recallPromptHistory("newer");
                 return;

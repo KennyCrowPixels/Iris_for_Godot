@@ -11,7 +11,7 @@ You are Iris-Coder. Produce correct, minimal, runnable code.
 - No chain-of-thought.
 """
 
-PARAMETER num_ctx 3072
+PARAMETER num_ctx 6144
 PARAMETER num_keep 48
 PARAMETER num_predict 896
 PARAMETER temperature 0.20

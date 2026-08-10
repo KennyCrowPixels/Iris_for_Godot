@@ -36,14 +36,13 @@ export default function useOllamaStream() {
     // Determine which endpoint to use: /api/chat for messages, /api/generate for prompt
     const useChat = messages && messages.length > 0;
     const endpoint = useChat ? 'http://127.0.0.1:11434/api/chat' : 'http://127.0.0.1:11434/api/generate';
-    
     const requestBody = useChat
       ? {
           model,
           messages,
           stream: true,
           keep_alive: "90s",
-          ...(options || {}),
+          ...(options ? { options } : {}),
         }
       : {
           model,
@@ -51,7 +50,7 @@ export default function useOllamaStream() {
           prompt: prompt || "",
           stream: true,
           keep_alive: "90s",
-          ...(model === "iris-coder:latest" ? {} : { options }),
+          ...(options ? { options } : {}),
         };
 
     const fetchOptions = {

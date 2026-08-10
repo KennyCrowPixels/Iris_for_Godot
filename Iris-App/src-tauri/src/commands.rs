@@ -6740,36 +6740,36 @@ pub struct ApplyModelProfileResult {
 
 fn profile_params(profile: ModelProfile, role: &str) -> (usize, usize, usize, f32, f32, usize, f32, usize) {
   match (profile, role) {
-    (ModelProfile::Ultra, "organizer") => (8192, 64, 1536, 0.22, 0.92, 48, 1.06, 192),
-    (ModelProfile::Ultra, "coder") => (6144, 64, 1200, 0.18, 0.90, 48, 1.06, 192),
-    (ModelProfile::Ultra, "summarizer") => (2048, 32, 240, 0.08, 0.60, 24, 1.10, 128),
-    (ModelProfile::Ultra, "vision") => (4096, 64, 1400, 0.30, 0.90, 40, 1.07, 192),
+    (ModelProfile::Ultra, "organizer") => (16384, 64, 1536, 0.22, 0.92, 48, 1.06, 192),
+    (ModelProfile::Ultra, "coder") => (12288, 64, 1200, 0.18, 0.90, 48, 1.06, 192),
+    (ModelProfile::Ultra, "summarizer") => (4096, 32, 240, 0.08, 0.60, 24, 1.10, 128),
+    (ModelProfile::Ultra, "vision") => (8192, 64, 1400, 0.30, 0.90, 40, 1.07, 192),
 
-    (ModelProfile::High, "organizer") => (4096, 48, 1200, 0.24, 0.90, 40, 1.06, 160),
-    (ModelProfile::High, "coder") => (3072, 48, 900, 0.20, 0.90, 40, 1.06, 160),
-    (ModelProfile::High, "summarizer") => (1536, 24, 220, 0.09, 0.60, 24, 1.10, 128),
-    (ModelProfile::High, "vision") => (2048, 48, 1100, 0.32, 0.90, 40, 1.07, 192),
+    (ModelProfile::High, "organizer") => (12288, 48, 1200, 0.24, 0.90, 40, 1.06, 160),
+    (ModelProfile::High, "coder") => (8192, 48, 900, 0.20, 0.90, 40, 1.06, 160),
+    (ModelProfile::High, "summarizer") => (3072, 24, 220, 0.09, 0.60, 24, 1.10, 128),
+    (ModelProfile::High, "vision") => (6144, 48, 1100, 0.32, 0.90, 40, 1.07, 192),
 
-    // MediumHigh: 8 GB VRAM + 32 GB RAM â€” Developer Baseline (7B models, 3-4K context)
-    (ModelProfile::MediumHigh, "organizer") => (4096, 48, 1100, 0.24, 0.90, 40, 1.06, 160),
-    (ModelProfile::MediumHigh, "coder") => (3072, 48, 896, 0.20, 0.90, 40, 1.06, 160),
-    (ModelProfile::MediumHigh, "summarizer") => (1536, 24, 200, 0.09, 0.60, 24, 1.10, 128),
-    (ModelProfile::MediumHigh, "vision") => (2048, 48, 1000, 0.32, 0.90, 40, 1.07, 192),
+    // MediumHigh: 8 GB VRAM + 32 GB RAM — Developer Baseline
+    (ModelProfile::MediumHigh, "organizer") => (8192, 48, 1100, 0.24, 0.90, 40, 1.06, 160),
+    (ModelProfile::MediumHigh, "coder") => (6144, 48, 896, 0.20, 0.90, 40, 1.06, 160),
+    (ModelProfile::MediumHigh, "summarizer") => (2560, 24, 200, 0.09, 0.60, 24, 1.10, 128),
+    (ModelProfile::MediumHigh, "vision") => (4096, 48, 1000, 0.32, 0.90, 40, 1.07, 192),
 
-    (ModelProfile::Medium, "organizer") => (2048, 32, 896, 0.25, 0.90, 40, 1.06, 160),
-    (ModelProfile::Medium, "coder") => (1536, 32, 700, 0.20, 0.90, 40, 1.06, 128),
-    (ModelProfile::Medium, "summarizer") => (1024, 20, 160, 0.10, 0.60, 30, 1.10, 160),
-    (ModelProfile::Medium, "vision") => (1536, 48, 1000, 0.35, 0.90, 40, 1.07, 192),
+    (ModelProfile::Medium, "organizer") => (6144, 32, 896, 0.25, 0.90, 40, 1.06, 160),
+    (ModelProfile::Medium, "coder") => (4096, 32, 700, 0.20, 0.90, 40, 1.06, 128),
+    (ModelProfile::Medium, "summarizer") => (2048, 20, 160, 0.10, 0.60, 30, 1.10, 160),
+    (ModelProfile::Medium, "vision") => (3072, 48, 1000, 0.35, 0.90, 40, 1.07, 192),
 
-    (ModelProfile::Low, "organizer") => (1280, 24, 640, 0.24, 0.88, 32, 1.06, 128),
-    (ModelProfile::Low, "coder") => (1024, 24, 520, 0.18, 0.88, 32, 1.06, 96),
-    (ModelProfile::Low, "summarizer") => (768, 16, 128, 0.08, 0.58, 24, 1.10, 96),
-    (ModelProfile::Low, "vision") => (1024, 32, 800, 0.32, 0.88, 32, 1.07, 128),
+    (ModelProfile::Low, "organizer") => (3072, 24, 640, 0.24, 0.88, 32, 1.06, 128),
+    (ModelProfile::Low, "coder") => (2048, 24, 520, 0.18, 0.88, 32, 1.06, 96),
+    (ModelProfile::Low, "summarizer") => (1280, 16, 128, 0.08, 0.58, 24, 1.10, 96),
+    (ModelProfile::Low, "vision") => (2048, 32, 800, 0.32, 0.88, 32, 1.07, 128),
 
-    (ModelProfile::Minimal, "organizer") => (896, 16, 480, 0.22, 0.85, 24, 1.05, 96),
-    (ModelProfile::Minimal, "coder") => (768, 16, 420, 0.16, 0.85, 24, 1.05, 80),
-    (ModelProfile::Minimal, "summarizer") => (512, 12, 96, 0.07, 0.55, 20, 1.10, 64),
-    (ModelProfile::Minimal, "vision") => (768, 24, 640, 0.30, 0.85, 24, 1.06, 96),
+    (ModelProfile::Minimal, "organizer") => (2048, 16, 480, 0.22, 0.85, 24, 1.05, 96),
+    (ModelProfile::Minimal, "coder") => (1536, 16, 420, 0.16, 0.85, 24, 1.05, 80),
+    (ModelProfile::Minimal, "summarizer") => (1024, 12, 96, 0.07, 0.55, 20, 1.10, 64),
+    (ModelProfile::Minimal, "vision") => (1536, 24, 640, 0.30, 0.85, 24, 1.06, 96),
     _ => (1024, 24, 512, 0.20, 0.90, 40, 1.06, 128),
   }
 }
@@ -7143,10 +7143,21 @@ pub fn create_custom_modelfile(app: tauri::AppHandle, filename: String, nickname
   if path.exists() {
     return Err(format!("File {} already exists", fname));
   }
+  let active_profile = ModelProfile::parse(&read_setup_flags(&app).model_profile);
+  let (num_ctx, num_keep, num_predict, temperature, top_p, top_k, repeat_penalty, repeat_last_n) =
+    profile_params(active_profile, "organizer");
   let safe_nick = nickname.trim();
   let content = format!(
-    "# NICKNAME: {}\nFROM llama3\n\nSYSTEM \"\"\"\nYou are a helpful assistant.\n\"\"\"\n\nPARAMETER num_ctx 4096\nPARAMETER temperature 0.7\n",
-    safe_nick
+    "# NICKNAME: {}\nFROM llama3\n\nSYSTEM \"\"\"\nYou are a helpful assistant.\n\"\"\"\n\nPARAMETER num_ctx {}\nPARAMETER num_keep {}\nPARAMETER num_predict {}\nPARAMETER temperature {:.2}\nPARAMETER top_p {:.2}\nPARAMETER top_k {}\nPARAMETER repeat_penalty {:.2}\nPARAMETER repeat_last_n {}\n",
+    safe_nick,
+    num_ctx,
+    num_keep,
+    num_predict,
+    temperature,
+    top_p,
+    top_k,
+    repeat_penalty,
+    repeat_last_n
   );
   atomic_write_text(&path, &content).map_err(|e| format!("Failed to create {}: {}", fname, e))
 }

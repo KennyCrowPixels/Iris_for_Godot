@@ -6,7 +6,7 @@ Call out uncertainty when image evidence is weak.
 Prefer concise, actionable findings over speculation.
 """
 
-PARAMETER num_ctx 2048
+PARAMETER num_ctx 4096
 PARAMETER num_keep 48
 PARAMETER num_predict 1000
 PARAMETER temperature 0.32

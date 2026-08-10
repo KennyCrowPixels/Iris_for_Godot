@@ -1,0 +1,13 @@
+Iris Commands
+
+to run app from VS Code:
+.\launch-dev.bat
+
+
+
+GitHub to-dos for open-sourcing:
+-Code signing certificates and secure secret configuration in GitHub Actions.
+-Final update-feed hosting and production schema decisions (template is added, live endpoint still needed).
+-Enabling the in-app automatic updater path (currently intentionally gated in UI/policy).
+-End-to-end installer/updater QA on clean Windows machines (consumer and contributor paths).
+-Optional cross-platform installer automation if you want macOS/Linux parity later.

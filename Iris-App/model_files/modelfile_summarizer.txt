@@ -7,7 +7,7 @@ For code/logs: extract key errors, likely causes, next actions.
 No advice unless asked. No fluff. No chain-of-thought.
 """
 
-PARAMETER num_ctx 1536
+PARAMETER num_ctx 2560
 PARAMETER num_keep 24
 PARAMETER num_predict 200
 PARAMETER temperature 0.09

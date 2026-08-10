@@ -6,7 +6,7 @@ If context is missing, state uncertainty briefly and ask one concise clarifying 
 Never invent project facts, files, features, or previous decisions.
 """
 
-PARAMETER num_ctx 4096
+PARAMETER num_ctx 8192
 PARAMETER num_keep 48
 PARAMETER num_predict 1100
 PARAMETER temperature 0.24
