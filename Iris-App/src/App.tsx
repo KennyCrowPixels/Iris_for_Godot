@@ -2468,6 +2468,7 @@ function App() {
   const [rustEngineStatus, setRustEngineStatus] = useState("");
   const [globalRuntimeState, setGlobalRuntimeState] = useState<CognitiveRuntimeStatePayload | null>(null);
   const [runtimeStateByTab, setRuntimeStateByTab] = useState<Record<number, CognitiveRuntimeStatePayload>>({});
+  const [runtimeControlBusy, setRuntimeControlBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
   const [input, setInput] = useState("");
@@ -3957,6 +3958,31 @@ function App() {
       if (unlistenFn) unlistenFn();
     };
   }, [useRustEngine]);
+
+  async function runRuntimeControl(action: "pause" | "resume" | "reset_idle") {
+    if (runtimeControlBusy) return;
+    try {
+      setRuntimeControlBusy(true);
+      const next = await invoke<CognitiveRuntimeStatePayload>("transition_cognitive_runtime_state", {
+        args: {
+          action,
+          reason: action === "pause" ? "paused_from_frontend" : undefined,
+        },
+      });
+      if (next && typeof next === "object") {
+        setGlobalRuntimeState(next);
+        const tabId = parseRuntimeTabId(next.goalId);
+        if (tabId != null) {
+          setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: next }));
+        }
+      }
+      setRustEngineStatus(`Runtime control applied: ${action}`);
+    } catch (err: any) {
+      setRustEngineStatus(`Runtime control failed: ${String(err?.message || err || action)}`);
+    } finally {
+      setRuntimeControlBusy(false);
+    }
+  }
 
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
@@ -11697,10 +11723,37 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             const iter = Number.isFinite(runtimeState.iterationCount) ? runtimeState.iterationCount : 0;
 
             return (
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 11, color: isLightMode ? "#4b647c" : "#9fb2c9" }}>
                   Runtime: {phaseLabel}{step ? ` | step: ${step}` : ""}{model ? ` | model: ${model}` : ""}{iter > 0 ? ` | iter: ${iter}` : ""}
                 </span>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase === "paused" || runtimeState.phase === "completed" || runtimeState.phase === "failed" || runtimeState.phase === "idle"}
+                  onClick={() => { void runRuntimeControl("pause"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Pause
+                </button>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase !== "paused"}
+                  onClick={() => { void runRuntimeControl("resume"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Resume
+                </button>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase === "idle"}
+                  onClick={() => { void runRuntimeControl("reset_idle"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Reset
+                </button>
               </div>
             );
           })()}
