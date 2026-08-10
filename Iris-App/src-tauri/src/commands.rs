@@ -308,9 +308,39 @@ pub async fn submit_turn(
     // Standard chat path — attach tools only when the user's request actually needs them.
     println!("[Routing] Standard Chat Payload (intent-gated tools)");
 
+    let goal_id = format!("tab{}_{}", payload.tab_id, now_ts());
+    let _ = transition_cognitive_runtime_state_internal(
+      &app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "start_planning".to_string(),
+        goal_id: Some(goal_id.clone()),
+        goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+        current_step: Some("compile_agent_context".to_string()),
+        active_model: None,
+        reason: None,
+      },
+    );
+    let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> planning".to_string()));
+
     match compile_agent_context(&app, &payload).await {
       Ok(context) => {
         let selected_model = resolve_submit_model(&app, &payload);
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "start_executing".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("execute_ollama_chat_stream".to_string()),
+            active_model: Some(selected_model.clone()),
+            reason: None,
+          },
+        );
+        let _ = window.emit(&event_name, IrisEvent::Status(format!(
+          "Runtime phase -> executing ({})",
+          selected_model
+        )));
+
         let historical_count = context.messages.len().saturating_sub(1);
         let msg = format!(
           "Rust Context Built: {} historical messages loaded. System Prompt length: {}. Model: {}",
@@ -349,14 +379,62 @@ pub async fn submit_turn(
         let request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
         match execute_ollama_chat_stream(&window, &event_name, &request).await {
           Ok(reply) => {
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "start_qa".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("persist_turn_snapshot".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: None,
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> qa".to_string()));
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "complete".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("done".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: None,
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> completed".to_string()));
           }
-          Err(_) => {
+          Err(err) => {
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, "");
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "fail".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("execute_ollama_chat_stream".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: Some(err),
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
           }
         }
       }
       Err(e) => {
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "fail".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("compile_agent_context".to_string()),
+            active_model: None,
+            reason: Some(e.clone()),
+          },
+        );
+        let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
         let _ = window.emit(&event_name, IrisEvent::Error(e));
         let _ = window.emit(&event_name, IrisEvent::Done);
       }
@@ -2829,6 +2907,13 @@ pub fn get_cognitive_runtime_state(app: tauri::AppHandle) -> Result<CognitiveRun
 pub fn transition_cognitive_runtime_state(
   app: tauri::AppHandle,
   args: CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  transition_cognitive_runtime_state_internal(&app, &args)
+}
+
+fn transition_cognitive_runtime_state_internal(
+  app: &tauri::AppHandle,
+  args: &CognitiveRuntimeTransitionArgs,
 ) -> Result<CognitiveRuntimeState, String> {
   let current = read_cognitive_runtime_state(&app);
   let next = apply_cognitive_runtime_transition(current, &args)?;
@@ -5728,6 +5813,23 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   if !flags.interpret_v2_enabled {
     return Err("interpret_v2 is disabled by setup flags".to_string());
   }
+
+  let runtime_before = read_cognitive_runtime_state(&app);
+  let planning_action = match runtime_before.phase {
+    CognitiveRuntimePhase::Idle | CognitiveRuntimePhase::Completed | CognitiveRuntimePhase::Failed => "start_planning",
+    _ => "update_progress",
+  };
+  let _ = transition_cognitive_runtime_state_internal(
+    &app,
+    &CognitiveRuntimeTransitionArgs {
+      action: planning_action.to_string(),
+      goal_id: Some(format!("tab{}_{}", args.tab_id, now_ts())),
+      goal_label: Some(format!("Tab {} planning", args.tab_id)),
+      current_step: Some("interpret_turn_v2".to_string()),
+      active_model: Some("iris-organizer:latest".to_string()),
+      reason: None,
+    },
+  );
 
   let mem = load_tab(&app, args.tab_id)?;
   let compiled = compile_context_from_mem(&mem, args.token_budget.unwrap_or(1200));
