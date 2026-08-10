@@ -18,7 +18,8 @@ if ($LASTEXITCODE -ne 0) {
 $milestoneDesc = "Deliver Iris cognitive-runtime overhaul with autonomous phase planning, anti-loop safeguards, non-destructive memory tree, transparent state editing, and real-time progress including current model name."
 
 Write-Host "Ensuring milestone exists: $MilestoneTitle"
-$msCheck = & $gh api "repos/$Owner/$Repo/milestones?state=all" --jq ".[] | select(.title == \"$MilestoneTitle\") | .number"
+$milestones = (& $gh api "repos/$Owner/$Repo/milestones?state=all" | ConvertFrom-Json)
+$msCheck = $milestones | Where-Object { $_.title -eq $MilestoneTitle } | Select-Object -First 1
 if (-not $msCheck) {
   & $gh api "repos/$Owner/$Repo/milestones" --method POST -f "title=$MilestoneTitle" -f "description=$milestoneDesc"
 }
@@ -39,7 +40,8 @@ $issues = @(
 )
 
 foreach ($i in $issues) {
-  $existing = & $gh issue list --repo "$Owner/$Repo" --state all --search "$($i.Title) in:title" --json title --jq ".[] | select(.title == \"$($i.Title)\") | .title"
+  $existing = & $gh issue list --repo "$Owner/$Repo" --state all --limit 200 --json title --jq ".[] | .title" |
+    Where-Object { $_ -eq $i.Title }
   if ($existing) {
     Write-Host "Skipping existing issue: $($i.Title)"
     continue
