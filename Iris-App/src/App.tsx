@@ -3469,9 +3469,14 @@ function App() {
     if (runtimeControlBusy) return;
     const approved = window.confirm("Reset runtime state to idle? This clears the active runtime phase state.");
     if (!approved) return;
-    await runRuntimeControl("reset_idle");
-    showRuntimeToast("Runtime state reset to idle.", 3200);
-    setCognitiveDocStatus("Runtime state reset to idle.");
+    const ok = await runRuntimeControl("reset_idle");
+    if (ok) {
+      showRuntimeToast("Runtime state reset to idle.", 3200);
+      setCognitiveDocStatus("Runtime state reset to idle.");
+    } else {
+      showRuntimeToast("Runtime reset failed. See runtime status for details.", 5000);
+      setCognitiveDocStatus("Runtime reset failed.");
+    }
   }
 
   async function clearCognitiveDocHistoryFromSettings(scope: "lane" | "goal") {
@@ -4240,8 +4245,8 @@ function App() {
     };
   }, [useRustEngine]);
 
-  async function runRuntimeControl(action: "pause" | "resume" | "reset_idle") {
-    if (runtimeControlBusy) return;
+  async function runRuntimeControl(action: "pause" | "resume" | "reset_idle"): Promise<boolean> {
+    if (runtimeControlBusy) return false;
     try {
       setRuntimeControlBusy(true);
       const next = await invoke<CognitiveRuntimeStatePayload>("transition_cognitive_runtime_state", {
@@ -4258,8 +4263,10 @@ function App() {
         }
       }
       setRustEngineStatus(`Runtime control applied: ${action}`);
+      return true;
     } catch (err: any) {
       setRustEngineStatus(`Runtime control failed: ${String(err?.message || err || action)}`);
+      return false;
     } finally {
       setRuntimeControlBusy(false);
     }
