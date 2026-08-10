@@ -38,7 +38,114 @@ const SUMMARY_MODEL = "iris-summarizer:latest";
 const DEBUG_MEMORY = false;
 
 type ModelStatus = "checking" | "ready" | "loading" | "error";
-type Message = { role: "user" | "llm"; text: string; images?: string[]; time?: number };
+type WorkLogEntry = {
+  ts: number;
+  text: string;
+};
+
+type IrisActionTrace = {
+  id: string;
+  ts: number;
+  action: string;
+  reason: string;
+  argsSummary: string;
+  outcome: string;
+};
+
+type IrisMessageThinkingLog = {
+  capturedAt: number;
+  prompt: string;
+  responseModel: string;
+  plannerPath: string;
+  plannerIntent: string;
+  plannerStrategy: string;
+  routeSummary: string;
+  selectedProfile: string;
+  profileReason: string;
+  plannerPhase: string;
+  plannerResumeHint: string;
+  checkpointCount: number;
+  suggestedGodotVersion: string;
+  runtimePhase: string;
+  workLog: WorkLogEntry[];
+  actionTrace: IrisActionTrace[];
+};
+
+type MessageLogViewerState = {
+  title: string;
+  timestamp: string;
+  log: IrisMessageThinkingLog | null;
+};
+
+type Message = { role: "user" | "llm"; text: string; images?: string[]; time?: number; thinkingLog?: unknown };
+type AutonomousTaskIntervalUnit = "seconds" | "minutes" | "hours" | "days" | "custom";
+
+type AutonomousTaskDraft = {
+  id: string;
+  prompt: string;
+  projectId: string | null;
+  networkAllowed: boolean;
+  intervalValue: string;
+  intervalUnit: AutonomousTaskIntervalUnit;
+  customSchedulePrompt: string;
+};
+
+const AUTONOMOUS_PANEL_PREFS_KEY = "iris_autonomous_panel_prefs";
+const AUTONOMOUS_TASKS_KEY = "iris_autonomous_tasks";
+
+function createBlankAutonomousTask(): AutonomousTaskDraft {
+  return {
+    id: makeId("auto_task"),
+    prompt: "",
+    projectId: null,
+    networkAllowed: false,
+    intervalValue: "",
+    intervalUnit: "minutes",
+    customSchedulePrompt: "",
+  };
+}
+
+function readAutonomousPanelPrefs(): { enabled: boolean; collapsed: boolean } {
+  try {
+    const raw = localStorage.getItem(AUTONOMOUS_PANEL_PREFS_KEY);
+    if (!raw) return { enabled: false, collapsed: false };
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: !!parsed?.enabled,
+      collapsed: !!parsed?.collapsed,
+    };
+  } catch {
+    return { enabled: false, collapsed: false };
+  }
+}
+
+function normalizeAutonomousTask(raw: any): AutonomousTaskDraft {
+  const intervalUnit = String(raw?.intervalUnit || "minutes").toLowerCase();
+  const allowedUnits: AutonomousTaskIntervalUnit[] = ["seconds", "minutes", "hours", "days", "custom"];
+  return {
+    id: String(raw?.id || makeId("auto_task")),
+    prompt: String(raw?.prompt || ""),
+    projectId: raw?.projectId ? String(raw.projectId) : null,
+    networkAllowed: !!raw?.networkAllowed,
+    intervalValue: String(raw?.intervalValue || ""),
+    intervalUnit: allowedUnits.includes(intervalUnit as AutonomousTaskIntervalUnit)
+      ? (intervalUnit as AutonomousTaskIntervalUnit)
+      : "minutes",
+    customSchedulePrompt: String(raw?.customSchedulePrompt || ""),
+  };
+}
+
+function readAutonomousTasksFromStorage(): AutonomousTaskDraft[] {
+  try {
+    const raw = localStorage.getItem(AUTONOMOUS_TASKS_KEY);
+    if (!raw) return [createBlankAutonomousTask()];
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed.map(normalizeAutonomousTask) : [];
+    return list.length ? list : [createBlankAutonomousTask()];
+  } catch {
+    return [createBlankAutonomousTask()];
+  }
+}
 type StartupStatus = {
   active: boolean;
   step: string;
@@ -113,6 +220,102 @@ type IrisEvent =
   | { type: "Error"; payload: string }
   | { type: "Done"; payload: null };
 
+type CognitiveRuntimePhase =
+  | "idle"
+  | "planning"
+  | "executing"
+  | "qa"
+  | "paused"
+  | "completed"
+  | "failed";
+
+type CognitiveRuntimeStatePayload = {
+  phase: CognitiveRuntimePhase;
+  resumePhase?: CognitiveRuntimePhase | null;
+  goalId: string;
+  goalLabel: string;
+  currentStep: string;
+  activeModel: string;
+  lastTransitionAction: string;
+  lastTransitionAt: number;
+  startedAt: number;
+  completedAt: number;
+  failedAt: number;
+  pausedAt: number;
+  pauseReason: string;
+  failureReason: string;
+  iterationCount: number;
+};
+
+type RuntimeNotificationPrefs = {
+  miniPlayerEnabled: boolean;
+  notifyMilestones: boolean;
+  notifyCompletion: boolean;
+  notifyBlockers: boolean;
+  quietMode: boolean;
+};
+
+type CognitiveDocVersionPayload = {
+  goalId: string;
+  docType: string;
+  version: number;
+  ts: number;
+  author: string;
+  content: string;
+  metadata?: unknown;
+};
+
+type CognitiveDocNodePayload = {
+  goalId: string;
+  docType: string;
+  latestVersion: number;
+  latestTs: number;
+};
+
+function readRuntimeNotificationPrefs(): RuntimeNotificationPrefs {
+  try {
+    const raw = localStorage.getItem("iris_runtime_notification_prefs");
+    if (!raw) {
+      return {
+        miniPlayerEnabled: true,
+        notifyMilestones: true,
+        notifyCompletion: true,
+        notifyBlockers: true,
+        quietMode: false,
+      };
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      miniPlayerEnabled: !!parsed?.miniPlayerEnabled,
+      notifyMilestones: !!parsed?.notifyMilestones,
+      notifyCompletion: !!parsed?.notifyCompletion,
+      notifyBlockers: !!parsed?.notifyBlockers,
+      quietMode: !!parsed?.quietMode,
+    };
+  } catch {
+    return {
+      miniPlayerEnabled: true,
+      notifyMilestones: true,
+      notifyCompletion: true,
+      notifyBlockers: true,
+      quietMode: false,
+    };
+  }
+}
+
+function parseRuntimeTabId(goalId: string): number | null {
+  const m = String(goalId || "").match(/^tab(\d+)_/i);
+  if (!m) return null;
+  const parsed = Number(m[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatRuntimePhaseLabel(phase: CognitiveRuntimePhase): string {
+  const raw = String(phase || "").replace(/_/g, " ").trim();
+  if (!raw) return "idle";
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
 function normalizeMessages(raw: any[] | undefined): Message[] {
   const out: Message[] = [];
   for (const m of raw || []) {
@@ -123,7 +326,16 @@ function normalizeMessages(raw: any[] | undefined): Message[] {
         ? (m as any).images.filter((v: any) => typeof v === "string")
         : undefined;
       const time = Number.isFinite((m as any).time) ? Number((m as any).time) : undefined;
-      out.push({ role, text, ...(images && images.length ? { images } : {}), ...(time ? { time } : {}) });
+      const thinkingLog = (m as any).thinkingLog && typeof (m as any).thinkingLog === "object"
+        ? ((m as any).thinkingLog as IrisMessageThinkingLog)
+        : null;
+      out.push({
+        role,
+        text,
+        ...(images && images.length ? { images } : {}),
+        ...(time ? { time } : {}),
+        ...(thinkingLog ? { thinkingLog } : {}),
+      });
       continue;
     }
     // Legacy transcript that merges both speakers into one block:
@@ -286,12 +498,7 @@ type ActiveRoutine = {
   goal: string;
   steps: RoutineStep[];
   isLongRunning: boolean;
-  status: "pending_confirm" | "running" | "done" | "cancelled" | "error";
-};
-
-type WorkLogEntry = {
-  ts: number;
-  text: string;
+  status: "pending_confirm" | "running" | "paused" | "done" | "cancelled" | "error";
 };
 
 type McpToolDescriptor = {
@@ -337,15 +544,6 @@ type InferredActions = {
   desktop: ParsedExplicitDesktopCall | null;
   mcp: ParsedExplicitMcpCall | null;
   project: ParsedExplicitProjectCall | null;
-};
-
-type IrisActionTrace = {
-  id: string;
-  ts: number;
-  action: string;
-  reason: string;
-  argsSummary: string;
-  outcome: string;
 };
 
 type IrisToolScope = "internal" | "custom";
@@ -1635,23 +1833,25 @@ async function persistDirectReply(params: {
   replyText: string;
   associatedProjectId: string | null;
   promptHistory?: string[];
+  thinkingLog?: IrisMessageThinkingLog | null;
 }) {
-  const { requestTabId, tabs, userDisplayText, replyText, associatedProjectId, promptHistory } = params;
+  const { requestTabId, tabs, userDisplayText, replyText, associatedProjectId, promptHistory, thinkingLog } = params;
   const tabObj = tabs.find(t => t.id === requestTabId);
   const nowTs = Math.floor(Date.now() / 1000);
   const uiMsgs = (tabObj?.messages || []).map((m: any) => ({
     role: m.role,
     text: m.text,
     time: (m as any).time ?? nowTs,
+    ...(m?.thinkingLog ? { thinkingLog: m.thinkingLog } : {}),
   }));
-  const messagesForSnapshot: { role: 'user' | 'llm'; text: string; time: number }[] = [...uiMsgs];
+  const messagesForSnapshot: Array<{ role: 'user' | 'llm'; text: string; time: number; thinkingLog?: IrisMessageThinkingLog | null }> = [...uiMsgs];
   if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'user' ||
       messagesForSnapshot[messagesForSnapshot.length - 1].text !== userDisplayText) {
     messagesForSnapshot.push({ role: 'user', text: userDisplayText, time: nowTs });
   }
   if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'llm' ||
       messagesForSnapshot[messagesForSnapshot.length - 1].text !== replyText) {
-    messagesForSnapshot.push({ role: 'llm', text: replyText, time: nowTs });
+    messagesForSnapshot.push({ role: 'llm', text: replyText, time: nowTs, ...(thinkingLog ? { thinkingLog } : {}) });
   }
   await withTimeout(persistSnapshot(requestTabId, {
     title: tabObj?.title ?? `Tab #${requestTabId}`,
@@ -2410,15 +2610,17 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 function capSnapshotMessages(
-  messages: Array<{ role: 'user' | 'llm'; text: string; time: number }>,
+  messages: Array<{ role: 'user' | 'llm'; text: string; time: number; images?: string[]; thinkingLog?: unknown }>,
   maxMessages = 140,
   maxCharsPerMessage = 16000
-): Array<{ role: 'user' | 'llm'; text: string; time: number }> {
+): Array<{ role: 'user' | 'llm'; text: string; time: number; images?: string[]; thinkingLog?: unknown }> {
   const trimmedWindow = messages.slice(-maxMessages);
   return trimmedWindow.map((m) => ({
     role: m.role,
     text: typeof m.text === "string" ? m.text.slice(0, maxCharsPerMessage) : "",
     time: Number.isFinite(m.time) ? m.time : Math.floor(Date.now() / 1000),
+    ...(Array.isArray(m.images) && m.images.length ? { images: m.images } : {}),
+    ...(m.thinkingLog && typeof m.thinkingLog === "object" ? { thinkingLog: m.thinkingLog } : {}),
   }));
 }
 
@@ -2426,12 +2628,32 @@ function capSnapshotMessages(
 function App() {
   const useRustEngine = true;
   const [rustEngineStatus, setRustEngineStatus] = useState("");
+  const [globalRuntimeState, setGlobalRuntimeState] = useState<CognitiveRuntimeStatePayload | null>(null);
+  const [runtimeStateByTab, setRuntimeStateByTab] = useState<Record<number, CognitiveRuntimeStatePayload>>({});
+  const [runtimeControlBusy, setRuntimeControlBusy] = useState(false);
+  const [runtimeNotificationPrefs, setRuntimeNotificationPrefs] = useState<RuntimeNotificationPrefs>(() => readRuntimeNotificationPrefs());
+  const [cognitiveGoalDraft, setCognitiveGoalDraft] = useState("");
+  const [cognitiveDocTypeDraft, setCognitiveDocTypeDraft] = useState("planning_logs");
+  const [cognitiveDocMaxCharsDraft, setCognitiveDocMaxCharsDraft] = useState("6000");
+  const [cognitiveDocSlice, setCognitiveDocSlice] = useState("");
+  const [cognitiveDocAppendText, setCognitiveDocAppendText] = useState("");
+  const [cognitiveDocVersions, setCognitiveDocVersions] = useState<CognitiveDocVersionPayload[]>([]);
+  const [cognitiveDocNodes, setCognitiveDocNodes] = useState<CognitiveDocNodePayload[]>([]);
+  const [cognitiveDocSelectedVersion, setCognitiveDocSelectedVersion] = useState<number | null>(null);
+  const [cognitiveDocVersionPreview, setCognitiveDocVersionPreview] = useState("");
+  const [cognitiveDocStatus, setCognitiveDocStatus] = useState("");
+  const [cognitiveDocBusy, setCognitiveDocBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [chatDragActive, setChatDragActive] = useState(false);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
+  const [messageLogViewer, setMessageLogViewer] = useState<MessageLogViewerState | null>(null);
+  const [autonomousPanelEnabled, setAutonomousPanelEnabled] = useState<boolean>(() => readAutonomousPanelPrefs().enabled);
+  const [autonomousPanelCollapsed, setAutonomousPanelCollapsed] = useState<boolean>(() => readAutonomousPanelPrefs().collapsed);
+  const [autonomousTasks, setAutonomousTasks] = useState<AutonomousTaskDraft[]>(() => readAutonomousTasksFromStorage());
+  const [autonomousDeleteConfirmId, setAutonomousDeleteConfirmId] = useState<string | null>(null);
   const [editingLastUserMsgIdx, setEditingLastUserMsgIdx] = useState<number | null>(null);
   const [editingLastUserMsgDraft, setEditingLastUserMsgDraft] = useState("");
   const [thinking, setThinking] = useState(false);
@@ -2465,6 +2687,8 @@ function App() {
   const rustDeltaDrainTimerByTabRef = useRef<Record<number, ReturnType<typeof setInterval> | null>>({});
   const rustStreamDoneByTabRef = useRef<Record<number, boolean>>({});
   const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
+  const workLogByTabRef = useRef<Record<number, WorkLogEntry[]>>({});
+  const actionTraceByTabRef = useRef<Record<number, IrisActionTrace[]>>({});
   const isMounted = useRef(true);
 
   const [useCoder, setUseCoder] = useState(false);
@@ -2492,6 +2716,7 @@ function App() {
     llmProfile === "Low" ? 2.5 : 3.5; // Minimal gets longest timeout
   const [hwToast, setHwToast] = useState<string | null>(null);
   const hwToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runtimePhaseTrackerRef = useRef<Record<string, string>>({});
   const [assistantName, setAssistantName] = useState("Iris");
   const [permissionSettings, setPermissionSettings] = useState<PermissionSettings>(DEFAULT_PERMISSION_SETTINGS);
   const [inlinePermissionQueue, setInlinePermissionQueue] = useState<InlinePermissionRequest[]>([]);
@@ -3179,6 +3404,262 @@ function App() {
       if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("iris_runtime_notification_prefs", JSON.stringify(runtimeNotificationPrefs));
+    } catch {}
+  }, [runtimeNotificationPrefs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTONOMOUS_PANEL_PREFS_KEY, JSON.stringify({
+        enabled: autonomousPanelEnabled,
+        collapsed: autonomousPanelCollapsed,
+      }));
+    } catch {}
+  }, [autonomousPanelEnabled, autonomousPanelCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTONOMOUS_TASKS_KEY, JSON.stringify(autonomousTasks));
+    } catch {}
+  }, [autonomousTasks]);
+
+  function updateAutonomousTask(taskId: string, patch: Partial<AutonomousTaskDraft>) {
+    setAutonomousTasks((prev) => prev.map((task) => (task.id === taskId ? { ...task, ...patch } : task)));
+  }
+
+  function addAutonomousTask() {
+    setAutonomousTasks((prev) => [...prev, createBlankAutonomousTask()]);
+  }
+
+  function confirmDeleteAutonomousTask(taskId: string) {
+    setAutonomousTasks((prev) => {
+      const next = prev.filter((task) => task.id !== taskId);
+      return next.length ? next : [createBlankAutonomousTask()];
+    });
+    setAutonomousDeleteConfirmId(null);
+  }
+
+  function resizeAutonomousPrompt(el: HTMLTextAreaElement | null) {
+    if (!el) return;
+    el.style.height = "auto";
+    const computed = window.getComputedStyle(el);
+    const lineHeight = Number.parseFloat(computed.lineHeight || "20") || 20;
+    const maxHeight = lineHeight * 7;
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+  }
+
+  function showRuntimeToast(message: string, ms = 4500) {
+    setHwToast(message);
+    if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
+    hwToastTimerRef.current = setTimeout(() => setHwToast(null), ms);
+  }
+
+  function maybeNotifyRuntimeTransition(payload: CognitiveRuntimeStatePayload) {
+    const goal = String(payload.goalId || "global");
+    const phase = String(payload.phase || "");
+    if (!phase) return;
+
+    const previous = runtimePhaseTrackerRef.current[goal];
+    runtimePhaseTrackerRef.current[goal] = phase;
+    if (!previous || previous === phase) return;
+    if (runtimeNotificationPrefs.quietMode) return;
+
+    const model = String(payload.activeModel || "").trim();
+    const label = phase.replace(/_/g, " ");
+    const message = `Runtime ${label}${model ? ` (${model})` : ""}`;
+
+    if ((phase === "planning" || phase === "executing" || phase === "qa" || phase === "paused") && runtimeNotificationPrefs.notifyMilestones) {
+      showRuntimeToast(message, 3200);
+      return;
+    }
+    if (phase === "completed" && runtimeNotificationPrefs.notifyCompletion) {
+      showRuntimeToast(message, 5200);
+      return;
+    }
+    if (phase === "failed" && runtimeNotificationPrefs.notifyBlockers) {
+      showRuntimeToast(`${message}${payload.failureReason ? ` | ${payload.failureReason}` : ""}`, 6500);
+      return;
+    }
+  }
+
+  function activeRuntimeStateForTab(tabId: number): CognitiveRuntimeStatePayload | null {
+    const tabState = runtimeStateByTab[tabId];
+    const fallbackState = globalRuntimeState;
+    const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
+    if (tabState) return tabState;
+    if (fallbackState && (fallbackTabId == null || fallbackTabId === tabId)) {
+      return fallbackState;
+    }
+    return null;
+  }
+
+  function resolveCognitiveGoalForEditor(): string {
+    const explicit = cognitiveGoalDraft.trim();
+    if (explicit) return explicit;
+    const runtimeState = activeRuntimeStateForTab(activeTab);
+    if (runtimeState?.goalId?.trim()) return runtimeState.goalId.trim();
+    return `tab${activeTab}_planning`;
+  }
+
+  function parseCognitiveDocMaxChars(): number {
+    const parsed = Number(cognitiveDocMaxCharsDraft);
+    if (!Number.isFinite(parsed)) return 6000;
+    const normalized = Math.floor(parsed);
+    return Math.min(20000, Math.max(240, normalized));
+  }
+
+  function updateCognitiveVersionPreview(versions: CognitiveDocVersionPayload[], selectedVersion: number | null) {
+    if (!versions.length) {
+      setCognitiveDocVersionPreview("");
+      setCognitiveDocSelectedVersion(null);
+      return;
+    }
+    const resolvedVersion = selectedVersion ?? versions[versions.length - 1].version;
+    const found = versions.find((v) => v.version === resolvedVersion) || versions[versions.length - 1];
+    setCognitiveDocSelectedVersion(found.version);
+    setCognitiveDocVersionPreview(found.content || "");
+  }
+
+  async function loadCognitiveDocSliceFromSettings(options?: { force?: boolean; docTypeOverride?: string }) {
+    if (cognitiveDocBusy && !options?.force) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = String(options?.docTypeOverride ?? cognitiveDocTypeDraft).trim();
+    const maxChars = parseCognitiveDocMaxChars();
+    try {
+      setCognitiveDocBusy(true);
+      const slice = await invoke<string>("read_cognitive_doc_context_slice", {
+        goalId: goal,
+        docType: docType ? docType : undefined,
+        maxChars,
+      });
+      setCognitiveDocSlice(String(slice || ""));
+      setCognitiveDocStatus(`Loaded context slice (${maxChars} char cap).`);
+    } catch (err: any) {
+      setCognitiveDocSlice(`Failed to load slice: ${String(err?.message || err || "unknown error")}`);
+      setCognitiveDocStatus("Failed to load context slice.");
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
+
+  async function refreshCognitiveDocMetadataFromSettings(options?: { force?: boolean }) {
+    if (cognitiveDocBusy && !options?.force) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    try {
+      setCognitiveDocBusy(true);
+      const [nodes, versions, latest] = await Promise.all([
+        invoke<CognitiveDocNodePayload[]>("list_cognitive_doc_nodes", { goalId: goal }),
+        invoke<CognitiveDocVersionPayload[]>("list_cognitive_doc_versions", {
+          goalId: goal,
+          docType,
+          limit: 30,
+        }),
+        invoke<CognitiveDocVersionPayload | null>("get_latest_cognitive_doc_version", {
+          goalId: goal,
+          docType,
+        }),
+      ]);
+      const normalizedNodes = Array.isArray(nodes) ? nodes : [];
+      const normalizedVersions = Array.isArray(versions) ? versions : [];
+      setCognitiveDocNodes(normalizedNodes);
+      setCognitiveDocVersions(normalizedVersions);
+      if (latest && typeof latest === "object") {
+        updateCognitiveVersionPreview(normalizedVersions, latest.version);
+      } else {
+        updateCognitiveVersionPreview(normalizedVersions, cognitiveDocSelectedVersion);
+      }
+      setCognitiveDocStatus(`Loaded ${normalizedNodes.length} lane(s), ${normalizedVersions.length} version(s) for ${docType}.`);
+    } catch (err: any) {
+      setCognitiveDocStatus(`Metadata refresh failed: ${String(err?.message || err || "unknown error")}`);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
+
+  function handleCognitiveVersionSelection(nextVersion: number) {
+    if (!Number.isFinite(nextVersion)) return;
+    const found = cognitiveDocVersions.find((v) => v.version === nextVersion);
+    if (!found) return;
+    setCognitiveDocSelectedVersion(found.version);
+    setCognitiveDocVersionPreview(found.content || "");
+  }
+
+  async function appendCognitiveDocNoteFromSettings() {
+    if (cognitiveDocBusy) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    const content = cognitiveDocAppendText.trim();
+    if (!content) return;
+    try {
+      setCognitiveDocBusy(true);
+      await invoke("append_cognitive_doc_version", {
+        args: {
+          goalId: goal,
+          docType,
+          author: "user",
+          content,
+          metadata: { source: "controller_editor" },
+        },
+      });
+      setCognitiveDocAppendText("");
+      await refreshCognitiveDocMetadataFromSettings({ force: true });
+      await loadCognitiveDocSliceFromSettings({ force: true });
+      showRuntimeToast("Cognitive document note appended.", 3200);
+      setCognitiveDocStatus(`Appended note to ${docType}.`);
+    } catch (err: any) {
+      showRuntimeToast(`Append failed: ${String(err?.message || err || "unknown")}`, 5000);
+      setCognitiveDocStatus("Append failed.");
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
+
+  async function resetRuntimeFromSettings() {
+    if (runtimeControlBusy) return;
+    const approved = window.confirm("Reset runtime state to idle? This clears the active runtime phase state.");
+    if (!approved) return;
+    const ok = await runRuntimeControl("reset_idle");
+    if (ok) {
+      showRuntimeToast("Runtime state reset to idle.", 3200);
+      setCognitiveDocStatus("Runtime state reset to idle.");
+    } else {
+      showRuntimeToast("Runtime reset failed. See runtime status for details.", 5000);
+      setCognitiveDocStatus("Runtime reset failed.");
+    }
+  }
+
+  async function clearCognitiveDocHistoryFromSettings(scope: "lane" | "goal") {
+    if (cognitiveDocBusy) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    const question = scope === "lane"
+      ? `Clear cognitive doc history for lane '${docType}' under goal '${goal}'?`
+      : `Clear ALL cognitive doc lanes for goal '${goal}'?`;
+    const approved = window.confirm(question);
+    if (!approved) return;
+    try {
+      setCognitiveDocBusy(true);
+      const cleared = await invoke<number>("clear_cognitive_doc_versions", {
+        goalId: goal,
+        docType: scope === "lane" ? docType : undefined,
+      });
+      setCognitiveDocSlice("");
+      setCognitiveDocVersionPreview("");
+      setCognitiveDocStatus(`Cleared ${Number(cleared) || 0} file(s) from ${scope === "lane" ? `lane ${docType}` : `goal ${goal}`}.`);
+      showRuntimeToast(`Cognitive doc ${scope === "lane" ? "lane" : "goal"} history cleared.`, 4200);
+      await refreshCognitiveDocMetadataFromSettings({ force: true });
+    } catch (err: any) {
+      const message = String(err?.message || err || "unknown error");
+      setCognitiveDocStatus(`Clear failed: ${message}`);
+      showRuntimeToast(`Cognitive doc clear failed: ${message}`, 5200);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!lowPowerProfile) return;
@@ -3874,6 +4355,120 @@ function App() {
     };
   }, [activeTab]);
 
+  useEffect(() => {
+    const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
+    if (!tauriInvoke || !useRustEngine) {
+      return;
+    }
+
+    let unlistenFn: (() => void) | null = null;
+
+    listen<CognitiveRuntimeStatePayload>("cognitive_runtime_state", (event) => {
+      const payload = event.payload as CognitiveRuntimeStatePayload;
+      if (!payload || typeof payload !== "object") return;
+
+      setGlobalRuntimeState(payload);
+      maybeNotifyRuntimeTransition(payload);
+
+      const tabId = parseRuntimeTabId(payload.goalId);
+      if (tabId != null) {
+        setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: payload }));
+      }
+    })
+      .then((off) => {
+        unlistenFn = off;
+      })
+      .catch((err) => {
+        console.warn("Failed to subscribe to cognitive runtime events", err);
+      });
+
+    invoke<CognitiveRuntimeStatePayload>("get_cognitive_runtime_state")
+      .then((state) => {
+        if (!state || typeof state !== "object") return;
+        setGlobalRuntimeState(state);
+        const tabId = parseRuntimeTabId(state.goalId);
+        if (tabId != null) {
+          setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: state }));
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, [useRustEngine]);
+
+  async function runRuntimeControl(action: "pause" | "resume" | "reset_idle"): Promise<boolean> {
+    if (runtimeControlBusy) return false;
+    try {
+      setRuntimeControlBusy(true);
+      const next = await invoke<CognitiveRuntimeStatePayload>("transition_cognitive_runtime_state", {
+        args: {
+          action,
+          reason: action === "pause" ? "paused_from_frontend" : undefined,
+        },
+      });
+      if (next && typeof next === "object") {
+        setGlobalRuntimeState(next);
+        const tabId = parseRuntimeTabId(next.goalId);
+        if (tabId != null) {
+          setRuntimeStateByTab((prev) => ({ ...prev, [tabId]: next }));
+        }
+      }
+      setRustEngineStatus(`Runtime control applied: ${action}`);
+      return true;
+    } catch (err: any) {
+      setRustEngineStatus(`Runtime control failed: ${String(err?.message || err || action)}`);
+      return false;
+    } finally {
+      setRuntimeControlBusy(false);
+    }
+  }
+
+  async function readCurrentRuntimeState(): Promise<CognitiveRuntimeStatePayload | null> {
+    try {
+      const state = await invoke<CognitiveRuntimeStatePayload>("get_cognitive_runtime_state");
+      if (!state || typeof state !== "object") return null;
+      return state;
+    } catch {
+      return null;
+    }
+  }
+
+  async function waitForRuntimeGate(tabId: number, stepLabel: string): Promise<boolean> {
+    let sawPause = false;
+    while (true) {
+      const runtime = await readCurrentRuntimeState();
+      if (!runtime) return true;
+
+      const runtimeTabId = parseRuntimeTabId(runtime.goalId);
+      const appliesToTab = runtimeTabId == null || runtimeTabId === tabId;
+      if (!appliesToTab) return true;
+
+      if (runtime.phase === "paused") {
+        if (!sawPause) {
+          appendWorkLog(tabId, `Runtime paused before step: ${stepLabel}`);
+        }
+        sawPause = true;
+        setActiveRoutine((prev) => (prev ? { ...prev, status: "paused" } : prev));
+        setThinkingProgress(tabId, `Runtime paused. Waiting to resume before ${stepLabel}...`);
+        await new Promise((resolve) => setTimeout(resolve, 450));
+        continue;
+      }
+
+      if (runtime.phase === "idle" || runtime.phase === "completed" || runtime.phase === "failed") {
+        appendWorkLog(tabId, `Runtime ended (${runtime.phase}) before step: ${stepLabel}`);
+        return false;
+      }
+
+      if (sawPause) {
+        appendWorkLog(tabId, `Runtime resumed for step: ${stepLabel}`);
+        setActiveRoutine((prev) => (prev ? { ...prev, status: "running" } : prev));
+      }
+      return true;
+    }
+  }
+
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
     if (!desktopDashboardEnabled) return;
@@ -4014,6 +4609,11 @@ function App() {
   const [irisStatus, setIrisStatus] = useState<"idle" | "thinking" | "summarizing" | "responding" | "coding">("idle");
   const [plannerRoutedModels, setPlannerRoutedModels] = useState<string[]>([]);
   const [plannerRouteSummary, setPlannerRouteSummary] = useState<string>("");
+  const [plannerSelectedProfile, setPlannerSelectedProfile] = useState<string>("");
+  const [plannerProfileReason, setPlannerProfileReason] = useState<string>("");
+  const [plannerPhase, setPlannerPhase] = useState<string>("");
+  const [plannerResumeHint, setPlannerResumeHint] = useState<string>("");
+  const [plannerCheckpointCount, setPlannerCheckpointCount] = useState<number>(0);
   const [respondingTab, setRespondingTab] = useState<number | null>(null);
   const [thinkingStep, setThinkingStep] = useState<string>("");
   const [thinkingSeconds, setThinkingSeconds] = useState<number>(0);
@@ -4023,13 +4623,13 @@ function App() {
     const normalized = String(text || "").trim();
     if (!normalized) return;
     const ts = Date.now();
-    setWorkLogByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      if (existing.length > 0 && existing[existing.length - 1].text === normalized) {
-        return prev;
-      }
-      return { ...prev, [tabId]: [...existing, { ts, text: normalized }].slice(-24) };
-    });
+    const existing = Array.isArray(workLogByTabRef.current[tabId]) ? workLogByTabRef.current[tabId] : [];
+    if (existing.length > 0 && existing[existing.length - 1].text === normalized) {
+      return;
+    }
+    const next = [...existing, { ts, text: normalized }].slice(-24);
+    workLogByTabRef.current[tabId] = next;
+    setWorkLogByTab((prev) => ({ ...prev, [tabId]: next }));
   }
 
   function setThinkingProgress(tabId: number, step: string) {
@@ -4038,7 +4638,64 @@ function App() {
   }
 
   function clearWorkLog(tabId: number) {
+    workLogByTabRef.current[tabId] = [];
     setWorkLogByTab((prev) => ({ ...prev, [tabId]: [] }));
+  }
+
+  function clearActionTrace(tabId: number) {
+    actionTraceByTabRef.current[tabId] = [];
+    setActionTraceByTab((prev) => ({ ...prev, [tabId]: [] }));
+  }
+
+  function buildThinkingLogForReply(args: {
+    tabId: number;
+    plannerPath: string;
+    plannerIntent: string;
+    plannerStrategy: string;
+    routeSummary: string;
+    selectedProfile: string;
+    profileReason: string;
+    plannerPhase: string;
+    plannerResumeHint: string;
+    checkpointCount: number;
+    suggestedGodotVersion: string;
+    responseModel: string;
+    prompt: string;
+    workLogStartIndex: number;
+    actionTraceStartIndex: number;
+  }): IrisMessageThinkingLog {
+    const workLog = (workLogByTabRef.current[args.tabId] || []).slice(args.workLogStartIndex);
+    const actionTrace = (actionTraceByTabRef.current[args.tabId] || []).slice(args.actionTraceStartIndex);
+    const runtimeState = activeRuntimeStateForTab(args.tabId);
+    return {
+      capturedAt: Math.floor(Date.now() / 1000),
+      prompt: args.prompt,
+      responseModel: args.responseModel,
+      plannerPath: args.plannerPath,
+      plannerIntent: args.plannerIntent,
+      plannerStrategy: args.plannerStrategy,
+      routeSummary: args.routeSummary,
+      selectedProfile: args.selectedProfile,
+      profileReason: args.profileReason,
+      plannerPhase: args.plannerPhase,
+      plannerResumeHint: args.plannerResumeHint,
+      checkpointCount: args.checkpointCount,
+      suggestedGodotVersion: args.suggestedGodotVersion,
+      runtimePhase: runtimeState?.phase || "idle",
+      workLog,
+      actionTrace,
+    };
+  }
+
+  function openMessageThinkingLog(msg: Message, idx: number) {
+    const log = msg.thinkingLog && typeof msg.thinkingLog === "object"
+      ? (msg.thinkingLog as IrisMessageThinkingLog)
+      : null;
+    setMessageLogViewer({
+      title: `${assistantLabel} response #${idx + 1}`,
+      timestamp: formatMessageTimestamp(msg.time) || "(no timestamp)",
+      log,
+    });
   }
 
   function setRoutineStepStatus(stepId: string, patch: Partial<RoutineStep>) {
@@ -4138,8 +4795,17 @@ function App() {
 
     const capturedImages: string[] = [];
     let sawRoutineError = false;
+    let runtimeStoppedRoutine = false;
 
     for (const step of steps) {
+      const canProceed = await waitForRuntimeGate(tabId, step.label);
+      if (!canProceed) {
+        runtimeStoppedRoutine = true;
+        setRoutineStepStatus(step.id, { status: "skipped", error: "runtime gated" });
+        appendWorkLog(tabId, `Routine halted by runtime lifecycle gate before: ${step.label}`);
+        break;
+      }
+
       setRoutineStepStatus(step.id, { status: "running" });
       appendWorkLog(tabId, `Routine step running: ${step.label}`);
       try {
@@ -4169,8 +4835,13 @@ function App() {
       }
     }
 
-    setActiveRoutine(prev => prev ? { ...prev, status: sawRoutineError ? "error" : "done" } : prev);
-    appendWorkLog(tabId, sawRoutineError ? "Routine completed with errors" : "Routine completed");
+    setActiveRoutine(prev => prev ? { ...prev, status: runtimeStoppedRoutine ? "cancelled" : (sawRoutineError ? "error" : "done") } : prev);
+    appendWorkLog(
+      tabId,
+      runtimeStoppedRoutine
+        ? "Routine stopped by runtime lifecycle state"
+        : (sawRoutineError ? "Routine completed with errors" : "Routine completed")
+    );
     return { images: capturedImages, windowHint };
   }
 
@@ -4407,6 +5078,8 @@ function App() {
 
     let preloadedSnapshot: Snapshot | null = null;
     clearWorkLog(requestTabId);
+    const turnWorkLogStartIndex = 0;
+    const turnActionTraceStartIndex = (actionTraceByTabRef.current[requestTabId] || []).length;
     setThinkingProgress(requestTabId, "Loading tab memory...");
     try {
       preloadedSnapshot = await readTabSnapshot(requestTabId);
@@ -4602,6 +5275,12 @@ function App() {
           plannerSuggestedGodotVersion = String(plannerV2.suggestedGodotVersion || plannerV2.suggested_godot_version || "unspecified");
           setPlannerRoutedModels(Array.isArray(plannerV2.routedModels ?? plannerV2.routed_models) ? (plannerV2.routedModels ?? plannerV2.routed_models) : []);
           setPlannerRouteSummary(String(plannerV2.routeSummary ?? plannerV2.route_summary ?? ""));
+          setPlannerSelectedProfile(String(plannerV2.selectedThinkingProfile ?? plannerV2.selected_thinking_profile ?? ""));
+          setPlannerProfileReason(String(plannerV2.profileSelectionReason ?? plannerV2.profile_selection_reason ?? ""));
+          setPlannerPhase(String(plannerV2.plannerPhase ?? plannerV2.planner_phase ?? ""));
+          setPlannerResumeHint(String(plannerV2.plannerResumeHint ?? plannerV2.planner_resume_hint ?? ""));
+          const phaseCheckpoints = plannerV2.plannerPhaseCheckpoints ?? plannerV2.planner_phase_checkpoints;
+          setPlannerCheckpointCount(Array.isArray(phaseCheckpoints) ? phaseCheckpoints.length : 0);
           const cc = plannerV2.compiledContext || {};
           compiled = {
             microSummary: cc.microSummary ?? cc.micro_summary ?? compiled.microSummary,
@@ -6625,6 +7304,75 @@ function App() {
           }
         }
 
+        const likelyComprehensiveRequest = /\b(build|create|design|implement|project|campaign|system|workflow|architecture|roadmap|plan|script)\b/i.test(text)
+          && text.trim().length > 28;
+        const looksLikeSkeletonOnly = /\b(skeleton|outline|phase\s*1|phase\s*2|milestone|todo|next steps?)\b/i.test(streamedText)
+          && !/```/.test(streamedText);
+        const shouldRunAutonomousContinuation = !hasImages
+          && !quickMode
+          && streamedText.trim().length > 0
+          && likelyComprehensiveRequest
+          && (looksLikeSkeletonOnly || plannerPath === "v2");
+
+        if (shouldRunAutonomousContinuation) {
+          const maxAutonomyPasses = looksLikeSkeletonOnly ? 3 : 2;
+          let autonomousDraft = streamedText;
+          for (let pass = 1; pass <= maxAutonomyPasses; pass++) {
+            if (stoppedRef.current) break;
+            setThinkingProgress(requestTabId, `Autonomous continuation ${pass}/${maxAutonomyPasses}...`);
+            let continuationRaw = "";
+            await stream({
+              model: "iris-organizer:latest",
+              prompt: [
+                "You are Iris continuing work on a single user request.",
+                "Decide whether the current draft fully completes the user's request.",
+                "Output strictly one of:",
+                "COMPLETE:<final user-facing answer only>",
+                "CONTINUE:<improved user-facing answer that executes the next needed steps now; do not return only a plan>",
+                "No extra labels, no analysis sections.",
+                "",
+                `User request:\n${text}`,
+                "",
+                `Current draft:\n${autonomousDraft}`,
+              ].join("\n"),
+              options: {
+                num_ctx: plannerReviewNumCtx,
+                num_keep: 24,
+                num_predict: Math.max(700, Math.floor(organizerPredictBudget * 0.9)),
+                temperature: 0.2,
+                top_p: 0.9,
+                top_k: 40,
+                repeat_penalty: 1.06,
+              },
+              signal: controller.signal,
+              onFirstToken: (first) => {
+                continuationRaw += first;
+              },
+              onTokens: (delta) => {
+                continuationRaw += delta;
+              },
+            });
+
+            const normalized = continuationRaw.replace(/<\/?final>/gi, "").trim();
+            if (!normalized) break;
+            if (/^COMPLETE:/i.test(normalized)) {
+              const next = sanitizeAssistantOutput(normalized.replace(/^COMPLETE:\s*/i, "").trim());
+              if (next) autonomousDraft = next;
+              break;
+            }
+            if (/^CONTINUE:/i.test(normalized)) {
+              const next = sanitizeAssistantOutput(normalized.replace(/^CONTINUE:\s*/i, "").trim());
+              if (!next || next === autonomousDraft) break;
+              autonomousDraft = next;
+              continue;
+            }
+            const fallback = sanitizeAssistantOutput(normalized);
+            if (!fallback || fallback === autonomousDraft) break;
+            autonomousDraft = fallback;
+          }
+          streamedText = autonomousDraft;
+        }
+
         const iterationBudget = iterationBudgetForProfile(llmProfile);
         if (!hasImages && !quickMode && iterationBudget > 1 && streamedText.trim()) {
           let workingDraft = streamedText;
@@ -6699,12 +7447,31 @@ function App() {
       let artifacts = extractArtifacts(deliveredText);
       const filenameMatch = deliveredText.match(/(?:here's|file|save as|edit)\s+`([^`]+)`/i);
       if (filenameMatch && artifacts[0]) artifacts[0].filename = filenameMatch[1];
+      const thinkingLog = buildThinkingLogForReply({
+        tabId: requestTabId,
+        plannerPath,
+        plannerIntent: String(plannerV2?.primaryIntent || plannerV2?.primary_intent || "legacy"),
+        plannerStrategy: String(plannerV2?.strategy || "legacy"),
+        routeSummary: String(plannerV2?.routeSummary ?? plannerV2?.route_summary ?? plannerRouteSummary ?? ""),
+        selectedProfile: String(plannerV2?.selectedThinkingProfile ?? plannerV2?.selected_thinking_profile ?? plannerSelectedProfile ?? ""),
+        profileReason: String(plannerV2?.profileSelectionReason ?? plannerV2?.profile_selection_reason ?? plannerProfileReason ?? ""),
+        plannerPhase: String(plannerV2?.plannerPhase ?? plannerV2?.planner_phase ?? plannerPhase ?? ""),
+        plannerResumeHint: String(plannerV2?.plannerResumeHint ?? plannerV2?.planner_resume_hint ?? plannerResumeHint ?? ""),
+        checkpointCount: Array.isArray(plannerV2?.plannerPhaseCheckpoints ?? plannerV2?.planner_phase_checkpoints)
+          ? (plannerV2?.plannerPhaseCheckpoints ?? plannerV2?.planner_phase_checkpoints).length
+          : plannerCheckpointCount,
+        suggestedGodotVersion: plannerSuggestedGodotVersion,
+        responseModel: model,
+        prompt,
+        workLogStartIndex: turnWorkLogStartIndex,
+        actionTraceStartIndex: turnActionTraceStartIndex,
+      });
 
       updateTabMessages(requestTabId, msgs => {
         const copy = [...msgs];
         for (let i = copy.length - 1; i >= 0; --i) {
           if (copy[i].role === "llm") {
-            copy[i] = { ...copy[i], text: deliveredText };
+            copy[i] = { ...copy[i], text: deliveredText, thinkingLog };
             break;
           }
         }
@@ -6789,10 +7556,11 @@ function App() {
           role: m.role,
           text: m.text,
           time: (m as any).time ?? nowTs,
+          ...(m?.thinkingLog ? { thinkingLog: m.thinkingLog } : {}),
         }));
         const baseMsgs = uiMsgs;
 
-        const messagesForSnapshot: { role: 'user' | 'llm'; text: string; time: number }[] = [...baseMsgs];
+        const messagesForSnapshot: Array<{ role: 'user' | 'llm'; text: string; time: number; thinkingLog?: IrisMessageThinkingLog | null }> = [...baseMsgs];
 
         // Ensure last user message is present
         if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'user' ||
@@ -6803,7 +7571,7 @@ function App() {
         // Ensure last LLM message is present/updated
         if (!messagesForSnapshot.length || messagesForSnapshot[messagesForSnapshot.length - 1].role !== 'llm' ||
             messagesForSnapshot[messagesForSnapshot.length - 1].text !== deliveredText) {
-          messagesForSnapshot.push({ role: 'llm', text: deliveredText, time: nowTs });
+          messagesForSnapshot.push({ role: 'llm', text: deliveredText, time: nowTs, thinkingLog });
         }
 
         const boundedSnapshotMessages = capSnapshotMessages(messagesForSnapshot);
@@ -8023,10 +8791,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       ts: Math.floor(Date.now() / 1000),
       ...entry,
     };
-    setActionTraceByTab((prev) => {
-      const existing = Array.isArray(prev[tabId]) ? prev[tabId] : [];
-      return { ...prev, [tabId]: [...existing, trace].slice(-60) };
-    });
+    const existing = Array.isArray(actionTraceByTabRef.current[tabId]) ? actionTraceByTabRef.current[tabId] : [];
+    const next = [...existing, trace].slice(-60);
+    actionTraceByTabRef.current[tabId] = next;
+    setActionTraceByTab((prev) => ({ ...prev, [tabId]: next }));
   }
 
   function applyFlowAdjustmentFeedback(tabId: number, text: string): string | null {
@@ -8824,6 +9592,22 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
               <div
                 className="dropdown-item"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const next = !autonomousPanelEnabled;
+                  setAutonomousPanelEnabled(next);
+                  if (next) {
+                    setAutonomousPanelCollapsed(false);
+                  }
+                  setOpenSubmenu(null);
+                  setOpenMenu(null);
+                }}
+              >
+                <span>{autonomousPanelEnabled ? "✓ " : ""}Autonomous Tasks Panel</span>
+              </div>
+
+              <div
+                className="dropdown-item"
                 onClick={async (e) => {
                   e.stopPropagation();
                   const next = !desktopDashboardEnabled;
@@ -9093,6 +9877,17 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             {currentStatusText()}
             {ellipsis}
           </strong>
+          {(() => {
+            const runtimeState = activeRuntimeStateForTab(activeTab);
+            if (!runtimeState) return null;
+            return (
+              <div style={{ marginTop: 4, opacity: 0.82, fontSize: 12 }}>
+                Runtime {formatRuntimePhaseLabel(runtimeState.phase)}
+                {runtimeState.currentStep ? ` | ${runtimeState.currentStep}` : ""}
+                {runtimeState.activeModel ? ` | ${runtimeState.activeModel}` : ""}
+              </div>
+            );
+          })()}
           {thinkingStep && (
             <div style={{ marginTop: 4, opacity: 0.8, fontSize: 13 }}>
               {thinkingStep}
@@ -9204,9 +9999,82 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         );
       })()}
 
+      {messageLogViewer && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(4, 10, 18, 0.58)",
+            zIndex: 70,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 18,
+          }}
+          onClick={() => setMessageLogViewer(null)}
+        >
+          <div
+            style={{
+              width: "min(900px, 92vw)",
+              maxHeight: "80vh",
+              overflow: "auto",
+              borderRadius: 12,
+              border: "1px solid var(--app-border)",
+              background: "var(--app-panel-bg)",
+              color: "var(--app-text)",
+              boxShadow: "0 18px 42px rgba(0,0,0,0.36)",
+              padding: 16,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700 }}>{messageLogViewer.title}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>{messageLogViewer.timestamp}</div>
+              </div>
+              <button type="button" className="setup-btn" onClick={() => setMessageLogViewer(null)}>Close</button>
+            </div>
+            {!messageLogViewer.log ? (
+              <div style={{ fontSize: 13, opacity: 0.84 }}>No thinking log was captured for this message.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 12, fontSize: 12, lineHeight: 1.5 }}>
+                <div><strong>Planner:</strong> {messageLogViewer.log.plannerPath || "(n/a)"} | {messageLogViewer.log.plannerIntent || "(n/a)"} | {messageLogViewer.log.plannerStrategy || "(n/a)"}</div>
+                <div><strong>Route:</strong> {messageLogViewer.log.routeSummary || "(n/a)"}</div>
+                <div><strong>Profile:</strong> {messageLogViewer.log.selectedProfile || "(n/a)"}{messageLogViewer.log.profileReason ? ` | ${messageLogViewer.log.profileReason}` : ""}</div>
+                <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}</div>
+                <div><strong>Phase hints:</strong> {messageLogViewer.log.plannerPhase || "(n/a)"}{messageLogViewer.log.plannerResumeHint ? ` | ${messageLogViewer.log.plannerResumeHint}` : ""}{messageLogViewer.log.checkpointCount ? ` | checkpoints: ${messageLogViewer.log.checkpointCount}` : ""}</div>
+                <div>
+                  <strong>Work log</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
+                    {messageLogViewer.log.workLog.length
+                      ? messageLogViewer.log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n")
+                      : "(empty)"}
+                  </div>
+                </div>
+                <div>
+                  <strong>Action trace</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
+                    {messageLogViewer.log.actionTrace.length
+                      ? messageLogViewer.log.actionTrace.map((entry) => `${new Date(entry.ts * 1000).toLocaleTimeString()} | ${entry.action} | ${entry.reason} | ${entry.outcome}`).join("\n")
+                      : "(empty)"}
+                  </div>
+                </div>
+                <div>
+                  <strong>Prompt snapshot</strong>
+                  <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, maxHeight: 180, overflow: "auto", opacity: 0.95 }}>
+                    {messageLogViewer.log.prompt || "(empty)"}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {currentTab?.type === "chat" && (
-        <div className="chat-history" ref={historyRef}>
-          {chatMessages.map((msg, idx) => {
+        <div className={`chat-workspace${autonomousPanelEnabled ? " with-autonomous" : ""}`}>
+          <div className="chat-history" ref={historyRef}>
+            {chatMessages.map((msg, idx) => {
             const key = `${activeTab}_${idx}`;
             const isHovered = hoveredMessageKey === key;
             const isLastUserMessage = msg.role === "user" && idx === lastUserMessageIdx;
@@ -9217,89 +10085,225 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               typeof msg.text === "string" &&
               msg.text.startsWith("[Godot Runtime Error]");
 
-            return (
-              <div
-                className={`bubble ${msg.role}`}
-                key={idx}
-                style={isGodotError ? {
-                  border: "1px solid rgba(220, 93, 93, 0.72)",
-                  background: "rgba(68, 16, 16, 0.68)",
-                } : undefined}
-                onMouseEnter={() => setHoveredMessageKey(key)}
-                onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
-              >
-                <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
-                  {timestamp ? <span>{timestamp}</span> : null}
-                  <button
-                    type="button"
-                    className="bubble-copy-btn"
-                    onClick={() => void copyChatMessageText(msg.text)}
-                  >
-                    Copy
-                  </button>
-                  {isLastUserMessage && !isEditingThis && (
+              return (
+                <div
+                  className={`bubble ${msg.role}`}
+                  key={idx}
+                  style={isGodotError ? {
+                    border: "1px solid rgba(220, 93, 93, 0.72)",
+                    background: "rgba(68, 16, 16, 0.68)",
+                  } : undefined}
+                  onMouseEnter={() => setHoveredMessageKey(key)}
+                  onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
+                >
+                  <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
+                    {timestamp ? <span>{timestamp}</span> : null}
                     <button
                       type="button"
-                      className="bubble-edit-btn"
-                      onClick={() => {
-                        setEditingLastUserMsgIdx(idx);
-                        setEditingLastUserMsgDraft(msg.text || "");
-                      }}
+                      className="bubble-copy-btn"
+                      onClick={() => void copyChatMessageText(msg.text)}
                     >
-                      Edit
+                      Copy
                     </button>
-                  )}
-                </div>
-
-                <strong>
-                  {msg.role === "user" ? "You:" : (isGodotError ? "Godot Monitor:" : `${assistantLabel}:`)}
-                </strong>{" "}
-
-                {isEditingThis ? (
-                  <div className="bubble-edit-wrap">
-                    <textarea
-                      className="bubble-edit-input"
-                      value={editingLastUserMsgDraft}
-                      onChange={(e) => setEditingLastUserMsgDraft(e.target.value)}
-                      rows={3}
-                    />
-                    <div className="bubble-edit-actions">
+                    {msg.role === "llm" && (
                       <button
                         type="button"
-                        className="setup-btn primary"
-                        onClick={() => editAndResendLastUserMessage(editingLastUserMsgDraft)}
+                        className="bubble-copy-btn"
+                        onClick={() => openMessageThinkingLog(msg as Message, idx)}
                       >
-                        Save + Resend
+                        Log
                       </button>
+                    )}
+                    {isLastUserMessage && !isEditingThis && (
                       <button
                         type="button"
-                        className="setup-btn"
+                        className="bubble-edit-btn"
                         onClick={() => {
-                          setEditingLastUserMsgIdx(null);
-                          setEditingLastUserMsgDraft("");
+                          setEditingLastUserMsgIdx(idx);
+                          setEditingLastUserMsgDraft(msg.text || "");
                         }}
                       >
-                        Cancel
+                        Edit
                       </button>
-                    </div>
+                    )}
                   </div>
-                ) : (
-                  <ReactMarkdown>{msg.text}</ReactMarkdown>
-                )}
 
-                {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
-                  <div className="bubble-image-strip">
-                    {((msg as any).images as string[]).map((src, imgIdx) => (
-                      <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
-                        <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
+                  <strong>
+                    {msg.role === "user" ? "You:" : (isGodotError ? "Godot Monitor:" : `${assistantLabel}:`)}
+                  </strong>{" "}
+
+                  {isEditingThis ? (
+                    <div className="bubble-edit-wrap">
+                      <textarea
+                        className="bubble-edit-input"
+                        value={editingLastUserMsgDraft}
+                        onChange={(e) => setEditingLastUserMsgDraft(e.target.value)}
+                        rows={3}
+                      />
+                      <div className="bubble-edit-actions">
+                        <button
+                          type="button"
+                          className="setup-btn primary"
+                          onClick={() => editAndResendLastUserMessage(editingLastUserMsgDraft)}
+                        >
+                          Save + Resend
+                        </button>
+                        <button
+                          type="button"
+                          className="setup-btn"
+                          onClick={() => {
+                            setEditingLastUserMsgIdx(null);
+                            setEditingLastUserMsgDraft("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                  )}
+
+                  {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
+                    <div className="bubble-image-strip">
+                      {((msg as any).images as string[]).map((src, imgIdx) => (
+                        <div key={`msg_${idx}_img_${imgIdx}`} className="bubble-image-card">
+                          <img src={src} alt={`attachment ${imgIdx + 1}`} className="bubble-image-thumb" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            <div ref={chatEndRef} />
+          </div>
+
+          {autonomousPanelEnabled && (
+            <aside className={`autonomous-panel${autonomousPanelCollapsed ? " collapsed" : ""}`}>
+              {!autonomousPanelCollapsed && (
+                <>
+                  <div className="autonomous-panel-header">
+                    <div>
+                      <strong>Autonomous Tasks</strong>
+                      <div className="autonomous-panel-subtitle">Plan goal- or time-driven self-wake tasks.</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="setup-btn"
+                      onClick={() => setAutonomousPanelCollapsed(true)}
+                    >
+                      Hide
+                    </button>
+                  </div>
+
+                  <div className="autonomous-panel-list">
+                    {autonomousTasks.map((task, idx) => (
+                      <div key={task.id} className="autonomous-task-card">
+                        <div className="autonomous-task-top">
+                          <span>Task {idx + 1}</span>
+                          <button
+                            type="button"
+                            className="autonomous-task-delete"
+                            onClick={() => setAutonomousDeleteConfirmId(task.id)}
+                            title="Delete task"
+                          >
+                            ×
+                          </button>
+                        </div>
+
+                        <textarea
+                          className="autonomous-task-prompt"
+                          value={task.prompt}
+                          rows={5}
+                          onChange={(e) => updateAutonomousTask(task.id, { prompt: e.target.value })}
+                          onInput={(e) => resizeAutonomousPrompt(e.currentTarget)}
+                          placeholder="Primary prompt for this automated task..."
+                        />
+
+                        <div className="autonomous-task-row">
+                          <label>Project</label>
+                          <select
+                            value={task.projectId || ""}
+                            onChange={(e) => updateAutonomousTask(task.id, { projectId: e.target.value || null })}
+                          >
+                            <option value="">No Project</option>
+                            {repoStore.projects.filter((p) => p.enabled).map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="autonomous-task-row split">
+                          <button
+                            type="button"
+                            className={`setup-btn${task.networkAllowed ? " primary" : ""}`}
+                            onClick={() => updateAutonomousTask(task.id, { networkAllowed: !task.networkAllowed })}
+                          >
+                            Network: {task.networkAllowed ? "Allowed" : "Blocked"}
+                          </button>
+                          <div className="autonomous-task-time-wrap">
+                            <input
+                              type="number"
+                              min="0"
+                              step="1"
+                              value={task.intervalValue}
+                              onChange={(e) => updateAutonomousTask(task.id, { intervalValue: e.target.value })}
+                              placeholder="Time"
+                            />
+                            <select
+                              value={task.intervalUnit}
+                              onChange={(e) => updateAutonomousTask(task.id, { intervalUnit: e.target.value as AutonomousTaskIntervalUnit })}
+                            >
+                              <option value="seconds">Seconds</option>
+                              <option value="minutes">Minutes</option>
+                              <option value="hours">Hours</option>
+                              <option value="days">Days</option>
+                              <option value="custom">Custom</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {task.intervalUnit === "custom" && (
+                          <input
+                            className="autonomous-task-custom"
+                            value={task.customSchedulePrompt}
+                            onChange={(e) => updateAutonomousTask(task.id, { customSchedulePrompt: e.target.value })}
+                            placeholder="Custom schedule prompt (for example: every Tuesday at 9 AM)"
+                          />
+                        )}
+
+                        {autonomousDeleteConfirmId === task.id && (
+                          <div className="autonomous-delete-confirm">
+                            <span>Delete this task?</span>
+                            <div>
+                              <button type="button" className="setup-btn" onClick={() => setAutonomousDeleteConfirmId(null)}>Cancel</button>
+                              <button type="button" className="setup-btn primary" onClick={() => confirmDeleteAutonomousTask(task.id)}>Delete</button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
-                )}
-              </div>
-            );
-          })}
-          <div ref={chatEndRef} />
+
+                  <button type="button" className="setup-btn primary autonomous-add-btn" onClick={addAutonomousTask}>
+                    + Add Task
+                  </button>
+                </>
+              )}
+            </aside>
+          )}
+
+          {autonomousPanelEnabled && autonomousPanelCollapsed && (
+            <button
+              type="button"
+              className="autonomous-reveal-handle"
+              onClick={() => setAutonomousPanelCollapsed(false)}
+              title="Show autonomous tasks panel"
+            >
+              ◀
+            </button>
+          )}
         </div>
       )}
       {!hasChatTabs && currentTab?.type !== "settings" && (
@@ -10914,6 +11918,26 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       Last planner-selected route: {plannerRouteSummary.replace(/^Planner route:\s*/i, "")}
                     </div>
                   )}
+                  {!!plannerPhase && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 6 }}>
+                      Planner phase: {plannerPhase.replace(/_/g, " ")} {plannerCheckpointCount > 0 ? `| checkpoints: ${plannerCheckpointCount}` : ""}
+                    </div>
+                  )}
+                  {!!plannerResumeHint && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
+                      Resume hint: {plannerResumeHint}
+                    </div>
+                  )}
+                  {!!plannerSelectedProfile && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 6 }}>
+                      Planner thinking profile: {plannerSelectedProfile}
+                    </div>
+                  )}
+                  {!!plannerProfileReason && plannerProfileReason !== "specified_via_request_or_settings" && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
+                      Profile rationale: {plannerProfileReason}
+                    </div>
+                  )}
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     {configuredRouteModels.map((m, i) => (
                       <span key={`route_${m}_${i}`} style={{ border: "1px solid rgba(151,176,214,0.45)", borderRadius: 999, padding: "2px 8px", fontSize: 11, color: "#d4e4ff" }}>{m}</span>
@@ -11304,6 +12328,229 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </button>
               </div>
 
+              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
+                  Runtime Notifications + Mini-Player
+                </div>
+                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.miniPlayerEnabled}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, miniPlayerEnabled: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Enable compact runtime mini-player in chat
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyMilestones}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyMilestones: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify milestones (planning/executing/qa/paused)
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyCompletion}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyCompletion: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify completion
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyBlockers}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyBlockers: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify blockers/failures
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.quietMode}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, quietMode: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Quiet mode (suppress runtime toasts)
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
+                  Cognitive Doc Transparency Editor
+                </div>
+                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
+                  <label>
+                    Goal ID (optional)
+                    <input
+                      className="model-input"
+                      value={cognitiveGoalDraft}
+                      onChange={(e) => setCognitiveGoalDraft(e.target.value)}
+                      placeholder={`Defaults to active goal for tab${activeTab}`}
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <label>
+                    Doc Type
+                    <input
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      placeholder="planning_logs"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <label>
+                    Context Slice Max Characters
+                    <input
+                      className="model-input"
+                      value={cognitiveDocMaxCharsDraft}
+                      onChange={(e) => setCognitiveDocMaxCharsDraft(e.target.value)}
+                      placeholder="6000"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void loadCognitiveDocSliceFromSettings(); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Load Slice
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void refreshCognitiveDocMetadataFromSettings(); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Refresh Metadata
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => {
+                        setCognitiveGoalDraft("");
+                        setCognitiveDocTypeDraft("planning_logs");
+                        setCognitiveDocMaxCharsDraft("6000");
+                        setCognitiveDocSlice("");
+                        setCognitiveDocAppendText("");
+                        setCognitiveDocVersions([]);
+                        setCognitiveDocNodes([]);
+                        setCognitiveDocSelectedVersion(null);
+                        setCognitiveDocVersionPreview("");
+                        setCognitiveDocStatus("");
+                      }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Reset Editor Fields
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void resetRuntimeFromSettings(); }}
+                      disabled={runtimeControlBusy}
+                    >
+                      Reset Runtime Idle
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void clearCognitiveDocHistoryFromSettings("lane"); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Clear Lane History
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void clearCognitiveDocHistoryFromSettings("goal"); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Clear Goal History
+                    </button>
+                  </div>
+                  <label>
+                    Available Lanes For Goal
+                    <select
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      style={{ marginTop: 4 }}
+                    >
+                      <option value={cognitiveDocTypeDraft}>{cognitiveDocTypeDraft || "planning_logs"}</option>
+                      {cognitiveDocNodes
+                        .filter((node) => !!node.docType)
+                        .map((node) => (
+                          <option key={`${node.docType}_${node.latestVersion}`} value={node.docType}>
+                            {node.docType} (latest v{node.latestVersion})
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label>
+                    Versions ({cognitiveDocVersions.length})
+                    <select
+                      className="model-input"
+                      value={cognitiveDocSelectedVersion == null ? "" : String(cognitiveDocSelectedVersion)}
+                      onChange={(e) => handleCognitiveVersionSelection(Number(e.target.value))}
+                      style={{ marginTop: 4 }}
+                    >
+                      <option value="">Select version</option>
+                      {cognitiveDocVersions
+                        .slice()
+                        .reverse()
+                        .map((version) => (
+                          <option key={version.version} value={String(version.version)}>
+                            v{version.version} by {version.author || "unknown"} @ {version.ts ? new Date(version.ts * 1000).toLocaleString() : "(n/a)"}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 100, resize: "vertical" }}
+                    readOnly
+                    value={cognitiveDocVersionPreview}
+                    placeholder="Selected version content appears here..."
+                  />
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 120, resize: "vertical" }}
+                    readOnly
+                    value={cognitiveDocSlice}
+                    placeholder="Loaded cognitive doc context slice appears here..."
+                  />
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 90, resize: "vertical" }}
+                    value={cognitiveDocAppendText}
+                    onChange={(e) => setCognitiveDocAppendText(e.target.value)}
+                    placeholder="Append a note to this goal/doc lane..."
+                  />
+                  <button
+                    className="setup-btn"
+                    type="button"
+                    onClick={() => { void appendCognitiveDocNoteFromSettings(); }}
+                    disabled={cognitiveDocBusy || !cognitiveDocAppendText.trim()}
+                  >
+                    Append Note
+                  </button>
+                  <div style={{ fontSize: 11, opacity: 0.9 }}>
+                    {cognitiveDocStatus || "Use Refresh Metadata to inspect lanes and versions for the active goal."}
+                  </div>
+                </div>
+              </div>
+
               <details>
                 <summary style={{ cursor: "pointer", color: "#b9cae7", marginBottom: 8 }}>Memory Debug Signals</summary>
                 <div style={{ fontSize: 13, lineHeight: 1.5, marginTop: 8 }}>
@@ -11600,6 +12847,51 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             </div>
           ) : null}
 
+          {(() => {
+            const runtimeState = activeRuntimeStateForTab(activeTab);
+            if (!runtimeState) return null;
+
+            const phaseLabel = formatRuntimePhaseLabel(runtimeState.phase);
+            const step = String(runtimeState.currentStep || "").trim();
+            const model = String(runtimeState.activeModel || "").trim();
+            const iter = Number.isFinite(runtimeState.iterationCount) ? runtimeState.iterationCount : 0;
+
+            return (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: isLightMode ? "#4b647c" : "#9fb2c9" }}>
+                  Runtime: {phaseLabel}{step ? ` | step: ${step}` : ""}{model ? ` | model: ${model}` : ""}{iter > 0 ? ` | iter: ${iter}` : ""}
+                </span>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase === "paused" || runtimeState.phase === "completed" || runtimeState.phase === "failed" || runtimeState.phase === "idle"}
+                  onClick={() => { void runRuntimeControl("pause"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Pause
+                </button>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase !== "paused"}
+                  onClick={() => { void runRuntimeControl("resume"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Resume
+                </button>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  disabled={runtimeControlBusy || runtimeState.phase === "idle"}
+                  onClick={() => { void runRuntimeControl("reset_idle"); }}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                >
+                  Reset
+                </button>
+              </div>
+            );
+          })()}
+
           {!!pendingImages.length && (
             <div className="image-attachment-strip">
               {pendingImages.map((img) => (
@@ -11609,6 +12901,51 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <button type="button" className="image-attachment-remove" onClick={() => removePendingImage(img.id)}>×</button>
                 </div>
               ))}
+
+              {currentTab?.type === "chat" && runtimeNotificationPrefs.miniPlayerEnabled && (() => {
+                const runtimeState = activeRuntimeStateForTab(activeTab);
+                if (!runtimeState) return null;
+                if (runtimeState.phase === "idle") return null;
+                return (
+                  <div className="runtime-mini-player">
+                    <div className="runtime-mini-header">
+                      <strong>Runtime</strong>
+                      <span>{formatRuntimePhaseLabel(runtimeState.phase)}</span>
+                    </div>
+                    <div className="runtime-mini-body">
+                      <div>Step: {runtimeState.currentStep || "(none)"}</div>
+                      <div>Model: {runtimeState.activeModel || "(none)"}</div>
+                      <div>Iter: {runtimeState.iterationCount}</div>
+                    </div>
+                    <div className="runtime-mini-actions">
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy || runtimeState.phase === "paused" || runtimeState.phase === "completed" || runtimeState.phase === "failed"}
+                        onClick={() => { void runRuntimeControl("pause"); }}
+                      >
+                        Pause
+                      </button>
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy || runtimeState.phase !== "paused"}
+                        onClick={() => { void runRuntimeControl("resume"); }}
+                      >
+                        Resume
+                      </button>
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy}
+                        onClick={() => { void runRuntimeControl("reset_idle"); }}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
           <textarea

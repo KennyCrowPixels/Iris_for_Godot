@@ -1,4 +1,10 @@
-export type Message = { role: "user" | "llm"; text: string; time?: number };
+export type Message = {
+  role: "user" | "llm";
+  text: string;
+  time?: number;
+  thinkingLog?: unknown;
+  images?: string[];
+};
 
 export function updateMessagesAppendUser(prev: Message[], text: string, images?: string[]): Message[] {
   return [...prev, { role: "user", text, time: Math.floor(Date.now() / 1000), ...(images && images.length ? { images } : {}) } as any];

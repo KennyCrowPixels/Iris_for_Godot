@@ -1,6 +1,12 @@
 export type Role = "user" | "llm";
 
-export type ChatMessage = { role: "user" | "llm"; text: string };
+export type ChatMessage = {
+	role: "user" | "llm";
+	text: string;
+	time?: number;
+	thinkingLog?: unknown;
+	images?: string[];
+};
 export type Artifact = { lang: string; filename?: string; content: string; ts?: number };
 
 export type Tab = {

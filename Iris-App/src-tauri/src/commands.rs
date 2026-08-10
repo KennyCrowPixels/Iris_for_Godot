@@ -148,6 +148,160 @@ pub struct ChatMessage {
     pub text: String,
     #[serde(default)]
     pub time: i64, // unix seconds
+  #[serde(default, rename = "thinkingLog", alias = "thinking_log")]
+  pub thinking_log: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveRuntimePhase {
+  Idle,
+  Planning,
+  Executing,
+  Qa,
+  Paused,
+  Completed,
+  Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeState {
+  pub phase: CognitiveRuntimePhase,
+  pub resume_phase: Option<CognitiveRuntimePhase>,
+  pub goal_id: String,
+  pub goal_label: String,
+  pub current_step: String,
+  pub active_model: String,
+  pub last_transition_action: String,
+  pub last_transition_at: i64,
+  pub started_at: i64,
+  pub completed_at: i64,
+  pub failed_at: i64,
+  pub paused_at: i64,
+  pub pause_reason: String,
+  pub failure_reason: String,
+  pub iteration_count: u32,
+}
+
+impl Default for CognitiveRuntimeState {
+  fn default() -> Self {
+    Self {
+      phase: CognitiveRuntimePhase::Idle,
+      resume_phase: None,
+      goal_id: String::new(),
+      goal_label: String::new(),
+      current_step: String::new(),
+      active_model: String::new(),
+      last_transition_action: "init".to_string(),
+      last_transition_at: now_ts(),
+      started_at: 0,
+      completed_at: 0,
+      failed_at: 0,
+      paused_at: 0,
+      pause_reason: String::new(),
+      failure_reason: String::new(),
+      iteration_count: 0,
+    }
+  }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeTransitionArgs {
+  pub action: String,
+  #[serde(default)]
+  pub goal_id: Option<String>,
+  #[serde(default)]
+  pub goal_label: Option<String>,
+  #[serde(default)]
+  pub current_step: Option<String>,
+  #[serde(default)]
+  pub active_model: Option<String>,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CognitiveRuntimeAction {
+  StartPlanning,
+  StartExecuting,
+  StartQa,
+  Pause,
+  Resume,
+  Complete,
+  Fail,
+  ResetIdle,
+  UpdateProgress,
+}
+
+impl CognitiveRuntimeAction {
+  fn parse(raw: &str) -> Result<Self, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+      "start_planning" => Ok(Self::StartPlanning),
+      "start_executing" => Ok(Self::StartExecuting),
+      "start_qa" => Ok(Self::StartQa),
+      "pause" => Ok(Self::Pause),
+      "resume" => Ok(Self::Resume),
+      "complete" => Ok(Self::Complete),
+      "fail" => Ok(Self::Fail),
+      "reset_idle" => Ok(Self::ResetIdle),
+      "update_progress" => Ok(Self::UpdateProgress),
+      _ => Err(format!(
+        "Unknown cognitive runtime action '{}'. Expected one of: start_planning, start_executing, start_qa, pause, resume, complete, fail, reset_idle, update_progress",
+        raw
+      )),
+    }
+  }
+
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::StartPlanning => "start_planning",
+      Self::StartExecuting => "start_executing",
+      Self::StartQa => "start_qa",
+      Self::Pause => "pause",
+      Self::Resume => "resume",
+      Self::Complete => "complete",
+      Self::Fail => "fail",
+      Self::ResetIdle => "reset_idle",
+      Self::UpdateProgress => "update_progress",
+    }
+  }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocVersion {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub version: u64,
+  pub ts: i64,
+  pub author: String,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocNode {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub latest_version: u64,
+  pub latest_ts: i64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendCognitiveDocArgs {
+  pub goal_id: String,
+  pub doc_type: String,
+  #[serde(default)]
+  pub author: Option<String>,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: Option<serde_json::Value>,
 }
 
 
@@ -172,6 +326,8 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const MODEL_TAG: &str = "iris-organizer:latest";
 const INTEGRITY_NORMAL_BAND: f32 = 0.80;
 const INTEGRITY_CAUTION_BAND: f32 = 0.60;
+const COGNITIVE_MAX_ACTIVE_SECS: i64 = 900;
+const COGNITIVE_MAX_ITERATIONS: u32 = 18;
 
 #[tauri::command]
 pub async fn submit_turn(
@@ -190,9 +346,65 @@ pub async fn submit_turn(
     // Standard chat path — attach tools only when the user's request actually needs them.
     println!("[Routing] Standard Chat Payload (intent-gated tools)");
 
+    let goal_id = format!("tab{}_{}", payload.tab_id, now_ts());
+    let _ = transition_cognitive_runtime_state_internal(
+      &app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "start_planning".to_string(),
+        goal_id: Some(goal_id.clone()),
+        goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+        current_step: Some("compile_agent_context".to_string()),
+        active_model: None,
+        reason: None,
+      },
+    );
+    if let Err(reason) = enforce_cognitive_runtime_policy(
+      &app,
+      &window,
+      &event_name,
+      payload.tab_id,
+      &goal_id,
+      "compile_agent_context",
+      None,
+    ) {
+      let _ = window.emit(&event_name, IrisEvent::Error(reason));
+      let _ = window.emit(&event_name, IrisEvent::Done);
+      return Ok(());
+    }
+    let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> planning".to_string()));
+
     match compile_agent_context(&app, &payload).await {
       Ok(context) => {
         let selected_model = resolve_submit_model(&app, &payload);
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "start_executing".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("execute_ollama_chat_stream".to_string()),
+            active_model: Some(selected_model.clone()),
+            reason: None,
+          },
+        );
+        if let Err(reason) = enforce_cognitive_runtime_policy(
+          &app,
+          &window,
+          &event_name,
+          payload.tab_id,
+          &goal_id,
+          "execute_ollama_chat_stream",
+          Some(&selected_model),
+        ) {
+          let _ = window.emit(&event_name, IrisEvent::Error(reason));
+          let _ = window.emit(&event_name, IrisEvent::Done);
+          return Ok(());
+        }
+        let _ = window.emit(&event_name, IrisEvent::Status(format!(
+          "Runtime phase -> executing ({})",
+          selected_model
+        )));
+
         let historical_count = context.messages.len().saturating_sub(1);
         let msg = format!(
           "Rust Context Built: {} historical messages loaded. System Prompt length: {}. Model: {}",
@@ -231,14 +443,79 @@ pub async fn submit_turn(
         let request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
         match execute_ollama_chat_stream(&window, &event_name, &request).await {
           Ok(reply) => {
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "start_qa".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("persist_turn_snapshot".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: None,
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> qa".to_string()));
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
+            if reply.trim().is_empty() {
+              let reason = "exit_criteria_failed: model produced empty final response".to_string();
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "fail".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("qa_exit_criteria".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: Some(reason.clone()),
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed (exit criteria)".to_string()));
+              let _ = window.emit(&event_name, IrisEvent::Error(reason));
+            } else {
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "complete".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("done".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: None,
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> completed".to_string()));
+            }
           }
-          Err(_) => {
+          Err(err) => {
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, "");
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "fail".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("execute_ollama_chat_stream".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: Some(err),
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
           }
         }
       }
       Err(e) => {
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "fail".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("compile_agent_context".to_string()),
+            active_model: None,
+            reason: Some(e.clone()),
+          },
+        );
+        let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
         let _ = window.emit(&event_name, IrisEvent::Error(e));
         let _ = window.emit(&event_name, IrisEvent::Done);
       }
@@ -1394,6 +1671,7 @@ fn persist_rust_turn_snapshot(
       role: "user".to_string(),
       text: user_text.to_string(),
       time: ts,
+      thinking_log: None,
     });
   }
   if !assistant_text.trim().is_empty() {
@@ -1401,6 +1679,7 @@ fn persist_rust_turn_snapshot(
       role: "llm".to_string(),
       text: assistant_text.to_string(),
       time: ts,
+      thinking_log: None,
     });
   }
   if snap.title.trim().is_empty() {
@@ -2507,7 +2786,72 @@ pub struct InterpretPlanV2 {
   pub route_summary: String,
   pub status_hint: String,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub selected_thinking_profile: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub profile_selection_reason: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_resume_hint: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase_checkpoints: Option<Vec<PlannerPhaseCheckpoint>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub routine_plan: Option<RoutinePlan>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerPhaseCheckpoint {
+  pub phase: String,
+  pub label: String,
+  pub summary: String,
+  pub doc_type: String,
+  pub doc_version: u64,
+  pub ts: i64,
+}
+
+fn auto_select_thinking_profile(
+  primary_intent: &str,
+  pressure: f32,
+  needs_vision: bool,
+  should_use_coder: bool,
+  token_budget: Option<usize>,
+) -> (String, String) {
+  let budget = token_budget.unwrap_or(1200);
+
+  if pressure >= 0.72 || (should_use_coder && (primary_intent == "code_edit_followup" || primary_intent == "dev_task")) || budget >= 3200 {
+    return (
+      "Meticulous".to_string(),
+      format!(
+        "auto_selected: high complexity (pressure={:.2}, coder={}, budget={})",
+        pressure,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  if pressure >= 0.45 || should_use_coder || needs_vision || budget >= 1800 {
+    return (
+      "Advanced".to_string(),
+      format!(
+        "auto_selected: medium complexity (pressure={:.2}, vision={}, coder={}, budget={})",
+        pressure,
+        needs_vision,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  (
+    "Fast".to_string(),
+    format!(
+      "auto_selected: lightweight path (pressure={:.2}, budget={})",
+      pressure,
+      budget
+    ),
+  )
 }
 
 
@@ -2532,6 +2876,533 @@ fn tab_file(app: &tauri::AppHandle, tab_id: u32) -> Result<PathBuf, String> {
 fn setup_flags_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   let dir = memory_dir(app)?;
   Ok(dir.join("setup_flags.json"))
+}
+
+fn cognitive_runtime_state_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  Ok(dir.join("cognitive_runtime_state.json"))
+}
+
+fn cognitive_docs_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  let root = dir.join("cognitive_docs");
+  fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+  Ok(root)
+}
+
+fn sanitize_cognitive_doc_component(raw: &str, fallback: &str) -> String {
+  let mut out = String::with_capacity(raw.len());
+  for ch in raw.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+      out.push(ch);
+    }
+  }
+  let trimmed = out.trim_matches('_').trim_matches('-').to_string();
+  if trimmed.is_empty() {
+    fallback.to_string()
+  } else {
+    trimmed
+  }
+}
+
+fn goal_doc_dir(app: &tauri::AppHandle, goal_id: &str) -> Result<PathBuf, String> {
+  let root = cognitive_docs_root(app)?;
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let dir = root.join(format!("goal_{}", safe_goal));
+  fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+  Ok(dir)
+}
+
+fn cognitive_doc_versions_file(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Result<PathBuf, String> {
+  let dir = goal_doc_dir(app, goal_id)?;
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  Ok(dir.join(format!("{}.jsonl", safe_type)))
+}
+
+fn load_cognitive_doc_versions(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Vec<CognitiveDocVersion> {
+  let path = match cognitive_doc_versions_file(app, goal_id, doc_type) {
+    Ok(p) => p,
+    Err(_) => return Vec::new(),
+  };
+  if !path.exists() {
+    return Vec::new();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return Vec::new(),
+  };
+
+  raw
+    .lines()
+    .filter_map(|line| serde_json::from_str::<CognitiveDocVersion>(line).ok())
+    .collect()
+}
+
+fn append_cognitive_doc_version_internal(
+  app: &tauri::AppHandle,
+  goal_id: &str,
+  doc_type: &str,
+  author: &str,
+  content: &str,
+  metadata: serde_json::Value,
+) -> Result<CognitiveDocVersion, String> {
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  let path = cognitive_doc_versions_file(app, &safe_goal, &safe_type)?;
+
+  let existing = load_cognitive_doc_versions(app, &safe_goal, &safe_type);
+  let next_version = existing.last().map(|v| v.version + 1).unwrap_or(1);
+
+  let version = CognitiveDocVersion {
+    goal_id: safe_goal,
+    doc_type: safe_type,
+    version: next_version,
+    ts: now_ts(),
+    author: author.to_string(),
+    content: content.to_string(),
+    metadata,
+  };
+
+  let json_line = serde_json::to_string(&version).map_err(|e| e.to_string())?;
+  let mut f = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&path)
+    .map_err(|e| format!("Failed opening {}: {}", path.display(), e))?;
+  f.write_all(format!("{}\n", json_line).as_bytes())
+    .map_err(|e| format!("Failed writing {}: {}", path.display(), e))?;
+  f.sync_all().ok();
+  Ok(version)
+}
+
+fn read_cognitive_runtime_state(app: &tauri::AppHandle) -> CognitiveRuntimeState {
+  let path = match cognitive_runtime_state_file(app) {
+    Ok(p) => p,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  if !path.exists() {
+    return CognitiveRuntimeState::default();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  serde_json::from_str::<CognitiveRuntimeState>(&raw).unwrap_or_default()
+}
+
+fn write_cognitive_runtime_state(app: &tauri::AppHandle, state: &CognitiveRuntimeState) -> Result<(), String> {
+  let path = cognitive_runtime_state_file(app)?;
+  let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+  atomic_write_json(&path, &json)
+}
+
+fn transition_phase(current: CognitiveRuntimePhase, action: CognitiveRuntimeAction) -> Result<CognitiveRuntimePhase, String> {
+  use CognitiveRuntimeAction::*;
+  use CognitiveRuntimePhase::*;
+
+  match (current, action) {
+    (Idle, StartPlanning) => Ok(Planning),
+    (Idle, ResetIdle) => Ok(Idle),
+
+    (Planning, StartExecuting) => Ok(Executing),
+    (Planning, Pause) => Ok(Paused),
+    (Planning, Fail) => Ok(Failed),
+    (Planning, ResetIdle) => Ok(Idle),
+    (Planning, UpdateProgress) => Ok(Planning),
+
+    (Executing, StartQa) => Ok(Qa),
+    (Executing, Pause) => Ok(Paused),
+    (Executing, Fail) => Ok(Failed),
+    (Executing, ResetIdle) => Ok(Idle),
+    (Executing, UpdateProgress) => Ok(Executing),
+
+    (Qa, StartExecuting) => Ok(Executing),
+    (Qa, Pause) => Ok(Paused),
+    (Qa, Complete) => Ok(Completed),
+    (Qa, Fail) => Ok(Failed),
+    (Qa, ResetIdle) => Ok(Idle),
+    (Qa, UpdateProgress) => Ok(Qa),
+
+    (Paused, Resume) => Ok(Paused),
+    (Paused, Fail) => Ok(Failed),
+    (Paused, ResetIdle) => Ok(Idle),
+    (Paused, UpdateProgress) => Ok(Paused),
+
+    (Completed, ResetIdle) => Ok(Idle),
+    (Failed, ResetIdle) => Ok(Idle),
+
+    (phase, attempted) => Err(format!(
+      "Invalid cognitive runtime transition: phase={:?}, action={}",
+      phase,
+      attempted.as_str()
+    )),
+  }
+}
+
+fn apply_cognitive_runtime_transition(
+  mut state: CognitiveRuntimeState,
+  args: &CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let action = CognitiveRuntimeAction::parse(&args.action)?;
+  let now = now_ts();
+  let previous_phase = state.phase.clone();
+  let next_phase = transition_phase(previous_phase.clone(), action)?;
+
+  if let Some(goal_id) = &args.goal_id {
+    state.goal_id = goal_id.trim().to_string();
+  }
+  if let Some(goal_label) = &args.goal_label {
+    state.goal_label = goal_label.trim().to_string();
+  }
+  if let Some(step) = &args.current_step {
+    state.current_step = step.trim().to_string();
+  }
+  if let Some(model) = &args.active_model {
+    state.active_model = model.trim().to_string();
+  }
+
+  match action {
+    CognitiveRuntimeAction::StartPlanning => {
+      state.phase = next_phase;
+      state.resume_phase = None;
+      state.started_at = now;
+      state.completed_at = 0;
+      state.failed_at = 0;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+      state.failure_reason.clear();
+      state.iteration_count = 0;
+      if state.goal_id.is_empty() {
+        state.goal_id = format!("goal_{}", now);
+      }
+      if state.goal_label.is_empty() {
+        state.goal_label = "Autonomous Goal".to_string();
+      }
+    }
+    CognitiveRuntimeAction::StartExecuting | CognitiveRuntimeAction::StartQa => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+      if matches!(action, CognitiveRuntimeAction::StartExecuting) {
+        state.iteration_count = state.iteration_count.saturating_add(1);
+      }
+    }
+    CognitiveRuntimeAction::Pause => {
+      state.resume_phase = Some(previous_phase);
+      state.phase = next_phase;
+      state.paused_at = now;
+      state.pause_reason = args.reason.clone().unwrap_or_else(|| "paused".to_string());
+    }
+    CognitiveRuntimeAction::Resume => {
+      let resume_target = state
+        .resume_phase
+        .clone()
+        .ok_or_else(|| "Cannot resume cognitive runtime: no saved resume phase".to_string())?;
+      if resume_target != CognitiveRuntimePhase::Planning && resume_target != CognitiveRuntimePhase::Executing && resume_target != CognitiveRuntimePhase::Qa {
+        return Err(format!(
+          "Cannot resume cognitive runtime: unsupported resume phase {:?}",
+          resume_target
+        ));
+      }
+      state.phase = resume_target;
+      state.resume_phase = None;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+    }
+    CognitiveRuntimeAction::Complete => {
+      state.phase = next_phase;
+      state.completed_at = now;
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::Fail => {
+      state.phase = next_phase;
+      state.failed_at = now;
+      state.failure_reason = args.reason.clone().unwrap_or_else(|| "failed".to_string());
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::ResetIdle => {
+      state = CognitiveRuntimeState::default();
+      state.last_transition_at = now;
+    }
+    CognitiveRuntimeAction::UpdateProgress => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+    }
+  }
+
+  state.last_transition_action = action.as_str().to_string();
+  state.last_transition_at = now;
+  Ok(state)
+}
+
+#[tauri::command]
+pub fn get_cognitive_runtime_state(app: tauri::AppHandle) -> Result<CognitiveRuntimeState, String> {
+  Ok(read_cognitive_runtime_state(&app))
+}
+
+#[tauri::command]
+pub fn append_cognitive_doc_version(
+  app: tauri::AppHandle,
+  args: AppendCognitiveDocArgs,
+) -> Result<CognitiveDocVersion, String> {
+  append_cognitive_doc_version_internal(
+    &app,
+    &args.goal_id,
+    &args.doc_type,
+    args.author.as_deref().unwrap_or("user"),
+    &args.content,
+    args.metadata.unwrap_or_else(|| serde_json::json!({})),
+  )
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+  limit: Option<usize>,
+) -> Result<Vec<CognitiveDocVersion>, String> {
+  let mut versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  if let Some(cap) = limit {
+    if versions.len() > cap {
+      let keep_from = versions.len().saturating_sub(cap);
+      versions = versions.split_off(keep_from);
+    }
+  }
+  Ok(versions)
+}
+
+#[tauri::command]
+pub fn get_latest_cognitive_doc_version(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+) -> Result<Option<CognitiveDocVersion>, String> {
+  let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  Ok(versions.last().cloned())
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_nodes(
+  app: tauri::AppHandle,
+  goal_id: String,
+) -> Result<Vec<CognitiveDocNode>, String> {
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  let mut out: Vec<CognitiveDocNode> = Vec::new();
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      let doc_type = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("phase_logs")
+        .to_string();
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+      if let Some(last) = versions.last() {
+        out.push(CognitiveDocNode {
+          goal_id: last.goal_id.clone(),
+          doc_type: last.doc_type.clone(),
+          latest_version: last.version,
+          latest_ts: last.ts,
+        });
+      }
+    }
+  }
+  out.sort_by(|a, b| b.latest_ts.cmp(&a.latest_ts));
+  Ok(out)
+}
+
+#[tauri::command]
+pub fn read_cognitive_doc_context_slice(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+  max_chars: Option<usize>,
+) -> Result<String, String> {
+  let cap = max_chars.unwrap_or(3000).max(240).min(20_000);
+  let mut lines: Vec<String> = Vec::new();
+
+  if let Some(kind) = doc_type {
+    let versions = load_cognitive_doc_versions(&app, &goal_id, &kind);
+    for v in versions.iter().rev().take(8) {
+      lines.push(format!(
+        "[{} v{} @{} by {}] {}",
+        v.doc_type,
+        v.version,
+        v.ts,
+        v.author,
+        v.content
+      ));
+    }
+  } else {
+    let nodes = list_cognitive_doc_nodes(app.clone(), goal_id.clone())?;
+    for node in nodes.into_iter().take(6) {
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &node.doc_type);
+      if let Some(v) = versions.last() {
+        lines.push(format!(
+          "[{} v{} @{} by {}] {}",
+          v.doc_type,
+          v.version,
+          v.ts,
+          v.author,
+          v.content
+        ));
+      }
+    }
+  }
+
+  if lines.is_empty() {
+    return Ok(String::new());
+  }
+
+  let joined = lines.join("\n");
+  let sliced: String = joined.chars().take(cap).collect();
+  Ok(sliced)
+}
+
+#[tauri::command]
+pub fn clear_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+) -> Result<usize, String> {
+  let mut cleared = 0usize;
+  if let Some(kind) = doc_type {
+    let target = cognitive_doc_versions_file(&app, &goal_id, &kind)?;
+    if target.exists() {
+      fs::remove_file(&target)
+        .map_err(|e| format!("Failed removing {}: {}", target.display(), e))?;
+      cleared = 1;
+    }
+    return Ok(cleared);
+  }
+
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      fs::remove_file(&path)
+        .map_err(|e| format!("Failed removing {}: {}", path.display(), e))?;
+      cleared = cleared.saturating_add(1);
+    }
+  }
+
+  Ok(cleared)
+}
+
+#[tauri::command]
+pub fn transition_cognitive_runtime_state(
+  app: tauri::AppHandle,
+  args: CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  transition_cognitive_runtime_state_internal(&app, &args)
+}
+
+fn transition_cognitive_runtime_state_internal(
+  app: &tauri::AppHandle,
+  args: &CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let current = read_cognitive_runtime_state(&app);
+  let next = apply_cognitive_runtime_transition(current, &args)?;
+  write_cognitive_runtime_state(&app, &next)?;
+  let event_meta = serde_json::json!({
+    "phase": format!("{:?}", &next.phase).to_lowercase(),
+    "action": &next.last_transition_action,
+    "currentStep": &next.current_step,
+    "activeModel": &next.active_model,
+    "iterationCount": next.iteration_count,
+    "failedAt": next.failed_at,
+    "completedAt": next.completed_at,
+  });
+  let _ = append_cognitive_doc_version_internal(
+    app,
+    if next.goal_id.trim().is_empty() { "global" } else { &next.goal_id },
+    "phase_logs",
+    "runtime",
+    &format!(
+      "phase={} action={} step={} model={} iterations={}",
+      format!("{:?}", &next.phase).to_lowercase(),
+      &next.last_transition_action,
+      &next.current_step,
+      &next.active_model,
+      next.iteration_count
+    ),
+    event_meta,
+  );
+  let _ = app.emit("cognitive_runtime_state", &next);
+  Ok(next)
+}
+
+fn evaluate_cognitive_runtime_policy(state: &CognitiveRuntimeState) -> Result<(), String> {
+  let now = now_ts();
+  if state.phase == CognitiveRuntimePhase::Planning
+    || state.phase == CognitiveRuntimePhase::Executing
+    || state.phase == CognitiveRuntimePhase::Qa
+  {
+    if state.started_at > 0 {
+      let active_secs = now.saturating_sub(state.started_at);
+      if active_secs > COGNITIVE_MAX_ACTIVE_SECS {
+        return Err(format!(
+          "anti_loop_guard: active runtime exceeded time budget ({}s > {}s)",
+          active_secs,
+          COGNITIVE_MAX_ACTIVE_SECS
+        ));
+      }
+    }
+    if state.iteration_count > COGNITIVE_MAX_ITERATIONS {
+      return Err(format!(
+        "anti_loop_guard: iteration budget exceeded ({} > {})",
+        state.iteration_count,
+        COGNITIVE_MAX_ITERATIONS
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn enforce_cognitive_runtime_policy(
+  app: &tauri::AppHandle,
+  window: &tauri::Window,
+  event_name: &str,
+  tab_id: u32,
+  goal_id: &str,
+  step: &str,
+  active_model: Option<&str>,
+) -> Result<(), String> {
+  let state = read_cognitive_runtime_state(app);
+  if let Err(reason) = evaluate_cognitive_runtime_policy(&state) {
+    let _ = transition_cognitive_runtime_state_internal(
+      app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "fail".to_string(),
+        goal_id: Some(goal_id.to_string()),
+        goal_label: Some(format!("Tab {} turn", tab_id)),
+        current_step: Some(step.to_string()),
+        active_model: active_model.map(|s| s.to_string()),
+        reason: Some(reason.clone()),
+      },
+    );
+    let _ = window.emit(&event_name, IrisEvent::Status(format!("Runtime phase -> failed ({})", reason)));
+    return Err(reason);
+  }
+  Ok(())
 }
 
 fn read_setup_flags(app: &tauri::AppHandle) -> SetupFlags {
@@ -5394,7 +6265,7 @@ pub fn update_tab_memory(app: tauri::AppHandle, args: UpdateTabMemoryArgs) -> Re
     mem.micro_summary = args.micro_summary;
     mem.dialogue_bullets = args.dialogue_bullets;
     let ts = now_ts();
-    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts });
+    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts, thinking_log: None });
     let mut arts = args.artifacts;
     for a in arts.iter_mut() { a.ts = ts; }
     mem.artifacts.extend(arts);
@@ -5426,6 +6297,23 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   if !flags.interpret_v2_enabled {
     return Err("interpret_v2 is disabled by setup flags".to_string());
   }
+
+  let runtime_before = read_cognitive_runtime_state(&app);
+  let planning_action = match runtime_before.phase {
+    CognitiveRuntimePhase::Idle | CognitiveRuntimePhase::Completed | CognitiveRuntimePhase::Failed => "start_planning",
+    _ => "update_progress",
+  };
+  let _ = transition_cognitive_runtime_state_internal(
+    &app,
+    &CognitiveRuntimeTransitionArgs {
+      action: planning_action.to_string(),
+      goal_id: Some(format!("tab{}_{}", args.tab_id, now_ts())),
+      goal_label: Some(format!("Tab {} planning", args.tab_id)),
+      current_step: Some("interpret_turn_v2".to_string()),
+      active_model: Some("iris-organizer:latest".to_string()),
+      reason: None,
+    },
+  );
 
   let mem = load_tab(&app, args.tab_id)?;
   let compiled = compile_context_from_mem(&mem, args.token_budget.unwrap_or(1200));
@@ -5520,11 +6408,33 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     .map(|v| v.trim())
     .filter(|v| !v.is_empty())
     .unwrap_or(flags.assistant_name.as_str());
-  let model_profile = args.model_profile.as_deref()
+  let explicit_model_profile = args.model_profile.as_deref()
     .map(|v| v.trim())
-    .filter(|v| !v.is_empty())
-    .unwrap_or(flags.model_profile.as_str());
-  let model_profile_lc = model_profile.to_ascii_lowercase();
+    .filter(|v| !v.is_empty());
+  let configured_model_profile = if let Some(explicit) = explicit_model_profile {
+    explicit.to_string()
+  } else {
+    flags.model_profile.clone()
+  };
+  let has_explicit_profile = explicit_model_profile.is_some();
+  let (auto_profile, auto_profile_reason) = auto_select_thinking_profile(
+    &primary_intent,
+    pressure,
+    needs_vision,
+    should_use_coder,
+    args.token_budget,
+  );
+  let selected_thinking_profile = if has_explicit_profile {
+    configured_model_profile
+  } else {
+    auto_profile
+  };
+  let profile_selection_reason = if has_explicit_profile {
+    "specified_via_request_or_settings".to_string()
+  } else {
+    auto_profile_reason
+  };
+  let model_profile_lc = selected_thinking_profile.to_ascii_lowercase();
   let constrained_profile = model_profile_lc == "low" || model_profile_lc == "minimal";
   let network_enabled = args.network_enabled.unwrap_or(flags.network_enabled);
   let mut repos_enabled = args.repos_enabled.unwrap_or(flags.repos_enabled);
@@ -5544,10 +6454,17 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let universal_dataweb = args.universal_dataweb.as_deref().unwrap_or("").trim();
   let allow_long_term_dataweb = explicitly_requests_long_term_memory(&args.user_text)
     || transcript_insufficient_for_long_term(&compiled.recent_transcript, &args.user_text);
+  let runtime_state_for_docs = read_cognitive_runtime_state(&app);
+  let runtime_goal_for_docs = if runtime_state_for_docs.goal_id.trim().is_empty() {
+    format!("tab{}_planning", args.tab_id)
+  } else {
+    runtime_state_for_docs.goal_id
+  };
+  let include_cognitive_slice = allow_long_term_dataweb || pressure >= 0.58;
   let system_state_block = format!(
     "System state:\n- Assistant name: {}\n- Model profile: {}\n- Network: {}\n- Repos context: {}\n- MCP context: {}\n- Desktop tools: {}\n- Selected project: {}",
     assistant_name,
-    model_profile,
+    selected_thinking_profile,
     if network_enabled { "ON" } else { "OFF" },
     if repos_enabled { "ON" } else { "OFF" },
     if mcp_enabled { "ON" } else { "OFF" },
@@ -5563,6 +6480,21 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   }
   if allow_long_term_dataweb && !universal_dataweb.is_empty() {
     injected_context_parts.push(format!("Universal dataweb memory:\n{}", universal_dataweb));
+  }
+  if include_cognitive_slice {
+    if let Ok(slice) = read_cognitive_doc_context_slice(
+      app.clone(),
+      runtime_goal_for_docs.clone(),
+      None,
+      Some(2400),
+    ) {
+      if !slice.trim().is_empty() {
+        injected_context_parts.push(format!(
+          "Cognitive doc slice (append-only history):\n{}",
+          slice
+        ));
+      }
+    }
   }
   let injected_context_block = if injected_context_parts.is_empty() {
     "Injected external context:\n(none)".to_string()
@@ -5691,7 +6623,13 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       active_art,
       args.user_text,
       godot_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   } else {
     let gk_hint = if primary_intent == "general_knowledge" {
@@ -5722,9 +6660,115 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       clarify_hint,
       followup_hint,
       alcohol_age_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   };
+
+  let goal_for_docs = runtime_goal_for_docs.clone();
+  let planning_summary = format!(
+    "primary_intent={} secondary_intent={} strategy={} model={} status_hint={} route={}",
+    primary_intent,
+    secondary_intent,
+    strategy,
+    model,
+    status_hint,
+    route_summary
+  );
+  let planning_meta = serde_json::json!({
+    "tabId": args.tab_id,
+    "primaryIntent": &primary_intent,
+    "secondaryIntent": &secondary_intent,
+    "strategy": &strategy,
+    "model": &model,
+    "statusHint": &status_hint,
+    "routedModels": &routed_models,
+    "pressureScore": pressure,
+    "resolverUsed": &resolver_used,
+    "selectedThinkingProfile": &selected_thinking_profile,
+    "profileSelectionReason": &profile_selection_reason,
+  });
+
+  let existing_plan_versions = load_cognitive_doc_versions(&app, &goal_for_docs, "planning_logs");
+  let planner_resume_hint = existing_plan_versions
+    .last()
+    .map(|v| format!("resume_from_planning_logs_v{}", v.version));
+
+  let phase_1_summary = format!(
+    "goal_discovery: primary_intent={} secondary_intent={} pressure={:.2} context_tokens~{}",
+    primary_intent,
+    secondary_intent,
+    pressure,
+    compiled.recent_transcript.chars().count() / 4
+  );
+  let phase_2_summary = format!(
+    "constraints_exit_criteria: strategy={} deterministic_resolver={} use_coder={}",
+    strategy,
+    resolver_used,
+    should_use_coder
+  );
+  let phase_3_summary = format!(
+    "master_plan: model={} routed_models={} status_hint={}",
+    model,
+    routed_models.join(" -> "),
+    status_hint
+  );
+  let phase_4_summary = format!(
+    "execution_ready: prompt_chars={} routine_plan={} bridge_note_present={}",
+    prompt.chars().count(),
+    if routine_plan.is_some() { "yes" } else { "no" },
+    if bridge_note.trim().is_empty() { "no" } else { "yes" }
+  );
+
+  let mut planner_phase_checkpoints: Vec<PlannerPhaseCheckpoint> = Vec::new();
+  let phase_entries = vec![
+    ("phase_1", "Goal + Resource Discovery", "phase1_logs", phase_1_summary),
+    ("phase_2", "Exit Criteria + Constraints", "phase2_logs", phase_2_summary),
+    ("phase_3", "Master Plan + Skeleton", "phase3_logs", phase_3_summary),
+    ("phase_4", "Execution Readiness", "phase4_logs", phase_4_summary),
+  ];
+
+  for (phase, label, doc_type, summary) in phase_entries {
+    let meta = serde_json::json!({
+      "phase": phase,
+      "label": label,
+      "tabId": args.tab_id,
+      "statusHint": &status_hint,
+      "routeSummary": &route_summary,
+      "suggestedGodotVersion": &suggested_godot_version,
+    });
+    if let Ok(v) = append_cognitive_doc_version_internal(
+      &app,
+      &goal_for_docs,
+      doc_type,
+      "planner",
+      &summary,
+      meta,
+    ) {
+      planner_phase_checkpoints.push(PlannerPhaseCheckpoint {
+        phase: phase.to_string(),
+        label: label.to_string(),
+        summary,
+        doc_type: doc_type.to_string(),
+        doc_version: v.version,
+        ts: v.ts,
+      });
+    }
+  }
+
+  let _ = append_cognitive_doc_version_internal(
+    &app,
+    &goal_for_docs,
+    "planning_logs",
+    "planner",
+    &planning_summary,
+    planning_meta,
+  );
 
   Ok(InterpretPlanV2 {
     primary_intent,
@@ -5745,6 +6789,11 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     routed_models,
     route_summary,
     status_hint,
+    selected_thinking_profile: Some(selected_thinking_profile),
+    profile_selection_reason: Some(profile_selection_reason),
+    planner_phase: Some("phase_4_execution_ready".to_string()),
+    planner_resume_hint,
+    planner_phase_checkpoints: if planner_phase_checkpoints.is_empty() { None } else { Some(planner_phase_checkpoints) },
     routine_plan,
   })
 }
@@ -6163,13 +7212,13 @@ fn normalize_messages(msgs: &[ChatMessage]) -> (Vec<ChatMessage>, bool) {
   for m in msgs.iter() {
     let role_l = m.role.to_lowercase();
     if is_standard_role(&role_l) {
-      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts(), thinking_log: None });
     } else if let Some((u, a)) = split_legacy_block(&m.text) {
-      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts() }); }
-      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts() }); }
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts(), thinking_log: None }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts(), thinking_log: None }); }
       changed = true;
     } else {
-      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts(), thinking_log: None });
       if role_l != "llm" { changed = true; }
     }
   }
