@@ -3171,6 +3171,54 @@ pub fn list_cognitive_doc_nodes(
 }
 
 #[tauri::command]
+pub fn read_cognitive_doc_context_slice(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+  max_chars: Option<usize>,
+) -> Result<String, String> {
+  let cap = max_chars.unwrap_or(3000).max(240).min(20_000);
+  let mut lines: Vec<String> = Vec::new();
+
+  if let Some(kind) = doc_type {
+    let versions = load_cognitive_doc_versions(&app, &goal_id, &kind);
+    for v in versions.iter().rev().take(8) {
+      lines.push(format!(
+        "[{} v{} @{} by {}] {}",
+        v.doc_type,
+        v.version,
+        v.ts,
+        v.author,
+        v.content
+      ));
+    }
+  } else {
+    let nodes = list_cognitive_doc_nodes(app.clone(), goal_id.clone())?;
+    for node in nodes.into_iter().take(6) {
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &node.doc_type);
+      if let Some(v) = versions.last() {
+        lines.push(format!(
+          "[{} v{} @{} by {}] {}",
+          v.doc_type,
+          v.version,
+          v.ts,
+          v.author,
+          v.content
+        ));
+      }
+    }
+  }
+
+  if lines.is_empty() {
+    return Ok(String::new());
+  }
+
+  let joined = lines.join("\n");
+  let sliced: String = joined.chars().take(cap).collect();
+  Ok(sliced)
+}
+
+#[tauri::command]
 pub fn transition_cognitive_runtime_state(
   app: tauri::AppHandle,
   args: CognitiveRuntimeTransitionArgs,

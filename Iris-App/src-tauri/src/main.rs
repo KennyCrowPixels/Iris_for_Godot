@@ -47,6 +47,7 @@ fn main() {
             commands::list_cognitive_doc_versions,
             commands::get_latest_cognitive_doc_version,
             commands::list_cognitive_doc_nodes,
+            commands::read_cognitive_doc_context_slice,
             commands::apply_model_profile,
             commands::pull_and_create_models,
             commands::restart_app,
