@@ -268,6 +268,40 @@ impl CognitiveRuntimeAction {
   }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocVersion {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub version: u64,
+  pub ts: i64,
+  pub author: String,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocNode {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub latest_version: u64,
+  pub latest_ts: i64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendCognitiveDocArgs {
+  pub goal_id: String,
+  pub doc_type: String,
+  #[serde(default)]
+  pub author: Option<String>,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: Option<serde_json::Value>,
+}
+
 
 
 use std::{fs, path::PathBuf};
@@ -2780,6 +2814,98 @@ fn cognitive_runtime_state_file(app: &tauri::AppHandle) -> Result<PathBuf, Strin
   Ok(dir.join("cognitive_runtime_state.json"))
 }
 
+fn cognitive_docs_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  let root = dir.join("cognitive_docs");
+  fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+  Ok(root)
+}
+
+fn sanitize_cognitive_doc_component(raw: &str, fallback: &str) -> String {
+  let mut out = String::with_capacity(raw.len());
+  for ch in raw.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+      out.push(ch);
+    }
+  }
+  let trimmed = out.trim_matches('_').trim_matches('-').to_string();
+  if trimmed.is_empty() {
+    fallback.to_string()
+  } else {
+    trimmed
+  }
+}
+
+fn goal_doc_dir(app: &tauri::AppHandle, goal_id: &str) -> Result<PathBuf, String> {
+  let root = cognitive_docs_root(app)?;
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let dir = root.join(format!("goal_{}", safe_goal));
+  fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+  Ok(dir)
+}
+
+fn cognitive_doc_versions_file(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Result<PathBuf, String> {
+  let dir = goal_doc_dir(app, goal_id)?;
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  Ok(dir.join(format!("{}.jsonl", safe_type)))
+}
+
+fn load_cognitive_doc_versions(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Vec<CognitiveDocVersion> {
+  let path = match cognitive_doc_versions_file(app, goal_id, doc_type) {
+    Ok(p) => p,
+    Err(_) => return Vec::new(),
+  };
+  if !path.exists() {
+    return Vec::new();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return Vec::new(),
+  };
+
+  raw
+    .lines()
+    .filter_map(|line| serde_json::from_str::<CognitiveDocVersion>(line).ok())
+    .collect()
+}
+
+fn append_cognitive_doc_version_internal(
+  app: &tauri::AppHandle,
+  goal_id: &str,
+  doc_type: &str,
+  author: &str,
+  content: &str,
+  metadata: serde_json::Value,
+) -> Result<CognitiveDocVersion, String> {
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  let path = cognitive_doc_versions_file(app, &safe_goal, &safe_type)?;
+
+  let existing = load_cognitive_doc_versions(app, &safe_goal, &safe_type);
+  let next_version = existing.last().map(|v| v.version + 1).unwrap_or(1);
+
+  let version = CognitiveDocVersion {
+    goal_id: safe_goal,
+    doc_type: safe_type,
+    version: next_version,
+    ts: now_ts(),
+    author: author.to_string(),
+    content: content.to_string(),
+    metadata,
+  };
+
+  let json_line = serde_json::to_string(&version).map_err(|e| e.to_string())?;
+  let mut f = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&path)
+    .map_err(|e| format!("Failed opening {}: {}", path.display(), e))?;
+  f.write_all(format!("{}\n", json_line).as_bytes())
+    .map_err(|e| format!("Failed writing {}: {}", path.display(), e))?;
+  f.sync_all().ok();
+  Ok(version)
+}
+
 fn read_cognitive_runtime_state(app: &tauri::AppHandle) -> CognitiveRuntimeState {
   let path = match cognitive_runtime_state_file(app) {
     Ok(p) => p,
@@ -2949,6 +3075,85 @@ pub fn get_cognitive_runtime_state(app: tauri::AppHandle) -> Result<CognitiveRun
 }
 
 #[tauri::command]
+pub fn append_cognitive_doc_version(
+  app: tauri::AppHandle,
+  args: AppendCognitiveDocArgs,
+) -> Result<CognitiveDocVersion, String> {
+  append_cognitive_doc_version_internal(
+    &app,
+    &args.goal_id,
+    &args.doc_type,
+    args.author.as_deref().unwrap_or("user"),
+    &args.content,
+    args.metadata.unwrap_or_else(|| serde_json::json!({})),
+  )
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+  limit: Option<usize>,
+) -> Result<Vec<CognitiveDocVersion>, String> {
+  let mut versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  if let Some(cap) = limit {
+    if versions.len() > cap {
+      let keep_from = versions.len().saturating_sub(cap);
+      versions = versions.split_off(keep_from);
+    }
+  }
+  Ok(versions)
+}
+
+#[tauri::command]
+pub fn get_latest_cognitive_doc_version(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+) -> Result<Option<CognitiveDocVersion>, String> {
+  let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  Ok(versions.last().cloned())
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_nodes(
+  app: tauri::AppHandle,
+  goal_id: String,
+) -> Result<Vec<CognitiveDocNode>, String> {
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  let mut out: Vec<CognitiveDocNode> = Vec::new();
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      let doc_type = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("phase_logs")
+        .to_string();
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+      if let Some(last) = versions.last() {
+        out.push(CognitiveDocNode {
+          goal_id: last.goal_id.clone(),
+          doc_type: last.doc_type.clone(),
+          latest_version: last.version,
+          latest_ts: last.ts,
+        });
+      }
+    }
+  }
+  out.sort_by(|a, b| b.latest_ts.cmp(&a.latest_ts));
+  Ok(out)
+}
+
+#[tauri::command]
 pub fn transition_cognitive_runtime_state(
   app: tauri::AppHandle,
   args: CognitiveRuntimeTransitionArgs,
@@ -2963,6 +3168,30 @@ fn transition_cognitive_runtime_state_internal(
   let current = read_cognitive_runtime_state(&app);
   let next = apply_cognitive_runtime_transition(current, &args)?;
   write_cognitive_runtime_state(&app, &next)?;
+  let event_meta = serde_json::json!({
+    "phase": format!("{:?}", &next.phase).to_lowercase(),
+    "action": &next.last_transition_action,
+    "currentStep": &next.current_step,
+    "activeModel": &next.active_model,
+    "iterationCount": next.iteration_count,
+    "failedAt": next.failed_at,
+    "completedAt": next.completed_at,
+  });
+  let _ = append_cognitive_doc_version_internal(
+    app,
+    if next.goal_id.trim().is_empty() { "global" } else { &next.goal_id },
+    "phase_logs",
+    "runtime",
+    &format!(
+      "phase={} action={} step={} model={} iterations={}",
+      format!("{:?}", &next.phase).to_lowercase(),
+      &next.last_transition_action,
+      &next.current_step,
+      &next.active_model,
+      next.iteration_count
+    ),
+    event_meta,
+  );
   let _ = app.emit("cognitive_runtime_state", &next);
   Ok(next)
 }
@@ -6230,6 +6459,41 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       bridge_note
     )
   };
+
+  let runtime_state = read_cognitive_runtime_state(&app);
+  let goal_for_docs = if runtime_state.goal_id.trim().is_empty() {
+    format!("tab{}_planning", args.tab_id)
+  } else {
+    runtime_state.goal_id
+  };
+  let planning_summary = format!(
+    "primary_intent={} secondary_intent={} strategy={} model={} status_hint={} route={}",
+    primary_intent,
+    secondary_intent,
+    strategy,
+    model,
+    status_hint,
+    route_summary
+  );
+  let planning_meta = serde_json::json!({
+    "tabId": args.tab_id,
+    "primaryIntent": &primary_intent,
+    "secondaryIntent": &secondary_intent,
+    "strategy": &strategy,
+    "model": &model,
+    "statusHint": &status_hint,
+    "routedModels": &routed_models,
+    "pressureScore": pressure,
+    "resolverUsed": &resolver_used,
+  });
+  let _ = append_cognitive_doc_version_internal(
+    &app,
+    &goal_for_docs,
+    "planning_logs",
+    "planner",
+    &planning_summary,
+    planning_meta,
+  );
 
   Ok(InterpretPlanV2 {
     primary_intent,
