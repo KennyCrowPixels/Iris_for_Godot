@@ -326,7 +326,7 @@ type ActiveRoutine = {
   goal: string;
   steps: RoutineStep[];
   isLongRunning: boolean;
-  status: "pending_confirm" | "running" | "done" | "cancelled" | "error";
+  status: "pending_confirm" | "running" | "paused" | "done" | "cancelled" | "error";
 };
 
 type WorkLogEntry = {
@@ -3984,6 +3984,50 @@ function App() {
     }
   }
 
+  async function readCurrentRuntimeState(): Promise<CognitiveRuntimeStatePayload | null> {
+    try {
+      const state = await invoke<CognitiveRuntimeStatePayload>("get_cognitive_runtime_state");
+      if (!state || typeof state !== "object") return null;
+      return state;
+    } catch {
+      return null;
+    }
+  }
+
+  async function waitForRuntimeGate(tabId: number, stepLabel: string): Promise<boolean> {
+    let sawPause = false;
+    while (true) {
+      const runtime = await readCurrentRuntimeState();
+      if (!runtime) return true;
+
+      const runtimeTabId = parseRuntimeTabId(runtime.goalId);
+      const appliesToTab = runtimeTabId == null || runtimeTabId === tabId;
+      if (!appliesToTab) return true;
+
+      if (runtime.phase === "paused") {
+        if (!sawPause) {
+          appendWorkLog(tabId, `Runtime paused before step: ${stepLabel}`);
+        }
+        sawPause = true;
+        setActiveRoutine((prev) => (prev ? { ...prev, status: "paused" } : prev));
+        setThinkingProgress(tabId, `Runtime paused. Waiting to resume before ${stepLabel}...`);
+        await new Promise((resolve) => setTimeout(resolve, 450));
+        continue;
+      }
+
+      if (runtime.phase === "idle" || runtime.phase === "completed" || runtime.phase === "failed") {
+        appendWorkLog(tabId, `Runtime ended (${runtime.phase}) before step: ${stepLabel}`);
+        return false;
+      }
+
+      if (sawPause) {
+        appendWorkLog(tabId, `Runtime resumed for step: ${stepLabel}`);
+        setActiveRoutine((prev) => (prev ? { ...prev, status: "running" } : prev));
+      }
+      return true;
+    }
+  }
+
   // Poll open windows and system stats while Desktop Dashboard is active
   useEffect(() => {
     if (!desktopDashboardEnabled) return;
@@ -4248,8 +4292,17 @@ function App() {
 
     const capturedImages: string[] = [];
     let sawRoutineError = false;
+    let runtimeStoppedRoutine = false;
 
     for (const step of steps) {
+      const canProceed = await waitForRuntimeGate(tabId, step.label);
+      if (!canProceed) {
+        runtimeStoppedRoutine = true;
+        setRoutineStepStatus(step.id, { status: "skipped", error: "runtime gated" });
+        appendWorkLog(tabId, `Routine halted by runtime lifecycle gate before: ${step.label}`);
+        break;
+      }
+
       setRoutineStepStatus(step.id, { status: "running" });
       appendWorkLog(tabId, `Routine step running: ${step.label}`);
       try {
@@ -4279,8 +4332,13 @@ function App() {
       }
     }
 
-    setActiveRoutine(prev => prev ? { ...prev, status: sawRoutineError ? "error" : "done" } : prev);
-    appendWorkLog(tabId, sawRoutineError ? "Routine completed with errors" : "Routine completed");
+    setActiveRoutine(prev => prev ? { ...prev, status: runtimeStoppedRoutine ? "cancelled" : (sawRoutineError ? "error" : "done") } : prev);
+    appendWorkLog(
+      tabId,
+      runtimeStoppedRoutine
+        ? "Routine stopped by runtime lifecycle state"
+        : (sawRoutineError ? "Routine completed with errors" : "Routine completed")
+    );
     return { images: capturedImages, windowHint };
   }
 
@@ -9203,6 +9261,20 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             {currentStatusText()}
             {ellipsis}
           </strong>
+          {(() => {
+            const tabState = runtimeStateByTab[activeTab];
+            const fallbackState = globalRuntimeState;
+            const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
+            const runtimeState = tabState || (fallbackState && (fallbackTabId == null || fallbackTabId === activeTab) ? fallbackState : null);
+            if (!runtimeState) return null;
+            return (
+              <div style={{ marginTop: 4, opacity: 0.82, fontSize: 12 }}>
+                Runtime {formatRuntimePhaseLabel(runtimeState.phase)}
+                {runtimeState.currentStep ? ` | ${runtimeState.currentStep}` : ""}
+                {runtimeState.activeModel ? ` | ${runtimeState.activeModel}` : ""}
+              </div>
+            );
+          })()}
           {thinkingStep && (
             <div style={{ marginTop: 4, opacity: 0.8, fontSize: 13 }}>
               {thinkingStep}
