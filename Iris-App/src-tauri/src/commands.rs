@@ -2782,6 +2782,10 @@ pub struct InterpretPlanV2 {
   pub route_summary: String,
   pub status_hint: String,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub selected_thinking_profile: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub profile_selection_reason: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub planner_phase: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub planner_resume_hint: Option<String>,
@@ -2800,6 +2804,50 @@ pub struct PlannerPhaseCheckpoint {
   pub doc_type: String,
   pub doc_version: u64,
   pub ts: i64,
+}
+
+fn auto_select_thinking_profile(
+  primary_intent: &str,
+  pressure: f32,
+  needs_vision: bool,
+  should_use_coder: bool,
+  token_budget: Option<usize>,
+) -> (String, String) {
+  let budget = token_budget.unwrap_or(1200);
+
+  if pressure >= 0.72 || (should_use_coder && (primary_intent == "code_edit_followup" || primary_intent == "dev_task")) || budget >= 3200 {
+    return (
+      "Meticulous".to_string(),
+      format!(
+        "auto_selected: high complexity (pressure={:.2}, coder={}, budget={})",
+        pressure,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  if pressure >= 0.45 || should_use_coder || needs_vision || budget >= 1800 {
+    return (
+      "Advanced".to_string(),
+      format!(
+        "auto_selected: medium complexity (pressure={:.2}, vision={}, coder={}, budget={})",
+        pressure,
+        needs_vision,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  (
+    "Fast".to_string(),
+    format!(
+      "auto_selected: lightweight path (pressure={:.2}, budget={})",
+      pressure,
+      budget
+    ),
+  )
 }
 
 
@@ -6319,11 +6367,33 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     .map(|v| v.trim())
     .filter(|v| !v.is_empty())
     .unwrap_or(flags.assistant_name.as_str());
-  let model_profile = args.model_profile.as_deref()
+  let explicit_model_profile = args.model_profile.as_deref()
     .map(|v| v.trim())
-    .filter(|v| !v.is_empty())
-    .unwrap_or(flags.model_profile.as_str());
-  let model_profile_lc = model_profile.to_ascii_lowercase();
+    .filter(|v| !v.is_empty());
+  let configured_model_profile = if let Some(explicit) = explicit_model_profile {
+    explicit.to_string()
+  } else {
+    flags.model_profile.clone()
+  };
+  let has_explicit_profile = explicit_model_profile.is_some();
+  let (auto_profile, auto_profile_reason) = auto_select_thinking_profile(
+    &primary_intent,
+    pressure,
+    needs_vision,
+    should_use_coder,
+    args.token_budget,
+  );
+  let selected_thinking_profile = if has_explicit_profile {
+    configured_model_profile
+  } else {
+    auto_profile
+  };
+  let profile_selection_reason = if has_explicit_profile {
+    "specified_via_request_or_settings".to_string()
+  } else {
+    auto_profile_reason
+  };
+  let model_profile_lc = selected_thinking_profile.to_ascii_lowercase();
   let constrained_profile = model_profile_lc == "low" || model_profile_lc == "minimal";
   let network_enabled = args.network_enabled.unwrap_or(flags.network_enabled);
   let mut repos_enabled = args.repos_enabled.unwrap_or(flags.repos_enabled);
@@ -6353,7 +6423,7 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let system_state_block = format!(
     "System state:\n- Assistant name: {}\n- Model profile: {}\n- Network: {}\n- Repos context: {}\n- MCP context: {}\n- Desktop tools: {}\n- Selected project: {}",
     assistant_name,
-    model_profile,
+    selected_thinking_profile,
     if network_enabled { "ON" } else { "OFF" },
     if repos_enabled { "ON" } else { "OFF" },
     if mcp_enabled { "ON" } else { "OFF" },
@@ -6512,7 +6582,13 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       active_art,
       args.user_text,
       godot_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   } else {
     let gk_hint = if primary_intent == "general_knowledge" {
@@ -6543,7 +6619,13 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       clarify_hint,
       followup_hint,
       alcohol_age_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   };
 
@@ -6567,6 +6649,8 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     "routedModels": &routed_models,
     "pressureScore": pressure,
     "resolverUsed": &resolver_used,
+    "selectedThinkingProfile": &selected_thinking_profile,
+    "profileSelectionReason": &profile_selection_reason,
   });
 
   let existing_plan_versions = load_cognitive_doc_versions(&app, &goal_for_docs, "planning_logs");
@@ -6664,6 +6748,8 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     routed_models,
     route_summary,
     status_hint,
+    selected_thinking_profile: Some(selected_thinking_profile),
+    profile_selection_reason: Some(profile_selection_reason),
     planner_phase: Some("phase_4_execution_ready".to_string()),
     planner_resume_hint,
     planner_phase_checkpoints: if planner_phase_checkpoints.is_empty() { None } else { Some(planner_phase_checkpoints) },

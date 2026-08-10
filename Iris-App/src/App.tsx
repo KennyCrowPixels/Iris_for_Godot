@@ -4168,6 +4168,8 @@ function App() {
   const [irisStatus, setIrisStatus] = useState<"idle" | "thinking" | "summarizing" | "responding" | "coding">("idle");
   const [plannerRoutedModels, setPlannerRoutedModels] = useState<string[]>([]);
   const [plannerRouteSummary, setPlannerRouteSummary] = useState<string>("");
+  const [plannerSelectedProfile, setPlannerSelectedProfile] = useState<string>("");
+  const [plannerProfileReason, setPlannerProfileReason] = useState<string>("");
   const [plannerPhase, setPlannerPhase] = useState<string>("");
   const [plannerResumeHint, setPlannerResumeHint] = useState<string>("");
   const [plannerCheckpointCount, setPlannerCheckpointCount] = useState<number>(0);
@@ -4773,6 +4775,8 @@ function App() {
           plannerSuggestedGodotVersion = String(plannerV2.suggestedGodotVersion || plannerV2.suggested_godot_version || "unspecified");
           setPlannerRoutedModels(Array.isArray(plannerV2.routedModels ?? plannerV2.routed_models) ? (plannerV2.routedModels ?? plannerV2.routed_models) : []);
           setPlannerRouteSummary(String(plannerV2.routeSummary ?? plannerV2.route_summary ?? ""));
+          setPlannerSelectedProfile(String(plannerV2.selectedThinkingProfile ?? plannerV2.selected_thinking_profile ?? ""));
+          setPlannerProfileReason(String(plannerV2.profileSelectionReason ?? plannerV2.profile_selection_reason ?? ""));
           setPlannerPhase(String(plannerV2.plannerPhase ?? plannerV2.planner_phase ?? ""));
           setPlannerResumeHint(String(plannerV2.plannerResumeHint ?? plannerV2.planner_resume_hint ?? ""));
           const phaseCheckpoints = plannerV2.plannerPhaseCheckpoints ?? plannerV2.planner_phase_checkpoints;
@@ -11111,6 +11115,16 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   {!!plannerResumeHint && (
                     <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
                       Resume hint: {plannerResumeHint}
+                    </div>
+                  )}
+                  {!!plannerSelectedProfile && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 6 }}>
+                      Planner thinking profile: {plannerSelectedProfile}
+                    </div>
+                  )}
+                  {!!plannerProfileReason && plannerProfileReason !== "specified_via_request_or_settings" && (
+                    <div style={{ fontSize: 11, color: isLightMode ? "#3f556d" : "#9fb2c9", marginBottom: 8 }}>
+                      Profile rationale: {plannerProfileReason}
                     </div>
                   )}
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
