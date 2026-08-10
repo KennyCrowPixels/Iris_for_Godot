@@ -140,6 +140,45 @@ type CognitiveRuntimeStatePayload = {
   iterationCount: number;
 };
 
+type RuntimeNotificationPrefs = {
+  miniPlayerEnabled: boolean;
+  notifyMilestones: boolean;
+  notifyCompletion: boolean;
+  notifyBlockers: boolean;
+  quietMode: boolean;
+};
+
+function readRuntimeNotificationPrefs(): RuntimeNotificationPrefs {
+  try {
+    const raw = localStorage.getItem("iris_runtime_notification_prefs");
+    if (!raw) {
+      return {
+        miniPlayerEnabled: true,
+        notifyMilestones: true,
+        notifyCompletion: true,
+        notifyBlockers: true,
+        quietMode: false,
+      };
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      miniPlayerEnabled: !!parsed?.miniPlayerEnabled,
+      notifyMilestones: !!parsed?.notifyMilestones,
+      notifyCompletion: !!parsed?.notifyCompletion,
+      notifyBlockers: !!parsed?.notifyBlockers,
+      quietMode: !!parsed?.quietMode,
+    };
+  } catch {
+    return {
+      miniPlayerEnabled: true,
+      notifyMilestones: true,
+      notifyCompletion: true,
+      notifyBlockers: true,
+      quietMode: false,
+    };
+  }
+}
+
 function parseRuntimeTabId(goalId: string): number | null {
   const m = String(goalId || "").match(/^tab(\d+)_/i);
   if (!m) return null;
@@ -2469,6 +2508,12 @@ function App() {
   const [globalRuntimeState, setGlobalRuntimeState] = useState<CognitiveRuntimeStatePayload | null>(null);
   const [runtimeStateByTab, setRuntimeStateByTab] = useState<Record<number, CognitiveRuntimeStatePayload>>({});
   const [runtimeControlBusy, setRuntimeControlBusy] = useState(false);
+  const [runtimeNotificationPrefs, setRuntimeNotificationPrefs] = useState<RuntimeNotificationPrefs>(() => readRuntimeNotificationPrefs());
+  const [cognitiveGoalDraft, setCognitiveGoalDraft] = useState("");
+  const [cognitiveDocTypeDraft, setCognitiveDocTypeDraft] = useState("planning_logs");
+  const [cognitiveDocSlice, setCognitiveDocSlice] = useState("");
+  const [cognitiveDocAppendText, setCognitiveDocAppendText] = useState("");
+  const [cognitiveDocBusy, setCognitiveDocBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [coderReady, setCoderReady] = useState<boolean | null>(null);
   const [input, setInput] = useState("");
@@ -2535,6 +2580,7 @@ function App() {
     llmProfile === "Low" ? 2.5 : 3.5; // Minimal gets longest timeout
   const [hwToast, setHwToast] = useState<string | null>(null);
   const hwToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runtimePhaseTrackerRef = useRef<Record<string, string>>({});
   const [assistantName, setAssistantName] = useState("Iris");
   const [permissionSettings, setPermissionSettings] = useState<PermissionSettings>(DEFAULT_PERMISSION_SETTINGS);
   const [inlinePermissionQueue, setInlinePermissionQueue] = useState<InlinePermissionRequest[]>([]);
@@ -3222,6 +3268,111 @@ function App() {
       if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("iris_runtime_notification_prefs", JSON.stringify(runtimeNotificationPrefs));
+    } catch {}
+  }, [runtimeNotificationPrefs]);
+
+  function showRuntimeToast(message: string, ms = 4500) {
+    setHwToast(message);
+    if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
+    hwToastTimerRef.current = setTimeout(() => setHwToast(null), ms);
+  }
+
+  function maybeNotifyRuntimeTransition(payload: CognitiveRuntimeStatePayload) {
+    const goal = String(payload.goalId || "global");
+    const phase = String(payload.phase || "");
+    if (!phase) return;
+
+    const previous = runtimePhaseTrackerRef.current[goal];
+    runtimePhaseTrackerRef.current[goal] = phase;
+    if (!previous || previous === phase) return;
+    if (runtimeNotificationPrefs.quietMode) return;
+
+    const model = String(payload.activeModel || "").trim();
+    const label = phase.replace(/_/g, " ");
+    const message = `Runtime ${label}${model ? ` (${model})` : ""}`;
+
+    if ((phase === "planning" || phase === "executing" || phase === "qa" || phase === "paused") && runtimeNotificationPrefs.notifyMilestones) {
+      showRuntimeToast(message, 3200);
+      return;
+    }
+    if (phase === "completed" && runtimeNotificationPrefs.notifyCompletion) {
+      showRuntimeToast(message, 5200);
+      return;
+    }
+    if (phase === "failed" && runtimeNotificationPrefs.notifyBlockers) {
+      showRuntimeToast(`${message}${payload.failureReason ? ` | ${payload.failureReason}` : ""}`, 6500);
+      return;
+    }
+  }
+
+  function activeRuntimeStateForTab(tabId: number): CognitiveRuntimeStatePayload | null {
+    const tabState = runtimeStateByTab[tabId];
+    const fallbackState = globalRuntimeState;
+    const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
+    if (tabState) return tabState;
+    if (fallbackState && (fallbackTabId == null || fallbackTabId === tabId)) {
+      return fallbackState;
+    }
+    return null;
+  }
+
+  function resolveCognitiveGoalForEditor(): string {
+    const explicit = cognitiveGoalDraft.trim();
+    if (explicit) return explicit;
+    const runtimeState = activeRuntimeStateForTab(activeTab);
+    if (runtimeState?.goalId?.trim()) return runtimeState.goalId.trim();
+    return `tab${activeTab}_planning`;
+  }
+
+  async function loadCognitiveDocSliceFromSettings() {
+    if (cognitiveDocBusy) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim();
+    try {
+      setCognitiveDocBusy(true);
+      const slice = await invoke<string>("read_cognitive_doc_context_slice", {
+        goalId: goal,
+        docType: docType ? docType : undefined,
+        maxChars: 6000,
+      });
+      setCognitiveDocSlice(String(slice || ""));
+    } catch (err: any) {
+      setCognitiveDocSlice(`Failed to load slice: ${String(err?.message || err || "unknown error")}`);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
+
+  async function appendCognitiveDocNoteFromSettings() {
+    if (cognitiveDocBusy) return;
+    const goal = resolveCognitiveGoalForEditor();
+    const docType = cognitiveDocTypeDraft.trim() || "planning_logs";
+    const content = cognitiveDocAppendText.trim();
+    if (!content) return;
+    try {
+      setCognitiveDocBusy(true);
+      await invoke("append_cognitive_doc_version", {
+        args: {
+          goalId: goal,
+          docType,
+          author: "user",
+          content,
+          metadata: { source: "controller_editor" },
+        },
+      });
+      setCognitiveDocAppendText("");
+      await loadCognitiveDocSliceFromSettings();
+      showRuntimeToast("Cognitive document note appended.", 3200);
+    } catch (err: any) {
+      showRuntimeToast(`Append failed: ${String(err?.message || err || "unknown")}`, 5000);
+    } finally {
+      setCognitiveDocBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!lowPowerProfile) return;
@@ -3930,6 +4081,7 @@ function App() {
       if (!payload || typeof payload !== "object") return;
 
       setGlobalRuntimeState(payload);
+      maybeNotifyRuntimeTransition(payload);
 
       const tabId = parseRuntimeTabId(payload.goalId);
       if (tabId != null) {
@@ -9273,10 +9425,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             {ellipsis}
           </strong>
           {(() => {
-            const tabState = runtimeStateByTab[activeTab];
-            const fallbackState = globalRuntimeState;
-            const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
-            const runtimeState = tabState || (fallbackState && (fallbackTabId == null || fallbackTabId === activeTab) ? fallbackState : null);
+            const runtimeState = activeRuntimeStateForTab(activeTab);
             if (!runtimeState) return null;
             return (
               <div style={{ marginTop: 4, opacity: 0.82, fontSize: 12 }}>
@@ -11517,6 +11666,132 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </button>
               </div>
 
+              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
+                  Runtime Notifications + Mini-Player
+                </div>
+                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.miniPlayerEnabled}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, miniPlayerEnabled: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Enable compact runtime mini-player in chat
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyMilestones}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyMilestones: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify milestones (planning/executing/qa/paused)
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyCompletion}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyCompletion: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify completion
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.notifyBlockers}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, notifyBlockers: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Notify blockers/failures
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={runtimeNotificationPrefs.quietMode}
+                      onChange={(e) => setRuntimeNotificationPrefs((prev) => ({ ...prev, quietMode: e.target.checked }))}
+                      style={{ marginRight: 8 }}
+                    />
+                    Quiet mode (suppress runtime toasts)
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
+                  Cognitive Doc Transparency Editor
+                </div>
+                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
+                  <label>
+                    Goal ID (optional)
+                    <input
+                      className="model-input"
+                      value={cognitiveGoalDraft}
+                      onChange={(e) => setCognitiveGoalDraft(e.target.value)}
+                      placeholder={`Defaults to active goal for tab${activeTab}`}
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <label>
+                    Doc Type
+                    <input
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      placeholder="planning_logs"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => { void loadCognitiveDocSliceFromSettings(); }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Load Slice
+                    </button>
+                    <button
+                      className="setup-btn"
+                      type="button"
+                      onClick={() => {
+                        setCognitiveGoalDraft("");
+                        setCognitiveDocTypeDraft("planning_logs");
+                        setCognitiveDocSlice("");
+                        setCognitiveDocAppendText("");
+                      }}
+                      disabled={cognitiveDocBusy}
+                    >
+                      Reset Editor
+                    </button>
+                  </div>
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 120, resize: "vertical" }}
+                    readOnly
+                    value={cognitiveDocSlice}
+                    placeholder="Loaded cognitive doc context slice appears here..."
+                  />
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 90, resize: "vertical" }}
+                    value={cognitiveDocAppendText}
+                    onChange={(e) => setCognitiveDocAppendText(e.target.value)}
+                    placeholder="Append a note to this goal/doc lane..."
+                  />
+                  <button
+                    className="setup-btn"
+                    type="button"
+                    onClick={() => { void appendCognitiveDocNoteFromSettings(); }}
+                    disabled={cognitiveDocBusy || !cognitiveDocAppendText.trim()}
+                  >
+                    Append Note
+                  </button>
+                </div>
+              </div>
+
               <details>
                 <summary style={{ cursor: "pointer", color: "#b9cae7", marginBottom: 8 }}>Memory Debug Signals</summary>
                 <div style={{ fontSize: 13, lineHeight: 1.5, marginTop: 8 }}>
@@ -11814,10 +12089,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           ) : null}
 
           {(() => {
-            const tabState = runtimeStateByTab[activeTab];
-            const fallbackState = globalRuntimeState;
-            const fallbackTabId = fallbackState ? parseRuntimeTabId(fallbackState.goalId) : null;
-            const runtimeState = tabState || (fallbackState && (fallbackTabId == null || fallbackTabId === activeTab) ? fallbackState : null);
+            const runtimeState = activeRuntimeStateForTab(activeTab);
             if (!runtimeState) return null;
 
             const phaseLabel = formatRuntimePhaseLabel(runtimeState.phase);
@@ -11870,6 +12142,51 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <button type="button" className="image-attachment-remove" onClick={() => removePendingImage(img.id)}>×</button>
                 </div>
               ))}
+
+              {currentTab?.type === "chat" && runtimeNotificationPrefs.miniPlayerEnabled && (() => {
+                const runtimeState = activeRuntimeStateForTab(activeTab);
+                if (!runtimeState) return null;
+                if (runtimeState.phase === "idle") return null;
+                return (
+                  <div className="runtime-mini-player">
+                    <div className="runtime-mini-header">
+                      <strong>Runtime</strong>
+                      <span>{formatRuntimePhaseLabel(runtimeState.phase)}</span>
+                    </div>
+                    <div className="runtime-mini-body">
+                      <div>Step: {runtimeState.currentStep || "(none)"}</div>
+                      <div>Model: {runtimeState.activeModel || "(none)"}</div>
+                      <div>Iter: {runtimeState.iterationCount}</div>
+                    </div>
+                    <div className="runtime-mini-actions">
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy || runtimeState.phase === "paused" || runtimeState.phase === "completed" || runtimeState.phase === "failed"}
+                        onClick={() => { void runRuntimeControl("pause"); }}
+                      >
+                        Pause
+                      </button>
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy || runtimeState.phase !== "paused"}
+                        onClick={() => { void runRuntimeControl("resume"); }}
+                      >
+                        Resume
+                      </button>
+                      <button
+                        type="button"
+                        className="setup-btn"
+                        disabled={runtimeControlBusy}
+                        onClick={() => { void runRuntimeControl("reset_idle"); }}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
           <textarea

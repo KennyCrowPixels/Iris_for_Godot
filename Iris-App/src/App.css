@@ -276,6 +276,45 @@ button {
   border-radius: 4px;
 }
 
+.runtime-mini-player {
+  position: fixed;
+  right: 18px;
+  bottom: 84px;
+  width: 280px;
+  z-index: 45;
+  border: 1px solid var(--app-border, #2d2d2d);
+  border-radius: 10px;
+  background: var(--app-panel-bg, #151d28);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.28);
+  padding: 10px;
+}
+
+.runtime-mini-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--app-text, #dce6f4);
+  margin-bottom: 8px;
+}
+
+.runtime-mini-body {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--app-text-dim, #b8c8db);
+  margin-bottom: 8px;
+}
+
+.runtime-mini-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.runtime-mini-actions .setup-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
 .bubble {
   position: relative;
   padding: 16px 16px 12px;
