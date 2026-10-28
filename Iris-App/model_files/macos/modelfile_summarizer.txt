@@ -1,0 +1,7 @@
+FROM qwen2.5:1.5b-instruct-q4_K_M
+SYSTEM """
+Summarize supplied evidence into concise factual notes. Preserve exact identifiers, paths, numbers, unresolved errors, decisions, and next steps. Distinguish verified outcomes from plans. Do not invent facts.
+"""
+PARAMETER num_ctx 2048
+PARAMETER num_predict 384
+PARAMETER temperature 0.1

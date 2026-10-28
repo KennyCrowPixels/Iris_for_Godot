@@ -1,7 +1,40 @@
-// filepath: d:\Iris_for_Godot\Iris-App\src\hooks\useOllamaStream.ts
-import { OLLAMA_URL } from "../lib/ollama";
-
 type Message = { role: "user" | "assistant"; content: string };
+
+export async function readOllamaStream(body: ReadableStream<Uint8Array>, onToken: (token: string) => void): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let completed = false;
+  const parseLine = (line: string) => {
+    if (!line.trim()) return;
+    const value = JSON.parse(line);
+    if (value.error) throw new Error(String(value.error));
+    const token = value.response ?? value.message?.content ?? "";
+    if (token) onToken(String(token));
+    if (value.done) completed = true;
+  };
+  try {
+    while (!completed) {
+      const { value, done } = await reader.read();
+      pending += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      let boundary = pending.indexOf("\n");
+      while (boundary >= 0) {
+        parseLine(pending.slice(0, boundary));
+        pending = pending.slice(boundary + 1);
+        if (completed) break;
+        boundary = pending.indexOf("\n");
+      }
+      if (done) {
+        if (!completed) parseLine(pending);
+        if (!completed) throw new Error("Ollama stream ended before its completion record");
+        break;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 
 export default function useOllamaStream() {
   async function stream({
@@ -27,11 +60,7 @@ export default function useOllamaStream() {
     onTokens?: (delta: string) => void;
     onDone?: () => void;
   }) {
-    let fullText = "";
-    let buffer = "";
-    let done = false;
     let llmInserted = false;
-    let acc = "";
 
     // Determine which endpoint to use: /api/chat for messages, /api/generate for prompt
     const useChat = messages && messages.length > 0;
@@ -71,6 +100,7 @@ export default function useOllamaStream() {
         lastErr = new Error(`Ollama responded with status ${response?.status}: ${txt}`);
         response = null;
       } catch (err) {
+        if (signal.aborted) throw err;
         lastErr = err;
         response = null;
       }
@@ -82,59 +112,10 @@ export default function useOllamaStream() {
 
     const body = response.body;
     if (!body) throw new Error("Ollama response missing body");
-    const reader = body.getReader();
-
-    while (!done) {
-      const { value, done: doneReading } = await reader.read();
-      done = doneReading;
-      if (value) {
-        const chunk = new TextDecoder().decode(value);
-        acc += chunk;
-
-        // parse all complete JSON objects in acc by balancing braces
-        for (;;) {
-          let depth = 0, end = -1;
-          for (let i = 0; i < acc.length; i++) {
-            const c = acc[i];
-            if (c === "{") depth++;
-            else if (c === "}") {
-              depth--;
-              if (depth === 0) {
-                end = i;
-                break;
-              }
-            }
-          }
-          if (end === -1) break;
-
-          const objStr = acc.slice(0, end + 1);
-          acc = acc.slice(end + 1);
-
-          try {
-            const json = JSON.parse(objStr);
-
-            // Handle both /api/generate (response field) and /api/chat (message.content field)
-            const token = json.response || (json.message && json.message.content) || "";
-            
-            if (token) {
-              buffer += token;
-
-              // Insert the LLM bubble on the first actual token
-              if (!llmInserted && buffer.length > 0) {
-                llmInserted = true;
-                if (onFirstToken) onFirstToken(buffer);
-                buffer = "";
-              } else if (llmInserted && buffer.length > 0) {
-                if (onTokens) onTokens(buffer);
-                buffer = "";
-              }
-            }
-          } catch {
-            // ignore and continue accumulating
-          }
-        }
-      }
-    }
+    await readOllamaStream(body, (token) => {
+      if (!llmInserted) { llmInserted = true; onFirstToken?.(token); }
+      else onTokens?.(token);
+    });
     if (onDone) onDone();
   }
 

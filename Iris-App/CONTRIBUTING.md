@@ -1,6 +1,6 @@
-# Contributing to Iris (Windows-First)
+# Contributing to Iris
 
-Iris v0.3 pre-alpha is currently optimized for Windows desktop development.
+Iris v0.3 pre-alpha shares its React/Tauri code across Windows and macOS. Native Mac runtime and packaging must be checked on macOS; see [docs/MACOS_SETUP.md](docs/MACOS_SETUP.md).
 
 ## One-Click Setup
 
@@ -39,7 +39,7 @@ build-release.bat
 
 Outputs are copied to:
 
-- `D:\Iris_for_Godot\Builds`
+- `builds` under the repository root, or `BUILD_OUT_DIR` when set
 
 ## Consumer-Oriented Build Path
 
@@ -69,7 +69,9 @@ npm run check
 
 ```bat
 npm run check
-cargo check -q --manifest-path src-tauri/Cargo.toml
+npm test
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 - Open PR to `main`.

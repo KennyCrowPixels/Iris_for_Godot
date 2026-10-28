@@ -1,16 +1,18 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { Activity, ArrowDown, ArrowUp, BookOpen, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, PanelRightClose, PanelRightOpen, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, X } from "lucide-react";
+import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
+import { themeTokens } from "./lib/theme";
+import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
+import "@fontsource-variable/manrope";
 import "./App.css";
 import type { ChatMessage, Artifact } from "./types/models";
-
-
 import {
   ensureOllamaServer,
   ensureModel,
-  // waitForTauri,
 } from "./lib/ollama";
 import {
   listOpenTabs,
@@ -23,10 +25,13 @@ import {
   updateMessagesAppendUser,
   insertLLMBubble,
   patchLastLLMBubble,
+  clearProvisionalReply,
   extractArtifacts,
 } from "./state/tabs";
 import useOllamaStream from "./hooks/useOllamaStream";
 import OllamaSetupModal from "./components/OllamaSetupModal";
+import ServerSettings from "./components/ServerSettings";
+import ResearchHistory from "./components/ResearchHistory";
 import { summarizeExchange } from "./lib/summarize";
 
 declare global {
@@ -36,6 +41,7 @@ declare global {
 
 const SUMMARY_MODEL = "iris-summarizer:latest";
 const DEBUG_MEMORY = false;
+const ENABLE_DEVELOPER_TOOLS = false;
 
 type ModelStatus = "checking" | "ready" | "loading" | "error";
 type WorkLogEntry = {
@@ -82,24 +88,73 @@ type AutonomousTaskIntervalUnit = "seconds" | "minutes" | "hours" | "days" | "cu
 
 type AutonomousTaskDraft = {
   id: string;
+  title: string;
+  collapsed: boolean;
   prompt: string;
   projectId: string | null;
   networkAllowed: boolean;
+  runToCompletion: boolean;
+  acceptanceCriteria: string;
+  cognitiveDoc: string;
   intervalValue: string;
   intervalUnit: AutonomousTaskIntervalUnit;
   customSchedulePrompt: string;
 };
 
+type AutonomousScheduleKind = "none" | "countdown" | "datetime";
+
+type AutonomousRunTelemetry = {
+  ts: number;
+  trigger: "auto" | "manual";
+  pass: number;
+  status: "complete" | "blocked" | "incomplete" | "unknown" | "error";
+  reason: string;
+  latencyMs: number;
+  tabId: number;
+  projectName: string;
+  mcpCount: number;
+  sshCount: number;
+  actionCount: number;
+  workLogCount: number;
+  assistantChars: number;
+};
+
+type AutonomousTaskRuntime = {
+  status: "idle" | "waiting" | "running" | "paused" | "error";
+  scheduleKind: AutonomousScheduleKind;
+  remainingMs: number;
+  nextRunAt: number;
+  repeatMs: number;
+  lastRunAt: number;
+  lastError: string;
+  runCount: number;
+  completionPasses: number;
+  blockerCount: number;
+  completionModeLastStatus: "complete" | "blocked" | "incomplete" | "unknown" | "error";
+  customLabel: string;
+  history: string[];
+  telemetry: AutonomousRunTelemetry[];
+  linkedTabId: number;
+  lastResult: string;
+  updatedAt: number;
+};
+
 const AUTONOMOUS_PANEL_PREFS_KEY = "iris_autonomous_panel_prefs";
 const AUTONOMOUS_TASKS_KEY = "iris_autonomous_tasks";
+const AUTONOMOUS_RUNTIME_KEY = "iris_autonomous_runtime";
 
 function createBlankAutonomousTask(): AutonomousTaskDraft {
   return {
     id: makeId("auto_task"),
+    title: "New Task",
+    collapsed: false,
     prompt: "",
     projectId: null,
     networkAllowed: false,
-    intervalValue: "",
+    runToCompletion: false,
+    acceptanceCriteria: "",
+    cognitiveDoc: "",
+    intervalValue: "30",
     intervalUnit: "minutes",
     customSchedulePrompt: "",
   };
@@ -124,9 +179,14 @@ function normalizeAutonomousTask(raw: any): AutonomousTaskDraft {
   const allowedUnits: AutonomousTaskIntervalUnit[] = ["seconds", "minutes", "hours", "days", "custom"];
   return {
     id: String(raw?.id || makeId("auto_task")),
+    title: String(raw?.title || "New Task"),
+    collapsed: !!raw?.collapsed,
     prompt: String(raw?.prompt || ""),
     projectId: raw?.projectId ? String(raw.projectId) : null,
     networkAllowed: !!raw?.networkAllowed,
+    runToCompletion: !!raw?.runToCompletion,
+    acceptanceCriteria: String(raw?.acceptanceCriteria || ""),
+    cognitiveDoc: String(raw?.cognitiveDoc || ""),
     intervalValue: String(raw?.intervalValue || ""),
     intervalUnit: allowedUnits.includes(intervalUnit as AutonomousTaskIntervalUnit)
       ? (intervalUnit as AutonomousTaskIntervalUnit)
@@ -145,6 +205,262 @@ function readAutonomousTasksFromStorage(): AutonomousTaskDraft[] {
   } catch {
     return [createBlankAutonomousTask()];
   }
+}
+
+function createIdleAutonomousRuntime(): AutonomousTaskRuntime {
+  return {
+    status: "idle",
+    scheduleKind: "none",
+    remainingMs: 0,
+    nextRunAt: 0,
+    repeatMs: 0,
+    lastRunAt: 0,
+    lastError: "",
+    runCount: 0,
+    completionPasses: 0,
+    blockerCount: 0,
+    completionModeLastStatus: "unknown",
+    customLabel: "",
+    history: [],
+    telemetry: [],
+    linkedTabId: 0,
+    lastResult: "",
+    updatedAt: Date.now(),
+  };
+}
+
+function parseIntervalValueToMs(value: string, unit: Exclude<AutonomousTaskIntervalUnit, "custom">): number {
+  return intervalMilliseconds(value, unit);
+}
+
+function nextWeekdayTimestamp(dayIdx: number, fromTs: number): number {
+  const now = new Date(fromTs);
+  const target = new Date(fromTs);
+  const today = now.getDay();
+  let delta = dayIdx - today;
+  if (delta <= 0) delta += 7;
+  target.setDate(now.getDate() + delta);
+  target.setHours(now.getHours(), now.getMinutes(), 0, 0);
+  return target.getTime();
+}
+
+function parseCustomSchedulePrompt(raw: string): { kind: AutonomousScheduleKind; nextRunAt: number; repeatMs: number; label: string } {
+  const prompt = String(raw || "").trim();
+  if (!prompt) return { kind: "none", nextRunAt: 0, repeatMs: 0, label: "" };
+  const parsedDate = Date.parse(prompt);
+  if (Number.isFinite(parsedDate)) {
+    return {
+      kind: "datetime",
+      nextRunAt: parsedDate,
+      repeatMs: 0,
+      label: `datetime: ${new Date(parsedDate).toLocaleString()}`,
+    };
+  }
+
+  const everyMatch = prompt.match(/every\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)\b/i);
+  if (everyMatch) {
+    const n = Math.max(1, Number(everyMatch[1]));
+    const unit = everyMatch[2].toLowerCase();
+    const unitSec = unit.startsWith("second") ? 1 : unit.startsWith("minute") ? 60 : unit.startsWith("hour") ? 3600 : 86400;
+    const repeatMs = n * unitSec * 1000;
+    return {
+      kind: "countdown",
+      nextRunAt: 0,
+      repeatMs,
+      label: `every ${n} ${unit}`,
+    };
+  }
+
+  const weekdays: Record<string, number> = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+  const weekdayMatch = prompt.match(/every\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
+  if (weekdayMatch) {
+    const idx = weekdays[weekdayMatch[1].toLowerCase()];
+    const nextRunAt = nextWeekdayTimestamp(idx, Date.now());
+    return {
+      kind: "datetime",
+      nextRunAt,
+      repeatMs: 7 * 24 * 3600 * 1000,
+      label: `weekly: ${weekdayMatch[1]}`,
+    };
+  }
+
+  return { kind: "none", nextRunAt: 0, repeatMs: 0, label: "custom schedule stored" };
+}
+
+function buildRuntimeFromTaskDraft(task: AutonomousTaskDraft, existing?: AutonomousTaskRuntime): AutonomousTaskRuntime {
+  const base = existing ? { ...existing } : createIdleAutonomousRuntime();
+  const waitingStatus = base.status === "running" ? "running"
+    : base.status === "paused" || base.status === "error" || base.status === "idle" ? base.status : "waiting";
+
+  if (task.runToCompletion) {
+    return { ...base, status: waitingStatus, scheduleKind: "countdown", repeatMs: 15000,
+      remainingMs: base.scheduleKind === "countdown" ? base.remainingMs : 0,
+      nextRunAt: base.nextRunAt || Date.now(), customLabel: "ongoing", updatedAt: Date.now() };
+  }
+
+  if (task.intervalUnit !== "custom") {
+    const intervalMs = parseIntervalValueToMs(task.intervalValue, task.intervalUnit);
+    if (intervalMs <= 0) {
+      return {
+        ...base,
+        status: base.status === "paused" ? "paused" : "idle",
+        scheduleKind: "none",
+        remainingMs: 0,
+        nextRunAt: 0,
+        repeatMs: 0,
+        customLabel: "",
+        updatedAt: base.updatedAt || Date.now(),
+      };
+    }
+    return {
+      ...base,
+      status: waitingStatus,
+      scheduleKind: "countdown",
+      remainingMs: base.scheduleKind === "countdown" && base.remainingMs > 0 ? base.remainingMs : intervalMs,
+      nextRunAt: base.repeatMs === intervalMs ? base.nextRunAt : Date.now() + intervalMs,
+      repeatMs: intervalMs,
+      customLabel: `every ${task.intervalValue || "?"} ${task.intervalUnit}`,
+      updatedAt: base.updatedAt || Date.now(),
+    };
+  }
+
+  const parsed = parseCustomSchedulePrompt(task.customSchedulePrompt);
+  if (parsed.kind === "countdown") {
+    return {
+      ...base,
+      status: waitingStatus,
+      scheduleKind: "countdown",
+      remainingMs: base.scheduleKind === "countdown" && base.remainingMs > 0 ? base.remainingMs : parsed.repeatMs,
+      nextRunAt: base.repeatMs === parsed.repeatMs ? base.nextRunAt : Date.now() + parsed.repeatMs,
+      repeatMs: parsed.repeatMs,
+      customLabel: parsed.label,
+      updatedAt: base.updatedAt || Date.now(),
+    };
+  }
+  if (parsed.kind === "datetime") {
+    const nextRunAt = base.scheduleKind === "datetime" && base.nextRunAt > 0 ? base.nextRunAt : parsed.nextRunAt;
+    return {
+      ...base,
+      status: waitingStatus,
+      scheduleKind: "datetime",
+      remainingMs: 0,
+      nextRunAt,
+      repeatMs: parsed.repeatMs,
+      customLabel: parsed.label,
+      updatedAt: base.updatedAt || Date.now(),
+    };
+  }
+
+  return {
+    ...base,
+    status: base.status === "paused" ? "paused" : "idle",
+    scheduleKind: "none",
+    remainingMs: 0,
+    nextRunAt: 0,
+    repeatMs: 0,
+    customLabel: parsed.label,
+    updatedAt: base.updatedAt || Date.now(),
+  };
+}
+
+function readAutonomousRuntimeFromStorage(): Record<string, AutonomousTaskRuntime> {
+  try {
+    const raw = localStorage.getItem(AUTONOMOUS_RUNTIME_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, AutonomousTaskRuntime> = {};
+    for (const [taskId, value] of Object.entries(parsed as Record<string, any>)) {
+      const v = value || {};
+      out[String(taskId)] = {
+        status: v.status === "running" ? "paused" : ["idle", "waiting", "paused", "error"].includes(String(v.status)) ? String(v.status) as any : "idle",
+        scheduleKind: ["none", "countdown", "datetime"].includes(String(v.scheduleKind)) ? String(v.scheduleKind) as any : "none",
+        remainingMs: Math.max(0, Number(v.remainingMs) || 0),
+        nextRunAt: Math.max(0, Number(v.nextRunAt) || 0),
+        repeatMs: Math.max(0, Number(v.repeatMs) || 0),
+        lastRunAt: Math.max(0, Number(v.lastRunAt) || 0),
+        lastError: String(v.lastError || ""),
+        runCount: Math.max(0, Number(v.runCount) || 0),
+        completionPasses: Math.max(0, Number(v.completionPasses) || 0),
+        blockerCount: Math.max(0, Number(v.blockerCount) || 0),
+        completionModeLastStatus: ["complete", "blocked", "incomplete", "unknown", "error"].includes(String(v.completionModeLastStatus))
+          ? String(v.completionModeLastStatus) as any
+          : "unknown",
+        customLabel: String(v.customLabel || ""),
+        history: Array.isArray(v.history) ? v.history.map((x: any) => String(x)).slice(-60) : [],
+        telemetry: Array.isArray(v.telemetry)
+          ? v.telemetry.map((entry: any) => ({
+              ts: Math.max(0, Number(entry?.ts) || 0),
+              trigger: entry?.trigger === "auto" ? "auto" : "manual",
+              pass: Math.max(1, Number(entry?.pass) || 1),
+              status: ["complete", "blocked", "incomplete", "unknown", "error"].includes(String(entry?.status))
+                ? String(entry.status) as any
+                : "unknown",
+              reason: String(entry?.reason || ""),
+              latencyMs: Math.max(0, Number(entry?.latencyMs) || 0),
+              tabId: Math.max(0, Number(entry?.tabId) || 0),
+              projectName: String(entry?.projectName || ""),
+              mcpCount: Math.max(0, Number(entry?.mcpCount) || 0),
+              sshCount: Math.max(0, Number(entry?.sshCount) || 0),
+              actionCount: Math.max(0, Number(entry?.actionCount) || 0),
+              workLogCount: Math.max(0, Number(entry?.workLogCount) || 0),
+              assistantChars: Math.max(0, Number(entry?.assistantChars) || 0),
+            })).slice(-30)
+          : [],
+        linkedTabId: Math.max(0, Number(v.linkedTabId) || 0),
+        lastResult: String(v.lastResult || "").slice(-6000),
+        updatedAt: Math.max(0, Number(v.updatedAt) || Date.now()),
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function formatAutonomousRemaining(ms: number): string {
+  const safe = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(safe / 86400);
+  const hours = Math.floor((safe % 86400) / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function autonomousCognitiveDocTemplate(runToCompletion: boolean): string {
+  if (runToCompletion) {
+    return [
+      "# Completion Mode Cognitive Doc",
+      "Goal:",
+      "- Deliver a completion-oriented run for this task.",
+      "Execution strategy:",
+      "- Break the objective into executable milestones.",
+      "- Continue iterating until the objective is complete or blocked.",
+      "Done criteria:",
+      "- Output includes completion state, evidence, and any blockers.",
+    ].join("\n");
+  }
+  return [
+    "# Recurring Mode Cognitive Doc",
+    "Goal:",
+    "- Perform a bounded periodic update for this task.",
+    "Execution strategy:",
+    "- Run one useful incremental pass each wake cycle.",
+    "- Preserve context for the next interval.",
+    "Done criteria:",
+    "- Output includes what changed this cycle and what remains.",
+  ].join("\n");
 }
 type StartupStatus = {
   active: boolean;
@@ -196,6 +512,21 @@ type UserTurnPayload = {
   tab_id: number;
   input_text: string;
   images: string[];
+  associated_project_id?: string | null;
+  network_allowed?: boolean;
+};
+
+type AgentTaskProgress = {
+  taskId?: string;
+  status: "running" | "paused" | "blocked" | "completed" | "cancelled";
+  model: string;
+  actions?: number;
+  completedSteps?: number;
+  totalSteps?: number;
+  currentStep?: string | null;
+  review?: string;
+  contextTokens?: number;
+  lastMessage?: string;
 };
 
 type ResolvePermissionPayload = {
@@ -205,7 +536,9 @@ type ResolvePermissionPayload = {
 
 type IrisEvent =
   | { type: "Status"; payload: string }
+  | { type: "AgentProgress"; payload: AgentTaskProgress }
   | { type: "Delta"; payload: string }
+  | { type: "ResetAnswer" }
   | { type: "GodotError"; payload: string }
   | {
       type: "PermissionRequest";
@@ -511,6 +844,23 @@ type McpToolDescriptor = {
   toolName: string;
   description: string;
   inputSchema?: any;
+};
+
+type BridgeCapability = {
+  mcpId: string;
+  mcpName: string;
+  connected: boolean;
+  toolCount: number;
+  tools: string[];
+  tags: string[];
+  errors: string[];
+};
+
+type BridgeCapabilitySnapshot = {
+  projectId: string;
+  projectName: string;
+  generatedAt: number;
+  bridgeCapabilities: BridgeCapability[];
 };
 
 type ParsedExplicitMcpCall = {
@@ -1974,7 +2324,7 @@ type MemoryLanes = {
 };
 
 type ResolverKind = "none" | "math" | "recall";
-type LlmProfile = "Ultra" | "High" | "MediumHigh" | "Medium" | "Low" | "Minimal";
+type LlmProfile = "Ultra" | "High" | "MediumHigh" | "Medium" | "Low" | "Minimal" | "MacBalanced" | "MacLarge13B" | "MacQuality14B";
 type ThemePreset = "Black" | "Blue" | "Pink" | "Purple" | "Silver" | "Grey" | "Custom";
 
 type HardwareProfile = {
@@ -2039,6 +2389,11 @@ type ProfileContextPlan = {
 
 function profileContextPlan(profile: LlmProfile): ProfileContextPlan {
   switch (profile) {
+    case "MacBalanced":
+      return { organizer: 8192, coder: 8192, summarizer: 2048, vision: 4096, plannerBase: 2200, plannerCap: 3200 };
+    case "MacLarge13B":
+    case "MacQuality14B":
+      return { organizer: 4096, coder: 4096, summarizer: 2048, vision: 4096, plannerBase: 1200, plannerCap: 1800 };
     case "Ultra":
       return { organizer: 16384, coder: 12288, summarizer: 4096, vision: 8192, plannerBase: 4200, plannerCap: 5600 };
     case "High":
@@ -2153,10 +2508,10 @@ function profileCapabilities(profile: LlmProfile) {
   const constrained = profile === "Low" || profile === "Minimal";
 
   return {
-    reposAvailable: !constrained,
-    mcpAvailable: !constrained,
+    reposAvailable: true,
+    mcpAvailable: true,
     fullRagEnabled: tier >= 2,     // MediumHigh and above
-    multiMcpEnabled: tier >= 2,    // MediumHigh and above
+    multiMcpEnabled: true,
     deepReasoningEnabled: tier >= 2,
     tokenBudget: contextPlan.plannerBase,
   };
@@ -2628,6 +2983,11 @@ function capSnapshotMessages(
 function App() {
   const useRustEngine = true;
   const [rustEngineStatus, setRustEngineStatus] = useState("");
+  const [agentStatusByTab, setAgentStatusByTab] = useState<Record<number, string>>({});
+  const [agentStartedAtByTab, setAgentStartedAtByTab] = useState<Record<number, number>>({});
+  const [runtimeNow, setRuntimeNow] = useState(Date.now());
+  const [agentProgressByTab, setAgentProgressByTab] = useState<Record<number, AgentTaskProgress>>({});
+  const activeRustRequestRef = useRef<number | null>(null);
   const [globalRuntimeState, setGlobalRuntimeState] = useState<CognitiveRuntimeStatePayload | null>(null);
   const [runtimeStateByTab, setRuntimeStateByTab] = useState<Record<number, CognitiveRuntimeStatePayload>>({});
   const [runtimeControlBusy, setRuntimeControlBusy] = useState(false);
@@ -2653,7 +3013,12 @@ function App() {
   const [autonomousPanelEnabled, setAutonomousPanelEnabled] = useState<boolean>(() => readAutonomousPanelPrefs().enabled);
   const [autonomousPanelCollapsed, setAutonomousPanelCollapsed] = useState<boolean>(() => readAutonomousPanelPrefs().collapsed);
   const [autonomousTasks, setAutonomousTasks] = useState<AutonomousTaskDraft[]>(() => readAutonomousTasksFromStorage());
+  const [autonomousRuntimeById, setAutonomousRuntimeById] = useState<Record<string, AutonomousTaskRuntime>>(() => readAutonomousRuntimeFromStorage());
   const [autonomousDeleteConfirmId, setAutonomousDeleteConfirmId] = useState<string | null>(null);
+  const [autonomousTitleEditingId, setAutonomousTitleEditingId] = useState<string | null>(null);
+  const [autonomousCognitiveTaskId, setAutonomousCognitiveTaskId] = useState<string | null>(null);
+  const [autonomousThoughtsTaskId, setAutonomousThoughtsTaskId] = useState<string | null>(null);
+  const [bridgeTagExpandedByMcpId, setBridgeTagExpandedByMcpId] = useState<Record<string, boolean>>({});
   const [editingLastUserMsgIdx, setEditingLastUserMsgIdx] = useState<number | null>(null);
   const [editingLastUserMsgDraft, setEditingLastUserMsgDraft] = useState("");
   const [thinking, setThinking] = useState(false);
@@ -2664,6 +3029,10 @@ function App() {
     { id: 1, title: "Tab #1", type: "chat", messages: [], promptHistory: [] }
   ]);
   const [activeTab, setActiveTab] = useState(1);
+  const [readinessChecklistHidden, setReadinessChecklistHidden] = useState(() => {
+    try { return localStorage.getItem("iris.ui.readinessChecklistHidden") === "true"; }
+    catch { return false; }
+  });
   const [editingTabId, setEditingTabId] = useState<number | null>(null);
   const [editingTabTitle, setEditingTabTitle] = useState("");
   const [draggingTabId, setDraggingTabId] = useState<number | null>(null);
@@ -2672,7 +3041,13 @@ function App() {
   const abortController = useRef<AbortController | null>(null);
   const mcpProbeAbortedRef = useRef<Set<string>>(new Set());
   const historyRef = useRef<HTMLDivElement>(null);
+  const remoteTurnSubscriptionsRef = useRef<Record<number, () => void>>({});
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const followChatRef = useRef(true);
+  const transcriptContentRef = useRef<HTMLDivElement>(null);
+  const lastChatScrollTopRef = useRef(0);
+  const transcriptSelectedRef = useRef(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const taskbarRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatFormRef = useRef<HTMLFormElement>(null);
@@ -2689,6 +3064,17 @@ function App() {
   const recentSceneFactsByTabRef = useRef<Record<number, RecentSceneFact[]>>({});
   const workLogByTabRef = useRef<Record<number, WorkLogEntry[]>>({});
   const actionTraceByTabRef = useRef<Record<number, IrisActionTrace[]>>({});
+  const autonomousTasksRef = useRef<AutonomousTaskDraft[]>(autonomousTasks);
+  const autonomousRuntimeByIdRef = useRef<Record<string, AutonomousTaskRuntime>>(autonomousRuntimeById);
+  const autonomousTickRef = useRef<number>(Date.now());
+  const autonomousRunningTaskRef = useRef<string | null>(null);
+  const autonomousRunnerRef = useRef(runAutonomousTask);
+  const isGeneratingRef = useRef<boolean>(isGenerating);
+  const tabsRef = useRef<Tab[]>(tabs);
+  const activeTabRef = useRef<number>(activeTab);
+  const inputValueRef = useRef<string>(input);
+  const networkEnabledRef = useRef<boolean>(false);
+  const menuLockedRef = useRef<boolean>(false);
   const isMounted = useRef(true);
 
   const [useCoder, setUseCoder] = useState(false);
@@ -2722,6 +3108,7 @@ function App() {
   const [inlinePermissionQueue, setInlinePermissionQueue] = useState<InlinePermissionRequest[]>([]);
   const inlinePermissionResolverRef = useRef<Record<string, (value: boolean) => void>>({});
   const [agentProficiencies, setAgentProficiencies] = useState<AgentProficiency[]>(DEFAULT_AGENT_PROFICIENCIES);
+  const [observedProficiencies, setObservedProficiencies] = useState<Record<string, { successes: number; failures: number; verifiedCheckpoints: number }>>({});
   const [agentStatsDraftName, setAgentStatsDraftName] = useState("");
   const [lastTaskTags, setLastTaskTags] = useState<string[]>([]);
   const [lastTaskConfidence, setLastTaskConfidence] = useState<number>(50);
@@ -2745,6 +3132,9 @@ function App() {
   const [toolDraft, setToolDraft] = useState<IrisToolDef[]>([]);
   const [mcpLaunchStatus, setMcpLaunchStatus] = useState<Record<string, { pid: number; launched: boolean }>>({});
   const [mcpHealthStatus, setMcpHealthStatus] = useState<Record<string, { state: "stopped" | "launching" | "bridge_up" | "connected" | "error"; message: string; toolCount?: number }>>({});
+  const [bridgeCapabilitySnapshot, setBridgeCapabilitySnapshot] = useState<BridgeCapabilitySnapshot | null>(null);
+  const [bridgeCapabilityByMcpId, setBridgeCapabilityByMcpId] = useState<Record<string, BridgeCapability>>({});
+  const [bridgeCapabilityBusy, setBridgeCapabilityBusy] = useState(false);
   const [sshConnectStatus, setSshConnectStatus] = useState<Record<string, { connected: boolean; checking: boolean; message?: string }>>({});
   const [chatBridgePanelOpen, setChatBridgePanelOpen] = useState(false);
   const [actionTraceByTab, setActionTraceByTab] = useState<Record<number, IrisActionTrace[]>>({});
@@ -2933,6 +3323,7 @@ function App() {
 
   const currentTab = tabs.find(t => t.id === activeTab);
   const hasChatTabs = tabs.some(t => t.type === "chat");
+  const canAddChatTab = tabs.filter(tab => tab.type === "chat").length < 8;
   const menuLocked = startupStatus.active || modelStatus === "checking" || modelStatus === "loading";
   const setupChecklist: SetupChecklistItem[] = [
     {
@@ -2963,24 +3354,34 @@ function App() {
       id: "desktop",
       label: "Desktop tools policy set",
       done: desktopToolsEnabled,
-      hint: "Settings -> Bridges -> Desktop tools toggle.",
+      hint: "Settings -> Bridges -> Desktop tools toggle (MCP context is now project-linked).",
     },
   ];
   const setupChecklistDone = setupChecklist.filter((item) => item.done).length;
   const setupChecklistPct = Math.round((setupChecklistDone / Math.max(setupChecklist.length, 1)) * 100);
+  function setReadinessChecklistVisible(visible: boolean) {
+    setReadinessChecklistHidden(!visible);
+    try { localStorage.setItem("iris.ui.readinessChecklistHidden", String(!visible)); }
+    catch {}
+  }
   const activeThemeColor = themePreset === "Custom" ? customThemeColor : THEME_PRESET_COLORS[themePreset as Exclude<ThemePreset, "Custom">];
   const isLightMode = colorMode === "light";
-  // App background and border follow ONLY theme color — not light/dark mode
-  const appBgColor = activeThemeColor;
-  const appBorderColor = mixHex(activeThemeColor, "#b0b0b0", 0.18);
-  // Detail/accent elements (tabs, inputs, surfaces, panels) respond to light/dark mode
-  const appSurfaceColor = isLightMode ? mixHex(activeThemeColor, "#d6d9de", 0.72) : mixHex(activeThemeColor, "#111111", 0.45);
-  const appTabBgColor = isLightMode ? mixHex(activeThemeColor, "#c5cbd3", 0.74) : mixHex(activeThemeColor, "#1e1e1e", 0.58);
-  const appTabActiveBgColor = isLightMode ? mixHex(activeThemeColor, "#e7ebf0", 0.82) : mixHex(activeThemeColor, "#0e0e0e", 0.52);
-  const appInputBgColor = isLightMode ? "rgba(235, 239, 244, 0.84)" : mixHex(activeThemeColor, "#141414", 0.68);
-  const appPanelBgColor = isLightMode ? "rgba(208, 214, 223, 0.72)" : mixHex(activeThemeColor, "#0d0d0d", 0.55);
-  const appUserBubbleColor = isLightMode ? mixHex(activeThemeColor, "#d8e2ef", 0.78) : mixHex(activeThemeColor, "#0a0a0a", 0.58);
-  const appTextColor = isLightMode ? "#1a1a1a" : "#e8e8e8";
+  const palette = themeTokens(themePreset, customThemeColor, isLightMode);
+  const appBgColor = palette["--app-bg"];
+  const appBorderColor = palette["--app-border"];
+  const appSurfaceColor = palette["--app-surface"];
+  const appTabBgColor = palette["--app-tab-bg"];
+  const appTabActiveBgColor = palette["--app-tab-active-bg"];
+  const appInputBgColor = palette["--app-input-bg"];
+  const appPanelBgColor = palette["--app-panel-bg"];
+  const appUserBubbleColor = palette["--app-user-bubble"];
+  const appTextColor = palette["--app-text"];
+  useEffect(() => {
+    for (const [name, value] of Object.entries(themeTokens(themePreset, customThemeColor, isLightMode))) {
+      document.documentElement.style.setProperty(name, value);
+    }
+    document.documentElement.style.colorScheme = isLightMode ? "light" : "dark";
+  }, [themePreset, customThemeColor, isLightMode]);
   const assistantLabel = assistantName.trim() || "Iris";
   const activeProjectId = tabProjectMap[activeTab] ?? null;
   const chatMessages = currentTab?.messages || [];
@@ -3014,7 +3415,9 @@ function App() {
         text: m.text,
         time: m?.time ?? nowTs,
       })) as any),
-      associatedProjectId: overrides?.associatedProjectId ?? existing?.associatedProjectId ?? tabProjectMap[tabId] ?? null,
+      associatedProjectId: overrides && "associatedProjectId" in overrides
+        ? overrides.associatedProjectId ?? null
+        : tabProjectMap[tabId] !== undefined ? tabProjectMap[tabId] : existing?.associatedProjectId ?? null,
       microSummary: overrides?.microSummary ?? existing?.microSummary ?? "",
       dialogueBullets: overrides?.dialogueBullets ?? existing?.dialogueBullets ?? "",
       summary: overrides?.summary ?? existing?.summary ?? "",
@@ -3031,6 +3434,7 @@ function App() {
   const activeProject = repoStore.projects.find((p) => p.id === activeProjectId) || null;
   const activeProjectMcpIds = new Set((activeProject?.mcpIds || []).map((id) => String(id)));
   const activeProjectSshIds = new Set((activeProject?.sshIds || []).map((id) => String(id)));
+  const activeProjectHasEnabledMcp = !!activeProject && repoStore.mcps.some((m) => m.enabled && activeProjectMcpIds.has(String(m.id)));
   const launchableProjectMcps = activeProject
     ? repoStore.mcps.filter((m) => {
         if (!m.enabled || !activeProjectMcpIds.has(String(m.id))) return false;
@@ -3350,8 +3754,8 @@ function App() {
   const visionNumCtxLive = readNumericParam(visionParamsLive, "num_ctx", contextPlan.vision);
   const liveTokenBudget = organizerNumCtxLive;
   const livePlannerTokenBudget = derivePlannerTokenBudget(llmProfile, organizerNumCtxLive);
-  const reposContextActive = llmCapabilities.reposAvailable && reposEnabled;
-  const mcpContextActive = llmCapabilities.mcpAvailable && mcpEnabled;
+  const reposContextActive = reposEnabled;
+  const mcpContextActive = mcpEnabled && activeProjectHasEnabledMcp;
   const safeStringify = (v: unknown) => {
     try { return JSON.stringify(v); } catch { return "__ERR__"; }
   };
@@ -3426,20 +3830,492 @@ function App() {
     } catch {}
   }, [autonomousTasks]);
 
+  useEffect(() => {
+    autonomousTasksRef.current = autonomousTasks;
+  }, [autonomousTasks]);
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
+
+  useEffect(() => {
+    inputValueRef.current = input;
+  }, [input]);
+
+  useEffect(() => {
+    networkEnabledRef.current = networkEnabled;
+  }, [networkEnabled]);
+
+  useEffect(() => {
+    menuLockedRef.current = menuLocked;
+  }, [menuLocked]);
+
+  useEffect(() => {
+    isGeneratingRef.current = isGenerating;
+  }, [isGenerating]);
+
+  useEffect(() => {
+    if (!isGenerating) return;
+    const timer = setInterval(() => setRuntimeNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [isGenerating]);
+
+  useEffect(() => {
+    autonomousRuntimeByIdRef.current = autonomousRuntimeById;
+    try {
+      localStorage.setItem(AUTONOMOUS_RUNTIME_KEY, JSON.stringify(autonomousRuntimeById));
+    } catch {}
+  }, [autonomousRuntimeById]);
+
+  useEffect(() => {
+    setAutonomousRuntimeById((prev) => {
+      const next: Record<string, AutonomousTaskRuntime> = {};
+      for (const task of autonomousTasks) {
+        const existing = prev[task.id];
+        const runtime = buildRuntimeFromTaskDraft(task, existing);
+        next[task.id] = runtime;
+      }
+      return next;
+    });
+  }, [autonomousTasks]);
+
+  useEffect(() => {
+    autonomousTickRef.current = Date.now();
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const current = autonomousRuntimeByIdRef.current;
+      const next = Object.fromEntries(Object.entries(current).map(([taskId, runtime]) => [taskId, advanceTaskClock(runtime, now)]));
+      if (Object.keys(next).some((taskId) => next[taskId] !== current[taskId])) {
+        autonomousRuntimeByIdRef.current = next;
+        setAutonomousRuntimeById(next);
+      }
+      const dueTaskId = Object.keys(next).find((taskId) => taskIsDue(next[taskId], now));
+      if (!dueTaskId) return;
+      if (autonomousRunningTaskRef.current) return;
+      if (isGeneratingRef.current || activeRustRequestRef.current !== null || menuLockedRef.current) return;
+
+      const dueTask = autonomousTasksRef.current.find((t) => t.id === dueTaskId);
+      if (dueTask) {
+        void autonomousRunnerRef.current(dueTask, "auto");
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => { autonomousRunnerRef.current = runAutonomousTask; });
+
   function updateAutonomousTask(taskId: string, patch: Partial<AutonomousTaskDraft>) {
     setAutonomousTasks((prev) => prev.map((task) => (task.id === taskId ? { ...task, ...patch } : task)));
   }
 
+  function appendAutonomousHistory(taskId: string, line: string) {
+    const stamped = `${new Date().toLocaleTimeString()} | ${line}`;
+    const existing = autonomousRuntimeByIdRef.current[taskId] || createIdleAutonomousRuntime();
+    patchAutonomousRuntime(taskId, { history: [...existing.history, stamped].slice(-60) });
+  }
+
+  function appendAutonomousTelemetry(taskId: string, entry: AutonomousRunTelemetry) {
+    const existing = autonomousRuntimeByIdRef.current[taskId] || createIdleAutonomousRuntime();
+    patchAutonomousRuntime(taskId, { telemetry: [...existing.telemetry, entry].slice(-30) });
+  }
+
+  function resolveTaskResourceSnapshot(projectId: string | null): { projectName: string; mcpCount: number; sshCount: number; repoCount: number } {
+    if (!projectId) {
+      return { projectName: "none", mcpCount: 0, sshCount: 0, repoCount: 0 };
+    }
+    const project = repoStore.projects.find((p) => p.id === projectId && p.enabled);
+    if (!project) {
+      return { projectName: "none", mcpCount: 0, sshCount: 0, repoCount: 0 };
+    }
+    const mcpCount = repoStore.mcps.filter((m) => m.enabled && (project.mcpIds || []).includes(m.id)).length;
+    const sshCount = repoStore.sshs.filter((s) => s.enabled && (project.sshIds || []).includes(s.id)).length;
+    const repoCount = repoStore.repos.filter((r) => r.enabled && (project.repoIds || []).includes(r.id)).length;
+    return { projectName: project.name, mcpCount, sshCount, repoCount };
+  }
+
+  function getLatestAssistantMessageText(tabId: number): string {
+    const tab = tabsRef.current.find((t) => t.id === tabId && t.type === "chat");
+    if (!tab || !Array.isArray(tab.messages)) return "";
+    for (let i = tab.messages.length - 1; i >= 0; i--) {
+      const msg = tab.messages[i];
+      if (msg?.role === "llm" && typeof msg.text === "string") {
+        return msg.text;
+      }
+    }
+    return "";
+  }
+
+  function parseAutonomousCompletionStatus(text: string): { status: "complete" | "blocked" | "incomplete" | "unknown"; reason: string } {
+    return parseTaskOutcome(text);
+  }
+
+  function toggleAutonomousRunMode(task: AutonomousTaskDraft) {
+    if (autonomousRunningTaskRef.current === task.id) return;
+    const next = !task.runToCompletion;
+    updateAutonomousTask(task.id, {
+      runToCompletion: next,
+      cognitiveDoc: task.cognitiveDoc.trim() ? task.cognitiveDoc : autonomousCognitiveDocTemplate(next),
+    });
+    appendAutonomousHistory(task.id, `run mode -> ${next ? "till completion" : "scheduled recurring"}`);
+  }
+
+  async function toggleAutonomousPause(taskId: string) {
+    const runtime = autonomousRuntimeByIdRef.current[taskId] || createIdleAutonomousRuntime();
+    if (runtime.status === "paused" || runtime.status === "error") {
+      if (autonomousRunningTaskRef.current === taskId) return;
+      const task = autonomousTasksRef.current.find((item) => item.id === taskId);
+      if (!task) return;
+      const scheduled = buildRuntimeFromTaskDraft(task, runtime);
+      patchAutonomousRuntime(taskId, { ...scheduled, status: "waiting", lastError: "",
+        nextRunAt: scheduled.scheduleKind === "countdown" ? Date.now() + runtime.remainingMs : scheduled.nextRunAt });
+      appendAutonomousHistory(taskId, "resumed");
+      if (scheduled.scheduleKind === "none") void autonomousRunnerRef.current(task, "manual");
+      return;
+    }
+    const clock = advanceTaskClock(runtime, Date.now());
+    patchAutonomousRuntime(taskId, { ...clock, status: "paused" });
+    appendAutonomousHistory(taskId, "paused; cancelling active work");
+    if (autonomousRunningTaskRef.current === taskId && activeRustRequestRef.current === runtime.linkedTabId) {
+      try { await invoke("cancel_agent_turn", { tabId: runtime.linkedTabId }); }
+      catch (error) { patchAutonomousRuntime(taskId, { lastError: `Cancellation could not be confirmed: ${String(error)}` }); }
+    }
+  }
+
+  function buildAutonomousExecutionPrompt(task: AutonomousTaskDraft, pass: number, maxPasses: number, priorResult: string): string {
+    const resource = resolveTaskResourceSnapshot(task.projectId);
+    const modeLine = task.runToCompletion
+      ? "Execution mode: ongoing work cycle. Make concrete progress toward the acceptance criteria. Resume saved work when relevant and inspect uncertain external state first. Verify completed work; do not call a draft or an untested change perfect. Stop and report real blockers."
+      : "Execution mode: scheduled recurring pass. Perform one bounded high-value iteration and preserve continuity for the next wake.";
+    const doc = (task.cognitiveDoc || "").trim();
+    const docBlock = `${doc ? `\n\nTask notes:\n${doc}` : ""}${task.runToCompletion ? `\n\nAcceptance criteria:\n${task.acceptanceCriteria}` : ""}`;
+    const passContext = task.runToCompletion
+      ? `\n\nBounded work cycle ${pass}/${maxPasses}. Further cycles can be scheduled if incomplete.`
+      : "";
+    const priorBlock = priorResult
+      ? `\n\nPrevious pass result (condensed):\n${priorResult.slice(0, 1800)}`
+      : "";
+    const statusContract = "\n\nEnd with one status line in the form AUTONOMOUS_STATUS: INCOMPLETE - remaining work. Use COMPLETE only when all acceptance criteria are met and verified; use BLOCKED for a real blocker. Never print all three alternatives.";
+    return `${modeLine}${passContext}\n\nLinked resources:\n- project: ${resource.projectName}\n- MCP bridges: ${resource.mcpCount}\n- SSH bridges: ${resource.sshCount}\n- Repos: ${resource.repoCount}\n\nPrimary task prompt:\n${String(task.prompt || "").trim()}${docBlock}${priorBlock}${statusContract}`;
+  }
+
   function addAutonomousTask() {
-    setAutonomousTasks((prev) => [...prev, createBlankAutonomousTask()]);
+    const created = createBlankAutonomousTask();
+    created.cognitiveDoc = autonomousCognitiveDocTemplate(false);
+    setAutonomousTasks((prev) => [...prev, created]);
   }
 
   function confirmDeleteAutonomousTask(taskId: string) {
+    if (autonomousRunningTaskRef.current === taskId) return;
     setAutonomousTasks((prev) => {
       const next = prev.filter((task) => task.id !== taskId);
       return next.length ? next : [createBlankAutonomousTask()];
     });
     setAutonomousDeleteConfirmId(null);
+  }
+
+  function patchAutonomousRuntime(taskId: string, patch: Partial<AutonomousTaskRuntime>) {
+    const previous = autonomousRuntimeByIdRef.current;
+    const existing = previous[taskId] || createIdleAutonomousRuntime();
+    const next = { ...previous, [taskId]: { ...existing, ...patch, updatedAt: Date.now() } };
+    autonomousRuntimeByIdRef.current = next;
+    setAutonomousRuntimeById(next);
+  }
+
+  async function ensureAutonomousTaskTab(taskId: string, preferredProjectId: string | null): Promise<number> {
+    const liveTabs = tabsRef.current;
+    const runtime = autonomousRuntimeByIdRef.current[taskId];
+    const linkedId = Number(runtime?.linkedTabId || 0);
+    if (linkedId > 0 && liveTabs.some((t) => t.id === linkedId && t.type === "chat")) {
+      return linkedId;
+    }
+
+    const chatCount = liveTabs.filter((t) => t.type === "chat").length;
+    if (chatCount >= 8) {
+      throw new Error("Close a chat tab to give this task its own workspace. Existing chats will not be reused.");
+    }
+
+    const utilityIdx = liveTabs.findIndex((tab) => tab.type !== "chat");
+    const newId = liveTabs.length ? Math.max(...liveTabs.map((t) => t.id)) + 1 : 1;
+    const newTab: Tab = {
+      id: newId,
+      title: `Auto Task ${taskId.slice(-4)}`,
+      type: "chat",
+      messages: [],
+      promptHistory: [],
+    };
+
+    setTabs((prev) => {
+      if (utilityIdx === -1) return [...prev, newTab];
+      const next = [...prev];
+      next.splice(utilityIdx, 0, newTab);
+      return next;
+    });
+
+    await persistTabProjectAssociation(newId, preferredProjectId);
+    patchAutonomousRuntime(taskId, { linkedTabId: newId });
+
+    try {
+      await persistSnapshot(newId, {
+        title: newTab.title,
+        messages: [],
+        associatedProjectId: preferredProjectId,
+        microSummary: "",
+        dialogueBullets: "",
+        summary: "",
+        artifacts: [],
+        promptHistory: [],
+        last_updated: Math.floor(Date.now() / 1000),
+      });
+    } catch {}
+
+    return newId;
+  }
+
+  function waitFor(ms: number) {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  async function waitForGenerationCycle(maxStartMs = 5000, maxRunMs = 300000): Promise<boolean> {
+    const startedAt = Date.now();
+    while (!isGeneratingRef.current && Date.now() - startedAt < maxStartMs) {
+      await waitFor(120);
+    }
+    if (!isGeneratingRef.current) return false;
+    while (isGeneratingRef.current && Date.now() - startedAt < maxRunMs) {
+      await waitFor(280);
+    }
+    return !isGeneratingRef.current;
+  }
+
+  async function runAutonomousTask(task: AutonomousTaskDraft, trigger: "auto" | "manual" = "auto") {
+    if (autonomousRunningTaskRef.current || activeRustRequestRef.current !== null || isGeneratingRef.current) return;
+    const runtimeBefore = autonomousRuntimeByIdRef.current[task.id] || createIdleAutonomousRuntime();
+    if (runtimeBefore.status === "paused" && trigger === "auto") {
+      return;
+    }
+    const prompt = String(task.prompt || "").trim();
+    if (!prompt) {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "Task prompt is empty." });
+      appendAutonomousHistory(task.id, "failed: task prompt is empty");
+      return;
+    }
+    if (task.runToCompletion && !task.acceptanceCriteria.trim()) {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "Add measurable completion criteria before starting ongoing work." });
+      return;
+    }
+    if (!task.runToCompletion && task.intervalUnit !== "custom" && task.intervalValue.trim() && !parseIntervalValueToMs(task.intervalValue, task.intervalUnit)) {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "Use a positive whole number for the interval." });
+      return;
+    }
+    if (!task.runToCompletion && task.intervalUnit === "custom" && parseCustomSchedulePrompt(task.customSchedulePrompt).kind === "none") {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "Enter a valid date/time or a schedule such as every 2 hours." });
+      return;
+    }
+    if (task.networkAllowed && !networkEnabledRef.current) {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "Network access is off in Settings. Enable it before starting this network-enabled task." });
+      return;
+    }
+    if (menuLockedRef.current) {
+      patchAutonomousRuntime(task.id, { status: "error", lastError: "App is still initializing. Try again after startup." });
+      appendAutonomousHistory(task.id, "failed: app is initializing");
+      return;
+    }
+
+    const userDraft = String(inputValueRef.current || "");
+    if (trigger === "auto" && userDraft.trim()) {
+      const runtime = autonomousRuntimeByIdRef.current[task.id] || createIdleAutonomousRuntime();
+      if (runtime.scheduleKind === "datetime") {
+        patchAutonomousRuntime(task.id, {
+          status: "waiting",
+          nextRunAt: Math.max(Date.now() + 15000, runtime.nextRunAt || 0),
+        });
+        appendAutonomousHistory(task.id, "deferred: user draft detected (datetime schedule)");
+      } else if (runtime.scheduleKind === "countdown") {
+        patchAutonomousRuntime(task.id, {
+          status: "waiting",
+          remainingMs: Math.max(15000, runtime.remainingMs || 0),
+          nextRunAt: Date.now() + Math.max(15000, runtime.remainingMs || 0),
+        });
+        appendAutonomousHistory(task.id, "deferred: user draft detected (countdown schedule)");
+      }
+      return;
+    }
+
+    autonomousRunningTaskRef.current = task.id;
+    const previousNetworkState = networkEnabledRef.current;
+    const forceNetworkOff = !useRustEngine && !task.networkAllowed && previousNetworkState;
+    const previousActiveTab = activeTabRef.current;
+    const previousInput = userDraft;
+
+    patchAutonomousRuntime(task.id, {
+      status: "running",
+      lastError: "",
+      completionPasses: 0,
+    });
+    appendAutonomousHistory(task.id, `running (${trigger})`);
+
+    try {
+      if (forceNetworkOff) {
+        setNetworkEnabled(false);
+        setNetworkDraftEnabled(false);
+      }
+
+      const tabId = await ensureAutonomousTaskTab(task.id, task.projectId ?? null);
+      await persistTabProjectAssociation(tabId, task.projectId ?? null);
+      patchAutonomousRuntime(task.id, { linkedTabId: tabId });
+      if (autonomousRuntimeByIdRef.current[task.id]?.status === "paused") return;
+
+      const maxCompletionPasses = 1;
+      let priorResult = runtimeBefore.lastResult;
+      let completionStatus: "complete" | "blocked" | "incomplete" | "unknown" | "error" = "unknown";
+      let completionReason = "";
+      let passCount = 0;
+
+      for (let pass = 1; pass <= maxCompletionPasses; pass++) {
+        const runtimeLive = autonomousRuntimeByIdRef.current[task.id] || createIdleAutonomousRuntime();
+        if (runtimeLive.status === "paused") {
+          completionStatus = "unknown";
+          completionReason = "paused by user";
+          break;
+        }
+
+        passCount = pass;
+        const passStartTs = Date.now();
+        const workStartIndex = (workLogByTabRef.current[tabId] || []).length;
+        const actionStartIndex = (actionTraceByTabRef.current[tabId] || []).length;
+
+        let backendTask: AgentTaskProgress | null = null;
+        if (useRustEngine) {
+          backendTask = await sendRustTurn(
+            tabId,
+            pass === 1 ? buildAutonomousExecutionPrompt(task, pass, maxCompletionPasses, priorResult) : "Continue the saved task from its notes. Inspect any uncertain action before retrying.",
+            [], task.projectId ?? null, task.networkAllowed,
+          );
+        } else {
+          setActiveTab(tabId);
+          setInput(buildAutonomousExecutionPrompt(task, pass, maxCompletionPasses, priorResult));
+          await waitFor(120);
+          chatFormRef.current?.requestSubmit();
+          await waitFor(90);
+        }
+
+        if (trigger === "auto") {
+          if (tabsRef.current.some((t) => t.id === previousActiveTab)) {
+            setActiveTab(previousActiveTab);
+          }
+          if (previousInput.trim()) {
+            setInput(previousInput);
+            queueMicrotask(() => {
+              if (inputRef.current) {
+                inputRef.current.style.height = "auto";
+              }
+            });
+          }
+        }
+
+        const completed = useRustEngine ? backendTask !== null : await waitForGenerationCycle();
+        const assistantText = backendTask?.lastMessage || getLatestAssistantMessageText(tabId);
+        const parsed = backendTask
+          ? backendTask.status === "completed"
+            ? task.runToCompletion ? parseTaskOutcome(assistantText) : { status: "complete" as const, reason: "Work cycle completed." }
+            : { status: backendTask.status === "paused" ? "incomplete" as const : "blocked" as const, reason: backendTask.lastMessage || backendTask.status }
+          : completed ? parseAutonomousCompletionStatus(assistantText)
+            : { status: "error" as const, reason: "no generation cycle observed" };
+        if (task.runToCompletion && parsed.status === "incomplete" && assistantText.trim() === runtimeBefore.lastResult.trim()) {
+          parsed.status = "blocked";
+          parsed.reason = "No new progress since the previous cycle. Review the task before resuming.";
+        }
+        const actionCount = Math.max(0, (actionTraceByTabRef.current[tabId] || []).length - actionStartIndex);
+        const workLogCount = Math.max(0, (workLogByTabRef.current[tabId] || []).length - workStartIndex);
+        const resource = resolveTaskResourceSnapshot(task.projectId);
+        const latencyMs = Math.max(0, Date.now() - passStartTs);
+
+        appendAutonomousTelemetry(task.id, {
+          ts: Math.floor(Date.now() / 1000),
+          trigger,
+          pass,
+          status: parsed.status,
+          reason: parsed.reason,
+          latencyMs,
+          tabId,
+          projectName: resource.projectName,
+          mcpCount: resource.mcpCount,
+          sshCount: resource.sshCount,
+          actionCount,
+          workLogCount,
+          assistantChars: assistantText.length,
+        });
+
+        appendAutonomousHistory(
+          task.id,
+          `pass ${pass}/${maxCompletionPasses}: ${parsed.status}${parsed.reason ? ` (${parsed.reason})` : ""} | ${latencyMs}ms | actions ${actionCount}`
+        );
+
+        completionStatus = parsed.status;
+        completionReason = parsed.reason;
+        priorResult = assistantText;
+
+        if (!task.runToCompletion) {
+          break;
+        }
+        if (parsed.status === "complete" || parsed.status === "blocked" || parsed.status === "error") {
+          break;
+        }
+        if (pass >= maxCompletionPasses) {
+          completionStatus = "incomplete";
+          completionReason = parsed.reason;
+          break;
+        }
+
+        await waitFor(900);
+        appendAutonomousHistory(task.id, `continuing completion loop -> pass ${pass + 1}`);
+      }
+
+      const now = Date.now();
+      const runtime = autonomousRuntimeByIdRef.current[task.id] || createIdleAutonomousRuntime();
+      const ranCount = Math.max(0, Number(runtime.runCount || 0)) + Math.max(0, passCount);
+      const blockerCount = completionStatus === "blocked"
+        ? Math.max(0, Number(runtime.blockerCount || 0)) + 1
+        : 0;
+      const needsAttention = completionStatus === "blocked" || completionStatus === "error" || completionStatus === "unknown";
+      const finished = task.runToCompletion && completionStatus === "complete";
+      const nextRunAt = finished ? 0 : task.runToCompletion ? now + 15000 : nextRecurringRun(runtime.nextRunAt, runtime.repeatMs, now);
+      patchAutonomousRuntime(task.id, {
+        status: runtime.status === "paused" || needsAttention ? "paused" : nextRunAt > 0 ? "waiting" : "idle",
+        nextRunAt, remainingMs: Math.max(0, nextRunAt - now),
+        scheduleKind: nextRunAt > 0 ? task.runToCompletion ? "countdown" : runtime.scheduleKind : "none",
+        lastRunAt: now, runCount: ranCount, completionPasses: passCount, blockerCount,
+        completionModeLastStatus: completionStatus, lastResult: priorResult.slice(-6000),
+        lastError: runtime.status === "paused" ? runtime.lastError : needsAttention ? completionReason : "",
+      });
+
+      if (completionStatus === "error") {
+        appendAutonomousHistory(task.id, "error: no generation cycle observed");
+      } else if (task.runToCompletion) {
+        appendAutonomousHistory(task.id, `completion mode final: ${completionStatus}${completionReason ? ` (${completionReason})` : ""}`);
+      } else {
+        appendAutonomousHistory(task.id, `completed run #${ranCount}`);
+      }
+    } catch (e: any) {
+      patchAutonomousRuntime(task.id, {
+        status: "error",
+        lastError: String(e?.message || e || "autonomous task failed"),
+      });
+      appendAutonomousHistory(task.id, `error: ${String(e?.message || e || "autonomous task failed")}`);
+    } finally {
+      if (forceNetworkOff) {
+        setNetworkEnabled(previousNetworkState);
+        setNetworkDraftEnabled(previousNetworkState);
+      }
+      autonomousRunningTaskRef.current = null;
+    }
   }
 
   function resizeAutonomousPrompt(el: HTMLTextAreaElement | null) {
@@ -3662,25 +4538,11 @@ function App() {
   }
 
   useEffect(() => {
-    if (!lowPowerProfile) return;
-    const args: Record<string, boolean> = {};
-    let changed = false;
-    if (reposEnabled) {
-      setReposEnabled(false);
-      args.reposEnabled = false;
-      changed = true;
-    }
-    if (mcpEnabled) {
-      setMcpEnabled(false);
-      args.mcpEnabled = false;
-      changed = true;
-    }
-    if (changed) {
-      invoke("set_setup_flags", { args }).catch((e) => {
-        console.warn("Failed to persist low-power feature gating", e);
-      });
-    }
-  }, [lowPowerProfile, reposEnabled, mcpEnabled]);
+    if (currentTab?.type !== "agent-stats" || !(window as any).__TAURI_INTERNALS__) return;
+    void invoke<{ tools: typeof observedProficiencies }>("get_agent_proficiency")
+      .then((result) => setObservedProficiencies(result.tools || {}))
+      .catch((error) => setRustEngineStatus(String(error)));
+  }, [currentTab?.type]);
 
   // helper: retry listOpenTabs a few times to be resilient to late Tauri injection
   async function tryListOpenTabs(retries = 4) {
@@ -3724,7 +4586,7 @@ function App() {
           }
           if (typeof flags?.modelProfile === "string") {
             const raw = String(flags.modelProfile);
-            if (["Ultra", "High", "MediumHigh", "Medium", "Low", "Minimal"].includes(raw)) {
+            if (["Ultra", "High", "MediumHigh", "Medium", "Low", "Minimal", "MacBalanced", "MacLarge13B", "MacQuality14B"].includes(raw)) {
               setLlmProfile(raw as LlmProfile);
             }
           }
@@ -4023,17 +4885,42 @@ function App() {
   }, [startupStatus.active, modelStatus]);
 
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    followChatRef.current = true;
+    lastChatScrollTopRef.current = 0;
+    transcriptSelectedRef.current = false;
+    setShowJumpToLatest(false);
+  }, [activeTab]);
+
+  useLayoutEffect(() => {
     const historyEl = historyRef.current;
     if (!historyEl) return;
-    const raf = requestAnimationFrame(() => {
-      if (chatEndRef.current) {
-        chatEndRef.current.scrollIntoView({ block: "end" });
-      }
+    const selection = window.getSelection();
+    const selectingChat = selection && !selection.isCollapsed && historyEl.contains(selection.anchorNode);
+    if (followChatRef.current && !selectingChat) {
       historyEl.scrollTop = historyEl.scrollHeight;
-    });
-    return () => cancelAnimationFrame(raf);
+      lastChatScrollTopRef.current = historyEl.scrollTop;
+    }
+    setShowJumpToLatest(historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight > 160);
   }, [activeTab, currentTab?.messages, thinking, isGenerating]);
+
+  useEffect(() => {
+    const historyEl = historyRef.current;
+    const content = transcriptContentRef.current;
+    if (!historyEl || !content) return;
+    const observer = new ResizeObserver(() => {
+      const selection = window.getSelection();
+      const selectingChat = selection && !selection.isCollapsed && historyEl.contains(selection.anchorNode);
+      if (followChatRef.current && !selectingChat) {
+        historyEl.scrollTop = historyEl.scrollHeight;
+        lastChatScrollTopRef.current = historyEl.scrollTop;
+      }
+      setShowJumpToLatest(historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight > 160);
+    });
+    observer.observe(content);
+    observer.observe(historyEl);
+    return () => observer.disconnect();
+  }, [activeTab, currentTab?.type]);
 
   useEffect(() => {
     if (!modelConfig.coderEnabled && useCoder) {
@@ -4212,6 +5099,18 @@ function App() {
   }, [showChatBridgeControls]);
 
   useEffect(() => {
+    if (!chatBridgePanelOpen) return;
+    if (currentTab?.type !== "chat") return;
+    if (!activeProjectId) return;
+    void refreshBridgeCapabilities(false);
+  }, [chatBridgePanelOpen, currentTab?.type, activeProjectId, activeTab]);
+
+  useEffect(() => {
+    setBridgeCapabilitySnapshot(null);
+    setBridgeCapabilityByMcpId({});
+  }, [activeProjectId]);
+
+  useEffect(() => {
     if (!activeProject || !isProjectBridgeConnected(activeProject)) return;
     void refreshProjectBridgeMetadata(activeProject, { forceFullPull: false, reason: "project_chat_open" });
   }, [activeProjectId, mcpHealthStatus, mcpLaunchStatus, sshConnectStatus]);
@@ -4254,28 +5153,33 @@ function App() {
     };
   }, [activeTab, currentTab?.type, activeProject?.id, activeProject?.manipulationRootPath]);
 
-  useEffect(() => {
+  async function subscribeRustTurn(currentTabId: number): Promise<() => void> {
     const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
     if (!tauriInvoke) {
-      return;
+      return () => {};
     }
-
-    const currentTabId = activeTab;
     const eventName = `iris_event_${currentTabId}`;
-    let unlistenFn: (() => void) | null = null;
-
-    listen<IrisEvent>(eventName, (event) => {
+    return listen<IrisEvent>(eventName, (event) => {
       const incoming = event.payload as IrisEvent;
       if (!incoming || typeof incoming !== "object") return;
 
       switch (incoming.type) {
         case "Status":
           setRustEngineStatus(String(incoming.payload || ""));
+          setAgentStatusByTab((previous) => ({ ...previous, [currentTabId]: String(incoming.payload || "") }));
+          break;
+        case "AgentProgress":
+          setAgentProgressByTab((previous) => ({ ...previous, [currentTabId]: incoming.payload }));
           break;
         case "Delta":
-          console.log("[RustEngine][Delta]", incoming.payload);
           rustHadDeltaByTabRef.current[currentTabId] = true;
           queueRustDelta(currentTabId, String(incoming.payload || ""));
+          break;
+        case "ResetAnswer":
+          stopRustDeltaDrain(currentTabId);
+          rustDeltaQueueByTabRef.current[currentTabId] = "";
+          rustHadDeltaByTabRef.current[currentTabId] = false;
+          updateTabMessages(currentTabId, clearProvisionalReply);
           break;
         case "GodotError": {
           const trace = String(incoming.payload || "").trim();
@@ -4292,10 +5196,19 @@ function App() {
           break;
         }
         case "PermissionRequest":
-          console.log("[RustEngine][PermissionRequest]", incoming.payload);
+          void askInlinePermission({
+            title: incoming.payload.action,
+            message: incoming.payload.target,
+            actionKey: incoming.payload.req_id,
+            risk: incoming.payload.risk_level === "critical" ? "high" : "medium",
+            confidence: 0,
+          }).then((approved) => invoke("resolve_permission", {
+            payload: { req_id: incoming.payload.req_id, approved },
+          })).catch((error) => setRustEngineStatus(String(error)));
           break;
         case "ToolResult":
-          console.log("[RustEngine][ToolResult]", incoming.payload);
+          setAgentStatusByTab((previous) => ({ ...previous, [currentTabId]: `${incoming.payload.tool_name.replace(/_/g, " ")} · ${incoming.payload.status}` }));
+          appendWorkLog(currentTabId, `${incoming.payload.tool_name}: ${incoming.payload.status}`);
           break;
         case "Error":
           console.log("[RustEngine][Error]", incoming.payload);
@@ -4342,18 +5255,65 @@ function App() {
         default:
           break;
       }
-    })
-      .then((off) => {
-        unlistenFn = off;
-      })
-      .catch((err) => {
-        console.warn("Failed to subscribe to Rust engine events", err);
-      });
+    });
+  }
 
-    return () => {
-      if (unlistenFn) unlistenFn();
+  useEffect(() => {
+    if (!(window as any).__TAURI_INTERNALS__) return;
+    let disposed = false;
+    const listeners: (() => void)[] = [];
+    const synchronize = async (tabId: number) => {
+      const snapshot = await readTabSnapshot(tabId);
+      if (!snapshot || disposed) return;
+      setTabs((previous) => {
+        const existing = previous.some((tab) => tab.id === tabId);
+        const restored: Tab = { id: tabId, type: "chat", title: snapshot.title, messages: normalizeMessages(snapshot.messages), promptHistory: snapshot.promptHistory || [] };
+        return existing ? previous.map((tab) => tab.id === tabId ? { ...tab, ...restored } : tab) : [...previous.filter((tab) => tab.type === "chat"), restored, ...previous.filter((tab) => tab.type !== "chat")];
+      });
+      setTabProjectMap((previous) => ({ ...previous, [tabId]: snapshot.associatedProjectId ?? null }));
     };
-  }, [activeTab]);
+    void listen<{ tabId: number; jobId: string; input: string }>("controller-turn-started", async ({ payload }) => {
+      if (disposed || activeRustRequestRef.current !== null || isGeneratingRef.current) return;
+      activeRustRequestRef.current = payload.tabId;
+      try {
+        await synchronize(payload.tabId);
+        if (disposed) return;
+        remoteTurnSubscriptionsRef.current[payload.tabId] = await subscribeRustTurn(payload.tabId);
+        rustHadDeltaByTabRef.current[payload.tabId] = false;
+        rustDeltaQueueByTabRef.current[payload.tabId] = "";
+        rustStreamDoneByTabRef.current[payload.tabId] = false;
+        updateTabMessages(payload.tabId, (messages) => updateMessagesAppendUser(messages, payload.input));
+        setIsGenerating(true);
+        isGeneratingRef.current = true;
+        setRespondingTab(payload.tabId);
+        setAgentStartedAtByTab((previous) => ({ ...previous, [payload.tabId]: Date.now() }));
+        await invoke("controller_frontend_ready", { jobId: payload.jobId });
+      } catch (error) {
+        remoteTurnSubscriptionsRef.current[payload.tabId]?.();
+        delete remoteTurnSubscriptionsRef.current[payload.tabId];
+        activeRustRequestRef.current = null;
+        setIsGenerating(false);
+        setRustEngineStatus(String(error));
+      }
+    }).then((unlisten) => { if (disposed) unlisten(); else listeners.push(unlisten); });
+    void listen<{ tabId: number }>("controller-chat-updated", async ({ payload }) => {
+      if (disposed) return;
+      if (remoteTurnSubscriptionsRef.current[payload.tabId]) {
+        remoteTurnSubscriptionsRef.current[payload.tabId]();
+        delete remoteTurnSubscriptionsRef.current[payload.tabId];
+        stopRustDeltaDrain(payload.tabId);
+        rustDeltaQueueByTabRef.current[payload.tabId] = "";
+        activeRustRequestRef.current = null;
+        isGeneratingRef.current = false;
+        setIsGenerating(false);
+        setRespondingTab(null);
+      }
+      await synchronize(payload.tabId);
+      const progress = await invoke<AgentTaskProgress | null>("get_agent_task", { tabId: payload.tabId });
+      if (progress && !disposed) setAgentProgressByTab((previous) => ({ ...previous, [payload.tabId]: progress }));
+    }).then((unlisten) => { if (disposed) unlisten(); else listeners.push(unlisten); });
+    return () => { disposed = true; listeners.forEach((unlisten) => unlisten()); Object.values(remoteTurnSubscriptionsRef.current).forEach((unlisten) => unlisten()); remoteTurnSubscriptionsRef.current = {}; };
+  }, []);
 
   useEffect(() => {
     const tauriInvoke = (window as any).__TAURI__?.core?.invoke ?? (window as any).__TAURI__?.invoke;
@@ -4400,6 +5360,14 @@ function App() {
 
   async function runRuntimeControl(action: "pause" | "resume" | "reset_idle"): Promise<boolean> {
     if (runtimeControlBusy) return false;
+    if (useRustEngine && action === "pause" && activeRustRequestRef.current !== null) {
+      return invoke<boolean>("cancel_agent_turn", { tabId: activeRustRequestRef.current });
+    }
+    if (useRustEngine && action === "resume") {
+      if (activeRustRequestRef.current !== null) return false;
+      return (await sendRustTurn(activeTab, "Continue the saved task from its notes. Inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null)) !== null;
+    }
+    if (useRustEngine && activeRustRequestRef.current !== null) return false;
     try {
       setRuntimeControlBusy(true);
       const next = await invoke<CognitiveRuntimeStatePayload>("transition_cognitive_runtime_state", {
@@ -4869,6 +5837,65 @@ function App() {
     });
   }
 
+  async function sendRustTurn(
+    requestTabId: number,
+    inputText: string,
+    images: string[],
+    projectId: string | null,
+    networkAllowed = networkEnabledRef.current,
+  ): Promise<AgentTaskProgress | null> {
+    if (activeRustRequestRef.current !== null) throw new Error("An agent task is already running. Stop it before starting another.");
+    activeRustRequestRef.current = requestTabId;
+    setIsGenerating(true);
+    setRespondingTab(requestTabId);
+    setRustEngineStatus("Preparing local agent...");
+    setAgentStatusByTab((previous) => ({ ...previous, [requestTabId]: "Preparing local agent" }));
+    setAgentStartedAtByTab((previous) => ({ ...previous, [requestTabId]: Date.now() }));
+    setRuntimeNow(Date.now());
+    rustHadDeltaByTabRef.current[requestTabId] = false;
+    rustStreamDoneByTabRef.current[requestTabId] = false;
+    rustDeltaQueueByTabRef.current[requestTabId] = "";
+    stopRustDeltaDrain(requestTabId);
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await subscribeRustTurn(requestTabId);
+      updateTabMessages(requestTabId, (messages) => updateMessagesAppendUser(messages, inputText || "Attached image", images));
+      if (inputText) updateTabPromptHistory(requestTabId, inputText);
+      const payload: UserTurnPayload = {
+        tab_id: requestTabId, input_text: inputText, images,
+        associated_project_id: projectId, network_allowed: networkAllowed,
+      };
+      await invoke("submit_turn", { payload });
+      const pending = rustDeltaQueueByTabRef.current[requestTabId] || "";
+      if (pending) {
+        stopRustDeltaDrain(requestTabId);
+        rustDeltaQueueByTabRef.current[requestTabId] = "";
+        appendRustDelta(requestTabId, pending);
+      }
+      return await invoke<AgentTaskProgress | null>("get_agent_task", { tabId: requestTabId });
+    } catch (error) {
+      const message = String((error as Error)?.message || error);
+      setRustEngineStatus(message);
+      updateTabMessages(requestTabId, (messages) => [...messages, {
+        role: "llm", text: `Agent error: ${message}`, time: Math.floor(Date.now() / 1000),
+      }]);
+      return null;
+    } finally {
+      unlisten?.();
+      stopRustDeltaDrain(requestTabId);
+      activeRustRequestRef.current = null;
+      setIsGenerating(false);
+      setRespondingTab(null);
+      setInlinePermissionQueue((pending) => {
+        pending.forEach((permission) => {
+          inlinePermissionResolverRef.current[permission.id]?.(false);
+          delete inlinePermissionResolverRef.current[permission.id];
+        });
+        return [];
+      });
+    }
+  }
+
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
     if (menuLocked) {
@@ -4889,49 +5916,13 @@ function App() {
       if (!inputText && images.length === 0) return;
 
       const requestTabId = activeTab;
-      const userDisplayText = inputText || `Attached ${images.length} image${images.length === 1 ? "" : "s"}.`;
-      updateTabMessages(requestTabId, msgs => updateMessagesAppendUser(msgs, userDisplayText, images));
-      if (inputText) {
-        updateTabPromptHistory(requestTabId, inputText);
-      }
       promptHistoryIndexRef.current = -1;
       promptHistoryDraftRef.current = "";
 
       setInput("");
       queueMicrotask(() => { if (inputRef.current) inputRef.current.style.height = "auto"; });
       setPendingImages([]);
-      setIsGenerating(true);
-      setRustEngineStatus("Submitting turn to Rust engine...");
-      rustHadDeltaByTabRef.current[requestTabId] = false;
-      rustStreamDoneByTabRef.current[requestTabId] = false;
-      rustDeltaQueueByTabRef.current[requestTabId] = "";
-      stopRustDeltaDrain(requestTabId);
-
-      const payload: UserTurnPayload = {
-        tab_id: requestTabId,
-        input_text: inputText,
-        images,
-      };
-
-      try {
-        await invoke("submit_turn", { payload });
-      } catch (err) {
-        console.error("submit_turn failed", err);
-        rustStreamDoneByTabRef.current[requestTabId] = false;
-        rustDeltaQueueByTabRef.current[requestTabId] = "";
-        stopRustDeltaDrain(requestTabId);
-        rustHadDeltaByTabRef.current[requestTabId] = true;
-        updateTabMessages(requestTabId, (msgs) => [
-          ...msgs,
-          {
-            role: "llm",
-            text: `[Rust Engine Error]\n\n${String((err as any)?.message || err || "unknown error")}`,
-            time: Math.floor(Date.now() / 1000),
-          },
-        ]);
-        setRustEngineStatus(`Rust engine error: ${String((err as any)?.message || err || "unknown error")}`);
-        setIsGenerating(false);
-      }
+      await sendRustTurn(requestTabId, inputText, images, tabProjectMap[requestTabId] ?? null);
       return;
     }
 
@@ -7746,6 +8737,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   function handleStop(e: React.FormEvent) {
     e.preventDefault();
+    if (useRustEngine && activeRustRequestRef.current !== null) {
+      setRustEngineStatus("Stopping agent; saving progress...");
+      void invoke("cancel_agent_turn", { tabId: activeRustRequestRef.current });
+      return;
+    }
     // mark stopped so in-flight async work can bail early
     stoppedRef.current = true;
     if (abortController.current) {
@@ -7771,8 +8767,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   async function handleNewTab() {
     if (menuLocked) return;
-    const chatTabs = tabs.filter(tab => tab.type === "chat");
-    if (chatTabs.length >= 8) return;
+    if (!canAddChatTab) return;
 
     const utilityIdx = tabs.findIndex(tab => tab.type !== "chat");
     const newId = tabs.length ? Math.max(...tabs.map(t => t.id)) + 1 : 1;
@@ -7804,7 +8799,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     } catch {}
   }
 
-  const [settingsTab, setSettingsTab] = useState<"General" | "Projects" | "Repos" | "Bridges" | "LLMs" | "Network" | "Controller">("General");
+  const [settingsTab, setSettingsTab] = useState<"General" | "Projects" | "Repos" | "Bridges" | "LLMs" | "Network" | "Server">("General");
 
   function handleSettings() {
     if (menuLocked) return;
@@ -8455,14 +9450,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         return;
       }
 
-      const take = queued.length > 160 ? 18 : queued.length > 64 ? 9 : 4;
-      const chunk = queued.slice(0, take);
-      rustDeltaQueueByTabRef.current[tabId] = queued.slice(take);
-      appendRustDelta(tabId, chunk);
+      rustDeltaQueueByTabRef.current[tabId] = "";
+      appendRustDelta(tabId, queued);
       if (!rustDeltaQueueByTabRef.current[tabId]) {
         maybeFinalizeRustStream(tabId);
       }
-    }, 12);
+    }, 16);
   }
 
   function queueRustDelta(tabId: number, delta: string) {
@@ -8808,6 +9801,29 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     return note;
   }
 
+  async function refreshBridgeCapabilities(refresh = true) {
+    if (currentTab?.type !== "chat") return;
+    if (!activeProjectId) return;
+    setBridgeCapabilityBusy(true);
+    try {
+      const snapshot = await invoke("inspect_project_bridge_capabilities", {
+        tabId: activeTab,
+        refresh,
+      }) as BridgeCapabilitySnapshot;
+      setBridgeCapabilitySnapshot(snapshot);
+      const map: Record<string, BridgeCapability> = {};
+      for (const cap of snapshot.bridgeCapabilities || []) {
+        if (cap?.mcpId) map[cap.mcpId] = cap;
+      }
+      setBridgeCapabilityByMcpId(map);
+    } catch (err) {
+      const msg = String((err as any)?.message || err || "capability check failed");
+      console.warn("bridge capability refresh failed", msg);
+    } finally {
+      setBridgeCapabilityBusy(false);
+    }
+  }
+
   async function probeMcpReadiness(mcp: McpConnection): Promise<{ connected: boolean; toolCount: number; message: string }> {
     const parsed = parseMcpTarget(mcp.target);
     const connectionType = parsed.type;
@@ -8872,6 +9888,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           ...prev,
           [mcp.id]: { state: "connected", message: readiness.message, toolCount: readiness.toolCount },
         }));
+        void refreshBridgeCapabilities(true);
         void refreshProjectsForBridgeOpen(mcp.id, "mcp_bridge_opened");
       } else {
         setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "error", message: readiness.message } }));
@@ -8998,9 +10015,16 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
   async function persistTabProjectAssociation(tabId: number, projectId: string | null) {
     setTabProjectMap((prev) => ({ ...prev, [tabId]: projectId }));
-    // Intentionally avoid immediate disk write here.
-    // Project association is persisted during normal tab snapshot saves,
-    // which avoids lock contention from read-then-write cycles.
+    // Keep snapshot linkage in sync immediately so Rust-side project resolution
+    // (bridge routing/capability checks) does not lag behind UI state.
+    try {
+      await persistTabSnapshotState(tabId, {
+        associatedProjectId: projectId,
+        last_updated: Math.floor(Date.now() / 1000),
+      });
+    } catch {
+      // Best-effort sync; normal snapshot saves will still persist linkage.
+    }
   }
 
   function getCurrentTabTurn(tabId: number): number {
@@ -9492,7 +10516,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         )}
       <div
         className={`chat-root${isLightMode ? " light-theme" : ""}`}
+        data-theme={themePreset}
         style={{
+          ...palette,
           ["--app-bg" as any]: appBgColor,
           ["--app-surface" as any]: appSurfaceColor,
           ["--app-user-bubble" as any]: appUserBubbleColor,
@@ -9505,6 +10531,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         }}
       >
       <div className="taskbar" ref={taskbarRef}>
+        <div className="workspace-brand"><img src={irisMark} alt="" /><span>{assistantLabel}</span></div>
         <div className="menu">
           <button
             className={`menu-btn${menuLocked ? " disabled" : ""}`}
@@ -9542,8 +10569,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             >
               <div className="dropdown-item" onClick={handleSettings}>Settings</div>
               <div className="dropdown-item" onClick={handleToolsCenter}>Tools Center</div>
+              <div className="dropdown-item" onClick={() => { handleAgentStats(); setOpenMenu(null); }}>Agent Stats</div>
 
-              <div
+              {ENABLE_DEVELOPER_TOOLS && <div
                 className="dropdown-item"
                 onMouseEnter={() => setOpenSubmenu("development")}
                 onMouseLeave={() => setOpenSubmenu(null)}
@@ -9588,7 +10616,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     </div>
                   </div>
                 )}
-              </div>
+              </div>}
 
               <div
                 className="dropdown-item"
@@ -9693,6 +10721,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             )}
           </div>
         ))}
+        {canAddChatTab && (
+          <button
+            type="button"
+            className="icon-button tab-add-button"
+            title="New chat tab"
+            aria-label="New chat tab"
+            disabled={menuLocked}
+            onClick={() => void handleNewTab()}
+          >
+            <Plus size={18} />
+          </button>
+        )}
         {currentTab?.type === "chat" && (
           <div style={{ marginLeft: "auto", paddingRight: 12, display: "flex", alignItems: "center", gap: 8, position: "relative" }}>
             {showChatBridgeControls && (
@@ -9706,6 +10746,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </button>
                 {chatBridgePanelOpen && (
                   <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, minWidth: 320, maxWidth: 460, maxHeight: 420, overflowY: "auto", border: "1px solid var(--app-border)", borderRadius: 8, padding: 8, background: "var(--app-panel-bg)", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 6px 18px rgba(0,0,0,0.35)", zIndex: 280 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4 }}>
+                      <button
+                        className="setup-btn"
+                        onClick={() => { void refreshBridgeCapabilities(true); }}
+                        disabled={bridgeCapabilityBusy}
+                      >
+                        {bridgeCapabilityBusy ? "Analyzing..." : "Capabilities"}
+                      </button>
+                      <div style={{ fontSize: 11, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
+                        {bridgeCapabilitySnapshot?.projectName
+                          ? `${bridgeCapabilitySnapshot.projectName} · ${bridgeCapabilitySnapshot.bridgeCapabilities?.length || 0} bridge entries`
+                          : "Capability view not loaded"}
+                      </div>
+                    </div>
+
                     {launchableProjectMcps.length > 1 && (
                       <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
                         <button
@@ -9755,6 +10810,44 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                               {mcpHealthStatus[mcp.id]?.message}
                             </div>
                           )}
+                          {!!bridgeCapabilityByMcpId[mcp.id] && (() => {
+                            const cap = bridgeCapabilityByMcpId[mcp.id];
+                            const tagText = cap.tags?.length ? cap.tags.join(", ") : "(none)";
+                            const expanded = !!bridgeTagExpandedByMcpId[mcp.id];
+                            const needsClamp = tagText.length > 70;
+                            return (
+                              <div style={{ marginTop: 2, color: isLightMode ? "#36506a" : "#93a8bf", display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ opacity: 0.86 }}>tags:</span>
+                                <span
+                                  style={{
+                                    flex: 1,
+                                    whiteSpace: expanded ? "normal" : "nowrap",
+                                    overflow: "hidden",
+                                    textOverflow: expanded ? "clip" : "ellipsis",
+                                  }}
+                                  title={tagText}
+                                >
+                                  {tagText}
+                                </span>
+                                {needsClamp && (
+                                  <button
+                                    type="button"
+                                    className="setup-btn"
+                                    style={{ padding: "1px 6px", fontSize: 10 }}
+                                    onClick={() => setBridgeTagExpandedByMcpId((prev) => ({ ...prev, [mcp.id]: !expanded }))}
+                                  >
+                                    {expanded ? "less" : "more"}
+                                  </button>
+                                )}
+                                {cap.toolCount > 0 && <span style={{ opacity: 0.86 }}>| tools: {cap.toolCount}</span>}
+                              </div>
+                            );
+                          })()}
+                          {!!bridgeCapabilityByMcpId[mcp.id]?.errors?.length && (
+                            <div style={{ marginTop: 2, color: isLightMode ? "#8b2b2b" : "#ff9f9f", whiteSpace: "normal" }}>
+                              {bridgeCapabilityByMcpId[mcp.id].errors.join(" | ")}
+                            </div>
+                          )}
                         </div>
                         <div style={{ display: "flex", gap: 6 }}>
                           <button className="setup-btn" onClick={() => toggleMcpServer(mcp)}>
@@ -9775,6 +10868,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                                   },
                                 }));
                                 if (readiness.connected) {
+                                  void refreshBridgeCapabilities(true);
                                   void refreshProjectsForBridgeOpen(mcp.id, "mcp_bridge_reopened");
                                 }
                               } catch (err: any) {
@@ -9843,7 +10937,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         </h2>
         {currentTab?.type === "settings" && (
           <div className="settings-subtab-bar">
-            {["General", "Projects", "Repos", "Bridges", "LLMs", "Network", "Controller"].map(subtab => {
+            {["General", "Projects", "Repos", "Bridges", "LLMs", "Network", "Server"].map(subtab => {
               return (
                 <button
                   key={subtab}
@@ -10073,7 +11167,50 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
       {currentTab?.type === "chat" && (
         <div className={`chat-workspace${autonomousPanelEnabled ? " with-autonomous" : ""}`}>
-          <div className="chat-history" ref={historyRef}>
+          <div className="chat-log-pane">
+          <div
+            className="chat-history"
+            ref={historyRef}
+            tabIndex={0}
+            role="region"
+            aria-label="Chat transcript"
+            onPointerDown={(event) => {
+              transcriptSelectedRef.current = false;
+              if (!(event.target as HTMLElement).closest("input, textarea, button, a, [contenteditable=true]")) event.currentTarget.focus({ preventScroll: true });
+            }}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+              if (remaining <= 4) followChatRef.current = true;
+              else if (element.scrollTop < lastChatScrollTopRef.current - 1) followChatRef.current = false;
+              lastChatScrollTopRef.current = element.scrollTop;
+              setShowJumpToLatest(remaining > 160);
+            }}
+            onKeyDown={(event) => {
+              if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "a" || event.altKey) return;
+              if ((event.target as HTMLElement).closest("input, textarea, [contenteditable=true]")) return;
+              event.preventDefault();
+              event.stopPropagation();
+              const selection = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(event.currentTarget);
+              selection?.removeAllRanges();
+              selection?.addRange(range);
+              transcriptSelectedRef.current = true;
+              followChatRef.current = false;
+            }}
+            onCopy={(event) => {
+              if (!transcriptSelectedRef.current || (event.target as HTMLElement).closest("input, textarea")) return;
+              event.preventDefault();
+              const transcript = chatMessages.map((message) => [
+                message.role === "user" ? "You:" : `${assistantLabel}:`,
+                formatMessageTimestamp(message.time), message.text,
+                ...(message.images || []).map((_, index) => `[Attachment ${index + 1}]`),
+              ].filter(Boolean).join("\n")).join("\n\n");
+              event.clipboardData.setData("text/plain", transcript);
+            }}
+          >
+            <div className="chat-transcript-content" ref={transcriptContentRef}>
             {chatMessages.map((msg, idx) => {
             const key = `${activeTab}_${idx}`;
             const isHovered = hoveredMessageKey === key;
@@ -10101,29 +11238,35 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     <button
                       type="button"
                       className="bubble-copy-btn"
+                      title="Copy message"
+                      aria-label="Copy message"
                       onClick={() => void copyChatMessageText(msg.text)}
                     >
-                      Copy
+                      <Copy size={13} />
                     </button>
                     {msg.role === "llm" && (
                       <button
                         type="button"
                         className="bubble-copy-btn"
+                        title="View activity log"
+                        aria-label="View activity log"
                         onClick={() => openMessageThinkingLog(msg as Message, idx)}
                       >
-                        Log
+                        <ClipboardList size={13} />
                       </button>
                     )}
                     {isLastUserMessage && !isEditingThis && (
                       <button
                         type="button"
                         className="bubble-edit-btn"
+                        title="Edit message"
+                        aria-label="Edit message"
                         onClick={() => {
                           setEditingLastUserMsgIdx(idx);
                           setEditingLastUserMsgDraft(msg.text || "");
                         }}
                       >
-                        Edit
+                        <Pencil size={13} />
                       </button>
                     )}
                   </div>
@@ -10161,7 +11304,12 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       </div>
                     </div>
                   ) : (
-                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                    <ReactMarkdown components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer" onClick={(event) => {
+                      if (!href || !/^https?:\/\//i.test(href)) return;
+                      event.preventDefault();
+                      if ((window as any).__TAURI__) void openUrl(href).catch((error) => showRuntimeToast(`Could not open source: ${String(error)}`));
+                      else window.open(href, "_blank", "noopener,noreferrer");
+                    }}>{children}</a> }}>{msg.text}</ReactMarkdown>
                   )}
 
                   {Array.isArray((msg as any).images) && (msg as any).images.length > 0 && (
@@ -10177,6 +11325,15 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               );
             })}
             <div ref={chatEndRef} />
+            </div>
+          </div>
+          {showJumpToLatest && (
+            <button type="button" className="chat-jump-latest" title="Jump to latest message" aria-label="Jump to latest message" onClick={() => {
+              followChatRef.current = true;
+              transcriptSelectedRef.current = false;
+              historyRef.current?.scrollTo({ top: historyRef.current.scrollHeight, behavior: "auto" });
+            }}><ArrowDown size={18} /></button>
+          )}
           </div>
 
           {autonomousPanelEnabled && (
@@ -10185,109 +11342,255 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <>
                   <div className="autonomous-panel-header">
                     <div>
-                      <strong>Autonomous Tasks</strong>
-                      <div className="autonomous-panel-subtitle">Plan goal- or time-driven self-wake tasks.</div>
+                      <strong>Auto Tasks</strong>
+                      <div className="autonomous-panel-subtitle">{autonomousTasks.filter((task) => autonomousRuntimeById[task.id]?.status === "waiting").length} scheduled · {autonomousTasks.filter((task) => autonomousRuntimeById[task.id]?.status === "running").length} running</div>
                     </div>
                     <button
                       type="button"
-                      className="setup-btn"
+                      className="icon-button"
+                      title="Hide Auto Tasks"
+                      aria-label="Hide Auto Tasks"
                       onClick={() => setAutonomousPanelCollapsed(true)}
                     >
-                      Hide
+                      <PanelRightClose size={16} />
                     </button>
                   </div>
 
                   <div className="autonomous-panel-list">
                     {autonomousTasks.map((task, idx) => (
                       <div key={task.id} className="autonomous-task-card">
-                        <div className="autonomous-task-top">
-                          <span>Task {idx + 1}</span>
-                          <button
-                            type="button"
-                            className="autonomous-task-delete"
-                            onClick={() => setAutonomousDeleteConfirmId(task.id)}
-                            title="Delete task"
-                          >
-                            ×
-                          </button>
-                        </div>
+                        {(() => {
+                          const runtime = autonomousRuntimeById[task.id] || createIdleAutonomousRuntime();
+                          const nextRunText = runtime.scheduleKind === "datetime" && runtime.nextRunAt > 0
+                            ? new Date(runtime.nextRunAt).toLocaleString()
+                            : "";
+                          const countdownText = runtime.scheduleKind === "countdown"
+                            ? formatAutonomousRemaining(runtime.remainingMs)
+                            : "";
+                          const resource = resolveTaskResourceSnapshot(task.projectId);
+                          const title = (task.title || "").trim() || `Task ${idx + 1}`;
+                          const summaryLines = [
+                            `${runtime.status === "idle" && runtime.completionModeLastStatus === "complete" ? "Complete" : runtime.status}${runtime.status === "waiting" && countdownText ? ` · next in ${countdownText}` : ""}${runtime.status === "waiting" && !countdownText && nextRunText ? ` · ${nextRunText}` : ""}`,
+                            `${task.runToCompletion ? "Ongoing" : "Scheduled"} · ${runtime.runCount} cycles${runtime.lastRunAt ? ` · last ${new Date(runtime.lastRunAt).toLocaleTimeString()}` : ""}`,
+                          ];
 
-                        <textarea
-                          className="autonomous-task-prompt"
-                          value={task.prompt}
-                          rows={5}
-                          onChange={(e) => updateAutonomousTask(task.id, { prompt: e.target.value })}
-                          onInput={(e) => resizeAutonomousPrompt(e.currentTarget)}
-                          placeholder="Primary prompt for this automated task..."
-                        />
+                          return (
+                            <>
+                              <div className="autonomous-task-top">
+                                <button
+                                  type="button"
+                                  className="icon-button autonomous-task-collapse"
+                                  onClick={() => updateAutonomousTask(task.id, { collapsed: !task.collapsed })}
+                                  title={task.collapsed ? "Expand task" : "Collapse task"}
+                                  aria-label={task.collapsed ? "Expand task" : "Collapse task"}
+                                  aria-expanded={!task.collapsed}
+                                >
+                                  {task.collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                                </button>
+                                {autonomousTitleEditingId === task.id ? (
+                                  <input
+                                    className="autonomous-task-title-input"
+                                    value={task.title}
+                                    onChange={(e) => updateAutonomousTask(task.id, { title: e.target.value })}
+                                    onBlur={() => setAutonomousTitleEditingId(null)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        e.preventDefault();
+                                        setAutonomousTitleEditingId(null);
+                                      }
+                                    }}
+                                    autoFocus
+                                  />
+                                ) : (
+                                  <span className="autonomous-task-title" onDoubleClick={() => setAutonomousTitleEditingId(task.id)}>{title}</span>
+                                )}
+                                <div className="autonomous-task-top-actions">
+                                  <button
+                                    type="button"
+                                    className="icon-button"
+                                    title={runtime.status === "running" || runtime.status === "waiting" ? "Pause task" : "Start task"}
+                                    aria-label={runtime.status === "running" || runtime.status === "waiting" ? "Pause task" : "Start task"}
+                                    disabled={!task.prompt.trim() || ((runtime.status !== "running" && runtime.status !== "waiting") && isGenerating)}
+                                    onClick={() => {
+                                      if (runtime.status === "running" || runtime.status === "waiting" || runtime.status === "paused") void toggleAutonomousPause(task.id);
+                                      else void runAutonomousTask(task, "manual");
+                                    }}
+                                  >
+                                    {runtime.status === "running" || runtime.status === "waiting" ? <Pause size={14} /> : <Play size={14} />}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="icon-button"
+                                    onClick={() => setAutonomousThoughtsTaskId(task.id)}
+                                    title="View task activity"
+                                    aria-label="View task activity"
+                                  >
+                                    <Activity size={14} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="icon-button"
+                                    onClick={() => {
+                                      if (!(task.cognitiveDoc || "").trim()) {
+                                        updateAutonomousTask(task.id, { cognitiveDoc: autonomousCognitiveDocTemplate(task.runToCompletion) });
+                                      }
+                                      setAutonomousCognitiveTaskId(task.id);
+                                    }}
+                                    title="Task notes"
+                                    aria-label="Task notes"
+                                  >
+                                    <BookOpen size={14} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="icon-button autonomous-task-delete"
+                                    disabled={autonomousRunningTaskRef.current === task.id}
+                                    onClick={() => setAutonomousDeleteConfirmId(task.id)}
+                                    title="Delete task"
+                                    aria-label="Delete task"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              </div>
 
-                        <div className="autonomous-task-row">
-                          <label>Project</label>
-                          <select
-                            value={task.projectId || ""}
-                            onChange={(e) => updateAutonomousTask(task.id, { projectId: e.target.value || null })}
-                          >
-                            <option value="">No Project</option>
-                            {repoStore.projects.filter((p) => p.enabled).map((p) => (
-                              <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                          </select>
-                        </div>
+                              <div className={`autonomous-task-progress state-${runtime.status}`}>
+                                {summaryLines.map((line, lineIdx) => (
+                                  <div key={`${task.id}_summary_${lineIdx}`}>{line}</div>
+                                ))}
+                              </div>
 
-                        <div className="autonomous-task-row split">
-                          <button
-                            type="button"
-                            className={`setup-btn${task.networkAllowed ? " primary" : ""}`}
-                            onClick={() => updateAutonomousTask(task.id, { networkAllowed: !task.networkAllowed })}
-                          >
-                            Network: {task.networkAllowed ? "Allowed" : "Blocked"}
-                          </button>
-                          <div className="autonomous-task-time-wrap">
-                            <input
-                              type="number"
-                              min="0"
-                              step="1"
-                              value={task.intervalValue}
-                              onChange={(e) => updateAutonomousTask(task.id, { intervalValue: e.target.value })}
-                              placeholder="Time"
-                            />
-                            <select
-                              value={task.intervalUnit}
-                              onChange={(e) => updateAutonomousTask(task.id, { intervalUnit: e.target.value as AutonomousTaskIntervalUnit })}
-                            >
-                              <option value="seconds">Seconds</option>
-                              <option value="minutes">Minutes</option>
-                              <option value="hours">Hours</option>
-                              <option value="days">Days</option>
-                              <option value="custom">Custom</option>
-                            </select>
-                          </div>
-                        </div>
+                              <div className="autonomous-resource-badges">
+                                {task.projectId && <span>{resource.projectName}</span>}
+                                {resource.mcpCount > 0 && <span>{resource.mcpCount} MCP</span>}
+                                {resource.sshCount > 0 && <span>{resource.sshCount} SSH</span>}
+                                {resource.repoCount > 0 && <span>{resource.repoCount} repos</span>}
+                                {runtime.linkedTabId > 0 && <button type="button" className="task-chat-link" onClick={() => {
+                                  if (tabs.some((tab) => tab.id === runtime.linkedTabId)) setActiveTab(runtime.linkedTabId);
+                                }}>Open chat</button>}
+                              </div>
 
-                        {task.intervalUnit === "custom" && (
-                          <input
-                            className="autonomous-task-custom"
-                            value={task.customSchedulePrompt}
-                            onChange={(e) => updateAutonomousTask(task.id, { customSchedulePrompt: e.target.value })}
-                            placeholder="Custom schedule prompt (for example: every Tuesday at 9 AM)"
-                          />
-                        )}
+                              {!task.collapsed && (
+                                <>
+                                  <div className="task-mode-selector" role="group" aria-label="Task mode">
+                                    <button type="button" aria-pressed={!task.runToCompletion} disabled={runtime.status === "running"} onClick={() => { if (task.runToCompletion) toggleAutonomousRunMode(task); }}>Scheduled</button>
+                                    <button type="button" aria-pressed={task.runToCompletion} disabled={runtime.status === "running"} onClick={() => { if (!task.runToCompletion) toggleAutonomousRunMode(task); }}>Ongoing</button>
+                                  </div>
+                                  <textarea
+                                    className="autonomous-task-prompt"
+                                    aria-label="Task objective"
+                                    disabled={runtime.status === "running"}
+                                    value={task.prompt}
+                                    rows={5}
+                                    onChange={(e) => updateAutonomousTask(task.id, { prompt: e.target.value })}
+                                    onInput={(e) => resizeAutonomousPrompt(e.currentTarget)}
+                                    placeholder="Task objective"
+                                  />
 
-                        {autonomousDeleteConfirmId === task.id && (
-                          <div className="autonomous-delete-confirm">
-                            <span>Delete this task?</span>
-                            <div>
-                              <button type="button" className="setup-btn" onClick={() => setAutonomousDeleteConfirmId(null)}>Cancel</button>
-                              <button type="button" className="setup-btn primary" onClick={() => confirmDeleteAutonomousTask(task.id)}>Delete</button>
-                            </div>
-                          </div>
-                        )}
+                                  {task.runToCompletion && <textarea
+                                    className="autonomous-task-criteria" aria-label="Completion criteria" placeholder="Completion criteria"
+                                    rows={3} value={task.acceptanceCriteria} disabled={runtime.status === "running"}
+                                    onChange={(event) => updateAutonomousTask(task.id, { acceptanceCriteria: event.target.value })}
+                                  />}
+
+                                  <div className="autonomous-task-row">
+                                    <label>Project</label>
+                                    <select
+                                      aria-label="Task project"
+                                      disabled={runtime.status === "running"}
+                                      value={task.projectId || ""}
+                                      onChange={(e) => updateAutonomousTask(task.id, { projectId: e.target.value || null })}
+                                    >
+                                      <option value="">No Project</option>
+                                      {repoStore.projects.filter((p) => p.enabled).map((p) => (
+                                        <option key={p.id} value={p.id}>{p.name}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+
+                                  <div className="autonomous-task-row split">
+                                    <label className="task-network-toggle"><input type="checkbox" checked={task.networkAllowed} disabled={runtime.status === "running"} onChange={(event) => updateAutonomousTask(task.id, { networkAllowed: event.target.checked })} /> Network access</label>
+                                    {!task.runToCompletion && <div className="autonomous-task-time-wrap">
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        step="1"
+                                        aria-label="Task interval"
+                                        disabled={runtime.status === "running" || task.intervalUnit === "custom"}
+                                        value={task.intervalValue}
+                                        onChange={(e) => updateAutonomousTask(task.id, { intervalValue: e.target.value })}
+                                        placeholder="Time"
+                                      />
+                                      <select
+                                        aria-label="Interval unit"
+                                        disabled={runtime.status === "running"}
+                                        value={task.intervalUnit}
+                                        onChange={(e) => updateAutonomousTask(task.id, { intervalUnit: e.target.value as AutonomousTaskIntervalUnit })}
+                                      >
+                                        <option value="seconds">Seconds</option>
+                                        <option value="minutes">Minutes</option>
+                                        <option value="hours">Hours</option>
+                                        <option value="days">Days</option>
+                                        <option value="custom">Custom</option>
+                                      </select>
+                                    </div>}
+                                  </div>
+
+                                  {!task.runToCompletion && task.intervalUnit === "custom" && (
+                                    <input
+                                      className="autonomous-task-custom"
+                                      aria-label="Custom schedule"
+                                      value={task.customSchedulePrompt}
+                                      onChange={(e) => updateAutonomousTask(task.id, { customSchedulePrompt: e.target.value })}
+                                      placeholder="Every 2 hours or 2026-11-01T09:00"
+                                    />
+                                  )}
+
+                                  <div className="autonomous-task-controls">
+                                    <button
+                                      type="button"
+                                      className="setup-btn primary"
+                                      onClick={() => { void runAutonomousTask(task, "manual"); }}
+                                      disabled={!!autonomousRunningTaskRef.current || isGenerating || runtime.status === "running" || !task.prompt.trim() || (task.runToCompletion && !task.acceptanceCriteria.trim())}
+                                    >
+                                      <Play size={14} /> {task.runToCompletion ? "Start work" : "Run now"}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className={`setup-btn${runtime.status === "paused" ? " primary" : ""}`}
+                                      onClick={() => { void toggleAutonomousPause(task.id); }}
+                                      disabled={runtime.status === "idle" && runtime.scheduleKind === "none"}
+                                    >
+                                      {runtime.status === "paused" || runtime.status === "error" ? <Play size={14} /> : <Pause size={14} />} {runtime.status === "paused" || runtime.status === "error" ? "Resume" : "Pause"}
+                                    </button>
+                                  </div>
+
+                                  {runtime?.lastError && (
+                                    <div style={{ marginTop: 6, fontSize: 11, color: "#d97e7e" }}>
+                                      {runtime.lastError}
+                                    </div>
+                                  )}
+                                </>
+                              )}
+
+                              {autonomousDeleteConfirmId === task.id && (
+                                <div className="autonomous-delete-confirm">
+                                  <span>Delete this task?</span>
+                                  <div>
+                                    <button type="button" className="setup-btn" onClick={() => setAutonomousDeleteConfirmId(null)}>Cancel</button>
+                                    <button type="button" className="setup-btn primary" onClick={() => confirmDeleteAutonomousTask(task.id)}>Delete</button>
+                                  </div>
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                     ))}
                   </div>
 
                   <button type="button" className="setup-btn primary autonomous-add-btn" onClick={addAutonomousTask}>
-                    + Add Task
+                    <Plus size={15} /> Add task
                   </button>
                 </>
               )}
@@ -10300,10 +11603,103 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               className="autonomous-reveal-handle"
               onClick={() => setAutonomousPanelCollapsed(false)}
               title="Show autonomous tasks panel"
+              aria-label="Show Auto Tasks"
             >
-              ◀
+              <PanelRightOpen size={16} />
             </button>
           )}
+
+          {autonomousThoughtsTaskId && (() => {
+            const task = autonomousTasks.find((t) => t.id === autonomousThoughtsTaskId);
+            if (!task) return null;
+            const runtime = autonomousRuntimeById[task.id] || createIdleAutonomousRuntime();
+            const telemetryRows = (runtime.telemetry || []).slice().reverse();
+            return (
+              <div className="autonomous-overlay" onClick={() => setAutonomousThoughtsTaskId(null)}>
+                <div className="autonomous-modal" onClick={(e) => e.stopPropagation()}>
+                  <div className="autonomous-modal-top">
+                    <strong>{task.title || "Task"} activity</strong>
+                    <button type="button" className="setup-btn" onClick={() => setAutonomousThoughtsTaskId(null)}>Close</button>
+                  </div>
+                  <div style={{ marginBottom: 10, fontSize: 12, opacity: 0.9 }}>
+                    Completion mode status: {runtime.completionModeLastStatus} | passes: {runtime.completionPasses} | blockers: {runtime.blockerCount}
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <strong style={{ fontSize: 12 }}>Run telemetry</strong>
+                    <div className="autonomous-telemetry-table">
+                      <div className="autonomous-telemetry-row autonomous-telemetry-head">
+                        <span>time</span>
+                        <span>status</span>
+                        <span>latency</span>
+                        <span>resources</span>
+                        <span>actions</span>
+                      </div>
+                      {telemetryRows.length ? telemetryRows.map((entry, idx) => (
+                        <div key={`${entry.ts}_${idx}`} className="autonomous-telemetry-row">
+                          <span>{entry.ts ? new Date(entry.ts * 1000).toLocaleTimeString() : "(n/a)"}</span>
+                          <span>{entry.status} {entry.reason ? `| ${entry.reason}` : ""}</span>
+                          <span>{Math.round(entry.latencyMs / 1000)}s</span>
+                          <span>{entry.projectName} | MCP {entry.mcpCount} | SSH {entry.sshCount}</span>
+                          <span>{entry.actionCount} actions | {entry.workLogCount} logs | {entry.assistantChars} chars</span>
+                        </div>
+                      )) : (
+                        <div className="autonomous-telemetry-row">
+                          <span>No run telemetry captured yet.</span>
+                          <span />
+                          <span />
+                          <span />
+                          <span />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <strong style={{ fontSize: 12 }}>Event history</strong>
+                  <div className="autonomous-modal-body">
+                    {(runtime.history || []).length
+                      ? runtime.history.join("\n")
+                      : "No activity yet."}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {autonomousCognitiveTaskId && (() => {
+            const task = autonomousTasks.find((t) => t.id === autonomousCognitiveTaskId);
+            if (!task) return null;
+            return (
+              <div className="autonomous-overlay" onClick={() => setAutonomousCognitiveTaskId(null)}>
+                <div className="autonomous-modal" onClick={(e) => e.stopPropagation()}>
+                  <div className="autonomous-modal-top">
+                    <strong>{task.title || "Task"} cognitive doc</strong>
+                    <button type="button" className="setup-btn" onClick={() => setAutonomousCognitiveTaskId(null)}>Close</button>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                    <button
+                      type="button"
+                      className="setup-btn"
+                      onClick={() => updateAutonomousTask(task.id, { cognitiveDoc: autonomousCognitiveDocTemplate(task.runToCompletion) })}
+                    >
+                      Load Skeleton
+                    </button>
+                    <button
+                      type="button"
+                      className="setup-btn"
+                      onClick={() => updateAutonomousTask(task.id, { cognitiveDoc: "" })}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <textarea
+                    className="autonomous-modal-editor"
+                    value={task.cognitiveDoc}
+                    onChange={(e) => updateAutonomousTask(task.id, { cognitiveDoc: e.target.value })}
+                    placeholder="Task-specific cognitive doc / plan scaffold"
+                  />
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
       {!hasChatTabs && currentTab?.type !== "settings" && (
@@ -10322,10 +11718,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <h3>General</h3>
               <p>Customize appearance and persona wiring for this app instance.</p>
 
-              <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
-                <label style={{ display: "block", marginBottom: 8, color: "var(--app-text)", fontWeight: 700 }}>
-                  First-Run Readiness Checklist
-                </label>
+              {!readinessChecklistHidden ? <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+                  <strong style={{ color: "var(--app-text)" }}>First-Run Readiness Checklist</strong>
+                  <button type="button" className="icon-button" title="Hide readiness checklist" aria-label="Hide readiness checklist" onClick={() => setReadinessChecklistVisible(false)}><X size={16} /></button>
+                </div>
                 <div style={{ marginBottom: 8, color: isLightMode ? "#425971" : "#b8c3d4", fontSize: 12 }}>
                   {setupChecklistDone}/{setupChecklist.length} complete ({setupChecklistPct}%)
                 </div>
@@ -10345,7 +11742,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     </div>
                   ))}
                 </div>
-              </div>
+              </div> : (
+                <button type="button" className="setup-btn" style={{ display: "inline-flex", alignItems: "center", gap: 8, marginBottom: 14 }} onClick={() => setReadinessChecklistVisible(true)}>
+                  <ListChecks size={16} /> Show readiness checklist
+                </button>
+              )}
 
               <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Assistant name</label>
@@ -10359,8 +11760,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </div>
 
               <div style={{ marginBottom: 14 }}>
-                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Theme color (background + borders)</label>
+                <label htmlFor="theme-preset" style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Theme</label>
                 <select
+                  id="theme-preset"
                   value={themePreset}
                   onChange={async (e) => {
                     const next = e.target.value as ThemePreset;
@@ -10396,7 +11798,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </div>
 
               <div style={{ marginBottom: 14 }}>
-                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Accent color mode</label>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Appearance</label>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button
                     className={`setup-btn${colorMode === "dark" ? " primary" : ""}`}
@@ -10417,12 +11819,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     Light
                   </button>
                 </div>
-                <p style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
-                  Controls tabs, inputs, panels, and surface elements. App background and borders only change with the theme color above.
-                </p>
               </div>
 
-              <div style={{ marginBottom: 14 }}>
+              {!useRustEngine && <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Response wait threshold (minutes)</label>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <input
@@ -10440,9 +11839,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <p style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
                   Iris will ask whether to continue waiting or cancel when any response exceeds this duration.
                 </p>
-              </div>
+              </div>}
 
-              <div style={{ marginBottom: 14 }}>
+              {!useRustEngine && <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Detailed response progress</label>
                 <button
                   className={`setup-btn${detailedProgressEnabled ? " primary" : ""}`}
@@ -10457,7 +11856,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <p style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
                   Show estimated % completed while Iris is generating a response. May slightly slow down inference.
                 </p>
-              </div>
+              </div>}
 
               <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)", fontWeight: 700 }}>Permissions</label>
@@ -10555,6 +11954,92 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </p>
               </div>
 
+              <div style={{ marginBottom: 14, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
+                  Cognitive Doc Transparency Editor
+                </div>
+                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
+                  <label>
+                    Goal ID (optional)
+                    <input
+                      className="model-input"
+                      value={cognitiveGoalDraft}
+                      onChange={(e) => setCognitiveGoalDraft(e.target.value)}
+                      placeholder={`Defaults to active goal for tab${activeTab}`}
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <label>
+                    Doc Type
+                    <input
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      placeholder="planning_logs"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <label>
+                    Context Slice Max Characters
+                    <input
+                      className="model-input"
+                      value={cognitiveDocMaxCharsDraft}
+                      onChange={(e) => setCognitiveDocMaxCharsDraft(e.target.value)}
+                      placeholder="6000"
+                      style={{ marginTop: 4 }}
+                    />
+                  </label>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button className="setup-btn" type="button" onClick={() => { void loadCognitiveDocSliceFromSettings(); }} disabled={cognitiveDocBusy}>Load Slice</button>
+                    <button className="setup-btn" type="button" onClick={() => { void refreshCognitiveDocMetadataFromSettings(); }} disabled={cognitiveDocBusy}>Refresh Metadata</button>
+                    <button className="setup-btn" type="button" onClick={() => { void resetRuntimeFromSettings(); }} disabled={runtimeControlBusy}>Reset Runtime Idle</button>
+                  </div>
+                  <label>
+                    Available Lanes For Goal
+                    <select
+                      className="model-input"
+                      value={cognitiveDocTypeDraft}
+                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
+                      style={{ marginTop: 4 }}
+                    >
+                      <option value={cognitiveDocTypeDraft}>{cognitiveDocTypeDraft || "planning_logs"}</option>
+                      {cognitiveDocNodes
+                        .filter((node) => !!node.docType)
+                        .map((node) => (
+                          <option key={`${node.docType}_${node.latestVersion}`} value={node.docType}>
+                            {node.docType} (latest v{node.latestVersion})
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 100, resize: "vertical" }}
+                    readOnly
+                    value={cognitiveDocSlice}
+                    placeholder="Loaded cognitive doc context slice appears here..."
+                  />
+                  <textarea
+                    className="chat-input"
+                    style={{ minHeight: 90, resize: "vertical" }}
+                    value={cognitiveDocAppendText}
+                    onChange={(e) => setCognitiveDocAppendText(e.target.value)}
+                    placeholder="Append a note to this goal/doc lane..."
+                  />
+                  <button
+                    className="setup-btn"
+                    type="button"
+                    onClick={() => { void appendCognitiveDocNoteFromSettings(); }}
+                    disabled={cognitiveDocBusy || !cognitiveDocAppendText.trim()}
+                  >
+                    Append Note
+                  </button>
+                  <div style={{ fontSize: 11, opacity: 0.9 }}>
+                    {cognitiveDocStatus || "Use Refresh Metadata to inspect lanes and versions for the active goal."}
+                  </div>
+                </div>
+              </div>
+
               <hr style={{ opacity: 0.2, margin: "12px 0" }} />
               <div style={{ marginBottom: 8, fontSize: 13, color: "var(--app-text)" }}>Core persona prompt</div>
               <textarea
@@ -10604,7 +12089,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <button
                     className={`setup-btn${reposContextActive ? " primary" : ""}`}
-                    disabled={lowPowerProfile}
                     onClick={async () => {
                       const next = !reposEnabled;
                       setReposEnabled(next);
@@ -10619,7 +12103,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
                 <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
                   Turning this off can significantly improve speed and reduce cognitive bandwidth usage, especially on lower-powered devices.
-                  {lowPowerProfile ? " Repos are automatically disabled on Low/Minimal profiles." : ""}
                 </div>
               </div>
               <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
@@ -11261,21 +12744,8 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 Configure external MCP and SSH endpoints Iris can use. Projects can opt into one or more bridge connections.
               </p>
               <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", background: isLightMode ? "rgba(86, 112, 138, 0.14)" : "#17202a", borderRadius: 8, padding: "9px 10px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                  <button
-                    className={`setup-btn${mcpContextActive ? " primary" : ""}`}
-                    disabled={lowPowerProfile}
-                    onClick={async () => {
-                      const next = !mcpEnabled;
-                      setMcpEnabled(next);
-                      await invoke("set_setup_flags", { args: { mcpEnabled: next } });
-                    }}
-                  >
-                    Bridge Context: {mcpContextActive ? "ON" : "OFF"}
-                  </button>
-                  <span style={{ fontSize: 12, color: isLightMode ? "#2f4359" : "#cfd9e8" }}>
-                    Toggle whether Iris should regard or disregard your configured MCP connections while planning/executing.
-                  </span>
+                <div style={{ fontSize: 12, color: isLightMode ? "#2f4359" : "#cfd9e8" }}>
+                  MCP context is now implicit: Iris enables bridge context when your active chat is linked to a project that has at least one enabled MCP connection.
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
                   <button
@@ -11293,8 +12763,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   </span>
                 </div>
                 <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
-                  MCP OFF reduces tool orchestration overhead; Desktop Tools OFF prevents any automatic window/screenshot routine.
-                  {lowPowerProfile ? " MCP is automatically disabled on Low/Minimal profiles." : ""}
+                  Active MCP context right now: {mcpContextActive ? "ON" : "OFF"}. Desktop Tools OFF prevents any automatic window/screenshot routine.
                 </div>
               </div>
               <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
@@ -11756,12 +13225,8 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       const hw = await invoke<HardwareProfile>("detect_hardware_profile");
                       const next = hw.detectedProfile as LlmProfile;
                       setLlmProfile(next);
-                      if (next === "Low" || next === "Minimal") {
-                        setReposEnabled(false);
-                        setMcpEnabled(false);
-                      }
                       await invoke("apply_model_profile", { profile: next });
-                      await invoke("set_setup_flags", { args: { modelProfile: next, ...(next === "Low" || next === "Minimal" ? { reposEnabled: false, mcpEnabled: false } : {}) } });
+                      await invoke("set_setup_flags", { args: { modelProfile: next } });
                       const msg = `Detected ${hw.gpuName}: Recommending ${next}. ${hw.detectionNote}`;
                       setHwToast(msg);
                       if (hwToastTimerRef.current) clearTimeout(hwToastTimerRef.current);
@@ -11791,19 +13256,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   onChange={async (e) => {
                     const next = e.target.value as LlmProfile;
                     setLlmProfile(next);
-                    if (next === "Low" || next === "Minimal") {
-                      setReposEnabled(false);
-                      setMcpEnabled(false);
-                    }
                     try {
                       await invoke("apply_model_profile", { profile: next });
-                      await invoke("set_setup_flags", { args: { modelProfile: next, ...(next === "Low" || next === "Minimal" ? { reposEnabled: false, mcpEnabled: false } : {}) } });
+                      await invoke("set_setup_flags", { args: { modelProfile: next } });
                     } catch (err: any) {
                       alert("Failed to apply profile defaults: " + (err?.message || err));
                     }
                   }}
                   style={{ minWidth: 240, padding: "8px 10px", borderRadius: 6, background: "var(--app-input-bg)", color: "var(--app-text)", border: "1px solid var(--app-border)" }}
                 >
+                  <option value="MacBalanced">Apple Silicon - 7B Q4 / 16 GB</option>
+                  <option value="MacLarge13B">Apple Silicon - 13B Q4 / 4K context</option>
+                  <option value="MacQuality14B">Apple Silicon - Qwen 14B Q4 / 4K context</option>
                   <option value="Ultra">Ultra — VRAM ≥ 16 GB</option>
                   <option value="High">High — VRAM ≥ 12 GB</option>
                   <option value="MediumHigh">Medium-High — 8 GB VRAM + 32 GB RAM (Developer Baseline)</option>
@@ -12270,65 +13734,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </div>
             </div>
           )}
-          {settingsTab === "Controller" && (
-            <div className="llm-settings-card">
-              <h3>Bi-directional AI Control</h3>
-              <p>
-                This controller defines how Iris receives instructions from you and how it routes focused objectives to each internal specialist model.
-                Use this as the bridge between human intent and model-level behavior.
-              </p>
-
-              <div style={{ marginBottom: 10, fontSize: 13, lineHeight: 1.55 }}>
-                <div style={{ color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, marginBottom: 4 }}>Outbound: You to Iris</div>
-                <div style={{ color: "#cfdcf1" }}>
-                  User prompts establish intent, constraints, and priority. Controller settings shape how that intent is interpreted,
-                  whether planner memory lanes are emphasized, and how much context load is allowed.
-                </div>
-              </div>
-
-              <div style={{ marginBottom: 10, fontSize: 13, lineHeight: 1.55 }}>
-                <div style={{ color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, marginBottom: 4 }}>Inbound: Iris to Internal Model Stack</div>
-                <div style={{ color: "#cfdcf1" }}>
-                  Iris routes tasks bi-directionally across Organizer, Coder, Summarizer, and Vision according to the selected profile,
-                  modelfile parameters, and available tool context (Repos, MCP, Network). This keeps each model focused while maintaining continuity.
-                </div>
-              </div>
-
-              <div style={{ marginBottom: 10, fontSize: 13, lineHeight: 1.55 }}>
-                <div style={{ color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, marginBottom: 4 }}>Inbound MCP: External AI to Iris</div>
-                <div style={{ color: "#cfdcf1" }}>
-                  Iris can expose her command surface through an MCP bridge so external agents (for example ChatGPT-connected tool clients)
-                  can trigger Iris actions like tab switching, memory retrieval, and project-context lookups.
-                  Keep this bridge constrained to trusted endpoints and only enable high-bandwidth routes when hardware profile allows.
-                </div>
-              </div>
-
-              <div style={{ marginBottom: 12, fontSize: 13, lineHeight: 1.55 }}>
-                <div style={{ color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, marginBottom: 4 }}>Task Directive Layer</div>
-                <div style={{ color: "#cfdcf1" }}>
-                  Use this section to verify the active reasoning route and memory signals. If behavior is too broad, reduce context load;
-                  if too narrow, increase token budget and keep planner lanes enabled.
-                </div>
-              </div>
-
-              <div style={{ marginBottom: 12 }}>
-                <button
-                  className="setup-btn"
-                  onClick={async () => {
-                    const next = !interpretV2Enabled;
-                    try {
-                      await invoke("set_setup_flags", { args: { interpretV2Enabled: next } });
-                      setInterpretV2Enabled(next);
-                    } catch (e) {
-                      console.warn("Failed to toggle interpret v2", e);
-                    }
-                  }}
-                >
-                  Interpret V2: {interpretV2Enabled ? "ON" : "OFF"}
-                </button>
-              </div>
-
-              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
+          {settingsTab === "Server" && (
+            <>
+              <ServerSettings />
+            <div className="llm-settings-card runtime-preferences">
+              <div className="server-section">
                 <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
                   Runtime Notifications + Mini-Player
                 </div>
@@ -12381,177 +13791,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
               </div>
 
-              <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)" }}>
-                <div style={{ marginBottom: 8, color: isLightMode ? "#26384d" : "#dbe9ff", fontWeight: 700, fontSize: 12 }}>
-                  Cognitive Doc Transparency Editor
-                </div>
-                <div style={{ display: "grid", gap: 8, fontSize: 12, color: isLightMode ? "#32485e" : "#cfdcf1" }}>
-                  <label>
-                    Goal ID (optional)
-                    <input
-                      className="model-input"
-                      value={cognitiveGoalDraft}
-                      onChange={(e) => setCognitiveGoalDraft(e.target.value)}
-                      placeholder={`Defaults to active goal for tab${activeTab}`}
-                      style={{ marginTop: 4 }}
-                    />
-                  </label>
-                  <label>
-                    Doc Type
-                    <input
-                      className="model-input"
-                      value={cognitiveDocTypeDraft}
-                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
-                      placeholder="planning_logs"
-                      style={{ marginTop: 4 }}
-                    />
-                  </label>
-                  <label>
-                    Context Slice Max Characters
-                    <input
-                      className="model-input"
-                      value={cognitiveDocMaxCharsDraft}
-                      onChange={(e) => setCognitiveDocMaxCharsDraft(e.target.value)}
-                      placeholder="6000"
-                      style={{ marginTop: 4 }}
-                    />
-                  </label>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => { void loadCognitiveDocSliceFromSettings(); }}
-                      disabled={cognitiveDocBusy}
-                    >
-                      Load Slice
-                    </button>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => { void refreshCognitiveDocMetadataFromSettings(); }}
-                      disabled={cognitiveDocBusy}
-                    >
-                      Refresh Metadata
-                    </button>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => {
-                        setCognitiveGoalDraft("");
-                        setCognitiveDocTypeDraft("planning_logs");
-                        setCognitiveDocMaxCharsDraft("6000");
-                        setCognitiveDocSlice("");
-                        setCognitiveDocAppendText("");
-                        setCognitiveDocVersions([]);
-                        setCognitiveDocNodes([]);
-                        setCognitiveDocSelectedVersion(null);
-                        setCognitiveDocVersionPreview("");
-                        setCognitiveDocStatus("");
-                      }}
-                      disabled={cognitiveDocBusy}
-                    >
-                      Reset Editor Fields
-                    </button>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => { void resetRuntimeFromSettings(); }}
-                      disabled={runtimeControlBusy}
-                    >
-                      Reset Runtime Idle
-                    </button>
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => { void clearCognitiveDocHistoryFromSettings("lane"); }}
-                      disabled={cognitiveDocBusy}
-                    >
-                      Clear Lane History
-                    </button>
-                    <button
-                      className="setup-btn"
-                      type="button"
-                      onClick={() => { void clearCognitiveDocHistoryFromSettings("goal"); }}
-                      disabled={cognitiveDocBusy}
-                    >
-                      Clear Goal History
-                    </button>
-                  </div>
-                  <label>
-                    Available Lanes For Goal
-                    <select
-                      className="model-input"
-                      value={cognitiveDocTypeDraft}
-                      onChange={(e) => setCognitiveDocTypeDraft(e.target.value)}
-                      style={{ marginTop: 4 }}
-                    >
-                      <option value={cognitiveDocTypeDraft}>{cognitiveDocTypeDraft || "planning_logs"}</option>
-                      {cognitiveDocNodes
-                        .filter((node) => !!node.docType)
-                        .map((node) => (
-                          <option key={`${node.docType}_${node.latestVersion}`} value={node.docType}>
-                            {node.docType} (latest v{node.latestVersion})
-                          </option>
-                        ))}
-                    </select>
-                  </label>
-                  <label>
-                    Versions ({cognitiveDocVersions.length})
-                    <select
-                      className="model-input"
-                      value={cognitiveDocSelectedVersion == null ? "" : String(cognitiveDocSelectedVersion)}
-                      onChange={(e) => handleCognitiveVersionSelection(Number(e.target.value))}
-                      style={{ marginTop: 4 }}
-                    >
-                      <option value="">Select version</option>
-                      {cognitiveDocVersions
-                        .slice()
-                        .reverse()
-                        .map((version) => (
-                          <option key={version.version} value={String(version.version)}>
-                            v{version.version} by {version.author || "unknown"} @ {version.ts ? new Date(version.ts * 1000).toLocaleString() : "(n/a)"}
-                          </option>
-                        ))}
-                    </select>
-                  </label>
-                  <textarea
-                    className="chat-input"
-                    style={{ minHeight: 100, resize: "vertical" }}
-                    readOnly
-                    value={cognitiveDocVersionPreview}
-                    placeholder="Selected version content appears here..."
-                  />
-                  <textarea
-                    className="chat-input"
-                    style={{ minHeight: 120, resize: "vertical" }}
-                    readOnly
-                    value={cognitiveDocSlice}
-                    placeholder="Loaded cognitive doc context slice appears here..."
-                  />
-                  <textarea
-                    className="chat-input"
-                    style={{ minHeight: 90, resize: "vertical" }}
-                    value={cognitiveDocAppendText}
-                    onChange={(e) => setCognitiveDocAppendText(e.target.value)}
-                    placeholder="Append a note to this goal/doc lane..."
-                  />
-                  <button
-                    className="setup-btn"
-                    type="button"
-                    onClick={() => { void appendCognitiveDocNoteFromSettings(); }}
-                    disabled={cognitiveDocBusy || !cognitiveDocAppendText.trim()}
-                  >
-                    Append Note
-                  </button>
-                  <div style={{ fontSize: 11, opacity: 0.9 }}>
-                    {cognitiveDocStatus || "Use Refresh Metadata to inspect lanes and versions for the active goal."}
-                  </div>
-                </div>
-              </div>
-
-              <details>
+              {ENABLE_DEVELOPER_TOOLS && <details>
                 <summary style={{ cursor: "pointer", color: "#b9cae7", marginBottom: 8 }}>Memory Debug Signals</summary>
                 <div style={{ fontSize: 13, lineHeight: 1.5, marginTop: 8 }}>
                   <div><strong>Planner path:</strong> {memoryDebug.plannerPath}</div>
@@ -12574,8 +13814,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <div style={{ marginTop: 8 }}><strong>Lane • Recall</strong></div>
                   <div style={{ opacity: 0.9 }}>{memoryDebug.laneRecall || "(empty)"}</div>
                 </div>
-              </details>
+              </details>}
             </div>
+            </>
           )}
         </div>
       )}
@@ -12725,6 +13966,16 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         <div className="settings-container">
           <div className="llm-settings-card">
             <h3>Agent Stats</h3>
+            <ResearchHistory />
+            <h4>Observed Tool Outcomes</h4>
+            <div className="skill-outcomes">
+              <div className="skill-outcome-row"><strong>Tool</strong><span>Success</span><span>Failed</span><span>Verified</span></div>
+              {Object.entries(observedProficiencies).map(([name, stats]) => (
+                <div className="skill-outcome-row" key={name}><span>{name}</span><span>{stats.successes}</span><span>{stats.failures}</span><span>{stats.verifiedCheckpoints}</span></div>
+              ))}
+              {!Object.keys(observedProficiencies).length && <p>No tool outcomes recorded yet.</p>}
+            </div>
+            <h4>Personal Proficiency Ratings</h4>
             <p>
               These proficiencies model {assistantLabel}'s perceived capability levels. Defaults ship per app release, then evolve from usage and feedback.
             </p>
@@ -12808,6 +14059,46 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
 
       {currentTab?.type === "chat" && (
         <>
+        {(() => {
+          const progress = agentProgressByTab[activeTab];
+          const running = isGenerating && respondingTab === activeTab;
+          const status = running ? activeInlinePermission ? "Awaiting approval" : "Working" : progress?.status === "completed" ? "Ready" : progress?.status || "Ready";
+          const elapsed = Math.max(0, Math.floor((runtimeNow - (agentStartedAtByTab[activeTab] || runtimeNow)) / 1000));
+          const task = autonomousTasks.find((item) => autonomousRuntimeById[item.id]?.linkedTabId === activeTab);
+          const activity = (workLogByTab[activeTab] || []).slice(-8);
+          return <div className="agent-status-area">
+          <div className="agent-progress-strip">
+            <Activity size={15} aria-hidden="true" />
+            <span className="agent-progress-status" role="status" aria-live="polite">{status}</span>
+            <span className="agent-progress-step" title={agentStatusByTab[activeTab]}>{running ? agentStatusByTab[activeTab] || "Preparing" : progress?.currentStep || progress?.model || "Local agent"}</span>
+            {running && <span className="agent-progress-count">{elapsed}s</span>}
+            {!!progress?.totalSteps && <span className="agent-progress-count">{progress.completedSteps || 0}/{progress.totalSteps} steps</span>}
+            {!!progress?.actions && <span className="agent-progress-count">{progress.actions} actions</span>}
+            <span className="agent-network-state">{networkEnabled && (!task || task.networkAllowed) ? "Network on" : "Offline"}</span>
+            {progress && <>
+            <button type="button" className="icon-button" title="Open saved task notes" aria-label="Open saved task notes" onClick={async () => {
+              try {
+                const saved = await invoke<{ goal: string; review: string; lastMessage: string; steps: { title: string; status: string; notes: string }[] } | null>("get_agent_task", { tabId: activeTab });
+                const notes = saved ? [saved.goal, ...saved.steps.map((step) => `${step.status}: ${step.title}${step.notes ? `\n${step.notes}` : ""}`), saved.review, saved.lastMessage].filter(Boolean).join("\n\n") : "No saved task notes.";
+                await askCenteredConfirm({ title: "Task notes", message: notes, confirmLabel: "Close" });
+              } catch (error) { showRuntimeToast(String(error)); }
+            }}><BookOpen size={16} /></button>
+            {running ? (
+              <button type="button" className="icon-button" title="Pause and save progress" aria-label="Pause and save progress" onClick={() => {
+                if (task) void toggleAutonomousPause(task.id);
+                else void invoke("cancel_agent_turn", { tabId: activeTab }).catch((error) => showRuntimeToast(String(error)));
+              }}><Pause size={16} /></button>
+            ) : progress.status !== "completed" ? (
+              <button type="button" className="icon-button" title="Resume saved task" aria-label="Resume saved task" disabled={isGenerating} onClick={() => {
+                if (task) void toggleAutonomousPause(task.id);
+                else void sendRustTurn(activeTab, "Continue the saved task from its notes; inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null);
+              }}><Play size={16} /></button>
+            ) : null}
+            </>}
+          </div>
+          {!!activity.length && <details className="agent-activity"><summary>Recent activity</summary><ol>{activity.map((entry, index) => <li key={`${entry.ts}_${index}`}>{entry.text}</li>)}</ol></details>}
+          </div>;
+        })()}
         {activeInlinePermission && (
           <div className="inline-permission-card">
             <div className="inline-permission-title">{activeInlinePermission.title}</div>
@@ -12839,7 +14130,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           onDrop={(e) => { void handleChatDrop(e); }}
           style={chatDragActive ? { boxShadow: "inset 0 0 0 2px rgba(91, 143, 214, 0.55)" } : undefined}
         >
-          {rustEngineStatus ? (
+          {rustEngineStatus && !useRustEngine ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <span style={{ fontSize: 11, color: isLightMode ? "#36506a" : "#9fb2c9" }}>
                 {rustEngineStatus}
@@ -12848,6 +14139,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           ) : null}
 
           {(() => {
+            if (useRustEngine) return null;
             const runtimeState = activeRuntimeStateForTab(activeTab);
             if (!runtimeState) return null;
 
@@ -12987,19 +14279,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 if (menuLocked) return;
-                if (input.trim() || pendingImages.length) sendMessage(e);
+                if (!isGenerating && (input.trim() || pendingImages.length)) sendMessage(e);
               }
             }}
           />
           <button
             className="send-btn"
             type="submit"
+            aria-label={isGenerating ? "Stop agent" : "Send message"}
+            title={isGenerating ? "Stop agent" : "Send message"}
             disabled={
               menuLocked ||
               (respondingTab !== null && respondingTab !== activeTab && !isGenerating)
             }
           >
-            {isGenerating ? "Stop" : "Send"}
+            {isGenerating ? <Square size={17} fill="currentColor" /> : <ArrowUp size={21} />}
           </button>
         </form>
         </>

@@ -18,6 +18,7 @@ export function patchLastLLMBubble(prev: Message[], delta: string): Message[] {
   if (!delta) return prev;
   const copy = [...prev];
   for (let i = copy.length - 1; i >= 0; --i) {
+    if (copy[i].role === "user") break;
     if (copy[i].role === "llm") {
       copy[i] = { ...copy[i], text: copy[i].text + delta };
       return copy;
@@ -37,4 +38,10 @@ export function extractArtifacts(text: string): Array<{ lang: string; filename?:
     if (content) out.push({ lang, content });
   }
   return out;
+}
+
+export function clearProvisionalReply(prev: Message[]): Message[] {
+  let end = prev.length;
+  while (end > 0 && prev[end - 1].role === "llm") end--;
+  return prev.slice(0, end);
 }

@@ -52,6 +52,9 @@ function tauriInvoke<T = unknown>(cmd: string, args?: any): Promise<T> {
   const tauri = (window as any).__TAURI__;
   const inv = tauri?.core?.invoke ?? tauri?.invoke;
   if (!inv || typeof inv !== "function") {
+    if (/^(update_|create_|restore_|close_|write_|save_)/.test(cmd)) {
+      return Promise.reject(new Error(`Desktop runtime unavailable; ${cmd} was not persisted`));
+    }
     // Soft fallback: pretend it succeeded (or return empty data)
     // so startup code doesn't break while Tauri injects. Callers that "need" data should handle empty results.
     console.warn("[tauriInvoke] Tauri invoke not available yet (frontend falling back). Cmd:", cmd, "args:", args);
@@ -156,6 +159,7 @@ export async function persistSnapshot(tabId: number, snapshotLike: Snapshot): Pr
     });
   } catch (e) {
     console.warn("[persistSnapshot] failed:", e);
+    throw e;
   }
 }
 

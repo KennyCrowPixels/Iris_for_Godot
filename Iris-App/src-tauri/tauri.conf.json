@@ -16,8 +16,10 @@
       {
         "label": "main",
         "title": "iris-app",
-        "width": 800,
-        "height": 600
+        "width": 1180,
+        "height": 780,
+        "minWidth": 640,
+        "minHeight": 480
       }
     ],
     "security": {
@@ -30,7 +32,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../model_files/": "model_files/",
+      "../core_prompts/UserPersonaPrompt.txt": "core_prompts/UserPersonaPrompt.txt"
+    },
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
     "icon": [
+      "icons/icon.icns",
       "icons/Iris_icon-1024px.png",
       "icons/Iris_icon-256px-win.ico"
     ]
