@@ -1,5 +1,15 @@
 # Iris Runtime Review and Upgrade
 
+## 0.3.2 Alpha Changes
+
+- **Integrity:** the model is barred from inventing project facts (scene/node/file names, counts, contents), connection/desktop state, or tool results. It may state a specific project/desktop fact only when a successful tool observation this turn returned it. `project_connections` now reports whether the project is actually inspectable and, when no enabled+linked MCP bridge or repository exists, instructs the model to say it cannot inspect and name what to enable — rather than fabricating an inventory.
+- **Dataweb v2 (`src-tauri/src/dataweb.rs`):** a brain-like 2D associative memory replaces the flat text blob as the engine. Entries are nodes placed in 2D so similar memories cluster, linked by weighted synapse neighbors. Recall is spreading activation over the synapse graph with per-hop decay and a bounded visit budget, so retrieval is local and cheap even with thousands of entries. Reinforcement strengthens walked pathways; low-value nodes are pruned to stay bounded. Human-editable dataweb notes ingest into the web; the executor injects a bounded, clearly-unverified recall digest into a turn (no-op when empty). Commands: `dataweb_remember`, `dataweb_recall`, `dataweb_stats`. This is retrieval support, not training or verified fact.
+- **Weather:** the lookup copies the user's named place verbatim (no substituting a different city or reusing an earlier location), leads with the actual current reading and observation time, and geocoding expands US state abbreviations ("Durham, NC" → North Carolina).
+- **Agent stats:** behavioral gating now keys on a short *recent* failure streak (`SkillStats.recentFailures`) that resets on any success, instead of permanent lifetime totals. The sole effect remains a tighter self-review cadence; stats never block or disable a tool.
+- **Light mode:** surfaces/panels/inputs/tabs are theme-tinted off-whites instead of pure white and follow the active color; contrast stays within targets.
+- **Bridge consistency:** the chat bridge-launch controls respect the global MCP-access toggle, matching agent availability.
+- **Not claimed solved:** end-to-end Godot asset generation over a live MCP bridge is improved (integrity, path, consistency) but still needs on-device verification against a running editor.
+
 ## What Was Holding Iris Back
 
 The largest regressions were in the agent harness, not React rendering:

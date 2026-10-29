@@ -3,6 +3,7 @@
 
 use crate::commands::ensure_model;
 mod agent_runtime;
+mod dataweb;
 mod platform_macos;
 mod commands;
 use commands::ensure_coder_lite_model;
@@ -90,6 +91,9 @@ fn main() {
             commands::read_universal_dataweb,
             commands::write_universal_dataweb,
             commands::open_universal_dataweb,
+            commands::dataweb_remember,
+            commands::dataweb_recall,
+            commands::dataweb_stats,
             commands::detect_hardware_profile,
                     commands::list_modelfiles,
                     commands::read_modelfile_params,

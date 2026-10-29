@@ -3446,7 +3446,7 @@ function App() {
   const contextMcpCount = repoStore.mcps.filter((connection) => connection.enabled && contextProject?.mcpIds.includes(connection.id)).length;
   const activeProjectMcpIds = new Set((activeProject?.mcpIds || []).map((id) => String(id)));
   const activeProjectSshIds = new Set((activeProject?.sshIds || []).map((id) => String(id)));
-  const launchableProjectMcps = activeProject
+  const launchableProjectMcps = activeProject && mcpEnabled
     ? repoStore.mcps.filter((m) => {
         if (!m.enabled || !activeProjectMcpIds.has(String(m.id))) return false;
         const parsed = parseMcpTarget(m.target);

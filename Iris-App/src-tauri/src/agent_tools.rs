@@ -226,10 +226,21 @@ pub(super) async fn execute(
     let result: Result<Value,String> = async { Ok(match tool {
         "project_connections" => {
             let (project,store) = project_for_task(app,task)?;
+            let mcps = store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>();
+            let sshs = store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>();
+            let repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
+            let can_bridge = !mcps.is_empty();
+            let can_files = !repositories.is_empty();
+            let guidance = if can_bridge {
+                "Use list_project_tools then call_project_tool on a linked MCP id to inspect or edit scenes/nodes. Report only what a successful call returns; never invent scene, node, or file names."
+            } else if can_files {
+                "No MCP bridge is linked, but a repository/project root is available: use project_files to inspect files. Report only what it returns; do not invent names."
+            } else {
+                "This project has no enabled, linked MCP bridge or repository. You cannot inspect its scenes, nodes, or files. Tell the user to enable and link an MCP bridge or repository in Settings > Projects, and do not invent any scene, node, or file names."
+            };
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
-                "mcps":store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>(),
-                "sshs":store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>(),
-                "repositories":store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>()})
+                "mcps":mcps,"sshs":sshs,"repositories":repositories,
+                "inspectable":can_bridge||can_files,"guidance":guidance})
         }
         "list_project_tools" | "call_project_tool" => {
             let connection = linked_mcp(app,task,string_arg(args,"connection_id")?)?;

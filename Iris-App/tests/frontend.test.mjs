@@ -130,3 +130,16 @@ test("neutral and blue themes have distinct surfaces in both modes", () => {
     assert.notEqual(themeTokens("Custom", "#e15580", light)["--app-panel-bg"], themeTokens("Custom", "#2687d8", light)["--app-panel-bg"]);
   }
 });
+
+test("light mode surfaces are theme-tinted off-white, never harsh pure white", () => {
+  for (const theme of ["Black", "Blue", "Pink", "Purple", "Silver", "Grey"]) {
+    for (const surface of ["--app-surface", "--app-panel-bg", "--app-input-bg", "--app-tab-active-bg"]) {
+      const value = themeTokens(theme, "#000000", true)[surface].toLowerCase();
+      assert.notEqual(value, "#ffffff", `${theme} ${surface} must not be pure white`);
+    }
+  }
+  // Distinct accent themes must produce visibly different light surfaces (tint carries through).
+  const pink = themeTokens("Pink", "#000000", true)["--app-surface"];
+  const blue = themeTokens("Blue", "#000000", true)["--app-surface"];
+  assert.notEqual(pink, blue);
+});

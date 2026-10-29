@@ -37,22 +37,25 @@ export function themeTokens(theme: ThemeName, custom: string, light: boolean): R
   const seed = theme === "Custom" ? (/^#[\da-f]{6}$/i.test(custom) ? custom : "#64d6b3") : accents[theme];
   const accent = light ? mix(seed, "#0c1820", 0.54) : mix(seed, "#ffffff", 0.12);
   const tint = theme === "Black" ? "#90949a" : theme === "Silver" ? "#94b4ca" : theme === "Grey" ? "#a4b0a7" : seed;
+  // In light mode, replace pure white with a softly theme-tinted off-white so surfaces
+  // pick up the active color and avoid a harsh bright-white contrast against the page.
+  const paper = light ? mix("#f4f6f8", tint, 0.14) : "#ffffff";
   const background = light ? mix("#eef1f4", tint, 0.18)
     : theme === "Custom" ? mix("#242a30", seed, 0.14) : darkBases[theme];
-  const surface = mix(background, "#ffffff", light ? 0.45 : 0.045);
-  const panel = mix(background, light ? "#ffffff" : tint, light ? 0.22 : 0.04);
+  const surface = mix(background, paper, light ? 0.52 : 0.045);
+  const panel = mix(background, light ? paper : tint, light ? 0.3 : 0.04);
   const accentRgb = [1, 3, 5].map((position) => parseInt(accent.slice(position, position + 2), 16)).join(", ");
   return {
     "--app-bg": background,
-    "--app-gradient-start": mix(background, tint, light ? 0.18 : 0.20),
-    "--app-gradient-end": mix(background, light ? "#d9e4ed" : "#191c24", 0.35),
+    "--app-gradient-start": mix(background, tint, light ? 0.16 : 0.20),
+    "--app-gradient-end": mix(background, light ? mix("#d9e4ed", tint, 0.18) : "#191c24", 0.35),
     "--app-surface": surface,
     "--app-panel-bg": panel,
-    "--app-border": mix(background, light ? "#425065" : "#d6dde4", light ? 0.24 : 0.20),
-    "--app-input-bg": mix(background, light ? "#ffffff" : "#111519", light ? 0.6 : 0.16),
+    "--app-border": mix(background, light ? mix("#425065", tint, 0.25) : "#d6dde4", light ? 0.26 : 0.20),
+    "--app-input-bg": mix(background, light ? mix(paper, "#ffffff", 0.5) : "#111519", light ? 0.62 : 0.16),
     "--app-tab-bg": "transparent",
     "--app-tab-active-bg": surface,
-    "--app-user-bubble": light ? mix(surface, tint, 0.12) : mix(surface, tint, 0.08),
+    "--app-user-bubble": light ? mix(surface, tint, 0.16) : mix(surface, tint, 0.08),
     "--app-text": light ? "#202a34" : "#f0f3f6",
     "--app-muted": light ? "#414e5b" : "#cbd2d9",
     "--app-accent": accent,

@@ -6415,7 +6415,9 @@ pub fn read_project_dataweb(app: tauri::AppHandle, project_id: String) -> Result
 pub fn write_project_dataweb(app: tauri::AppHandle, project_id: String, content: String) -> Result<(), String> {
   let path = project_dataweb_file(&app, &project_id)?;
   ensure_text_file(&path)?;
-  fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+  fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+  ingest_flat_into_web(&app, &format!("project_{}", project_id), &content);
+  Ok(())
 }
 
 #[tauri::command]
@@ -6436,7 +6438,9 @@ pub fn read_universal_dataweb(app: tauri::AppHandle) -> Result<String, String> {
 pub fn write_universal_dataweb(app: tauri::AppHandle, content: String) -> Result<(), String> {
   let path = universal_dataweb_file(&app)?;
   ensure_text_file(&path)?;
-  fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+  fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+  ingest_flat_into_web(&app, "universal", &content);
+  Ok(())
 }
 
 #[tauri::command]
@@ -6444,6 +6448,100 @@ pub fn open_universal_dataweb(app: tauri::AppHandle) -> Result<(), String> {
   let path = universal_dataweb_file(&app)?;
   ensure_text_file(&path)?;
   open_file_portal(&path)
+}
+
+// ---- Dataweb v2: brain-like 2D associative memory (crate::dataweb) ----
+
+fn dataweb_web_file(app: &tauri::AppHandle, scope: &str) -> Result<PathBuf, String> {
+  Ok(dataweb_dir(app)?.join(format!("web_{}.json", sanitize_dataweb_key(scope))))
+}
+
+fn load_dataweb(app: &tauri::AppHandle, scope: &str) -> Result<crate::dataweb::DataWeb, String> {
+  let path = dataweb_web_file(app, scope)?;
+  if !path.exists() {
+    return Ok(crate::dataweb::DataWeb::default());
+  }
+  let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+  Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+fn save_dataweb(app: &tauri::AppHandle, scope: &str, web: &crate::dataweb::DataWeb) -> Result<(), String> {
+  let path = dataweb_web_file(app, scope)?;
+  atomic_write_json(&path, &serde_json::to_string(web).map_err(|e| e.to_string())?)
+}
+
+/// Ingest each meaningful line/paragraph of flat dataweb text into the associative web so the
+/// human-editable notes feed recall. Near-duplicates reinforce rather than duplicate.
+fn ingest_flat_into_web(app: &tauri::AppHandle, scope: &str, text: &str) {
+  let entries: Vec<&str> = text
+    .split(|c| c == '\n')
+    .map(str::trim)
+    .filter(|line| line.chars().filter(|c| c.is_alphanumeric()).count() >= 6)
+    .collect();
+  if entries.is_empty() {
+    return;
+  }
+  if let Ok(mut web) = load_dataweb(app, scope) {
+    let now = now_ts();
+    for entry in entries.into_iter().take(500) {
+      web.remember(entry, now);
+    }
+    let _ = save_dataweb(app, scope, &web);
+  }
+}
+
+#[tauri::command]
+pub fn dataweb_remember(app: tauri::AppHandle, scope: String, content: String) -> Result<u64, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  let mut web = load_dataweb(&app, &scope)?;
+  let id = web.remember(&content, now_ts());
+  save_dataweb(&app, &scope, &web)?;
+  Ok(id)
+}
+
+#[tauri::command]
+pub fn dataweb_recall(app: tauri::AppHandle, scope: String, query: String, limit: Option<usize>) -> Result<Value, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  let mut web = load_dataweb(&app, &scope)?;
+  let nodes = web.recall(&query, limit.unwrap_or(8).min(40), now_ts(), true);
+  save_dataweb(&app, &scope, &web)?;
+  Ok(serde_json::json!({
+    "query": query,
+    "results": nodes.iter().map(|node| serde_json::json!({
+      "id": node.id, "content": node.content, "hits": node.hits,
+      "coords": [node.x, node.y], "links": node.neighbors.len(),
+    })).collect::<Vec<_>>(),
+    "digest": web.recall_digest(&query, 1800, now_ts()),
+  }))
+}
+
+#[tauri::command]
+pub fn dataweb_stats(app: tauri::AppHandle, scope: String) -> Result<Value, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  Ok(load_dataweb(&app, &scope)?.stats())
+}
+
+/// Associative recall across the universal web and (if any) the active project's web, returned as a
+/// compact digest for injecting relevant long-term memory into an agent turn. Read-only and bounded,
+/// so it stays cheap no matter how much is stored; empty when nothing relevant exists.
+pub(crate) fn recall_memory_digest(app: &tauri::AppHandle, project_id: Option<&str>, query: &str, max_chars: usize) -> String {
+  let mut scopes: Vec<String> = vec!["universal".to_string()];
+  if let Some(id) = project_id {
+    scopes.push(format!("project_{}", id));
+  }
+  let mut out = String::new();
+  for scope in scopes {
+    if let Ok(web) = load_dataweb(app, &scope) {
+      let digest = web.recall_digest(query, max_chars / 2, now_ts());
+      if !digest.is_empty() {
+        if !out.is_empty() {
+          out.push('\n');
+        }
+        out.push_str(&digest);
+      }
+    }
+  }
+  out.chars().take(max_chars).collect()
 }
 
 fn read_repo_project_store(app: &tauri::AppHandle) -> RepoProjectStore {
@@ -7055,6 +7153,23 @@ fn weather_code_label(code: i64) -> &'static str {
   }
 }
 
+fn us_state_from_abbrev(token: &str) -> Option<&'static str> {
+  Some(match token.to_ascii_lowercase().as_str() {
+    "al" => "alabama", "ak" => "alaska", "az" => "arizona", "ar" => "arkansas", "ca" => "california",
+    "co" => "colorado", "ct" => "connecticut", "de" => "delaware", "fl" => "florida", "ga" => "georgia",
+    "hi" => "hawaii", "id" => "idaho", "il" => "illinois", "in" => "indiana", "ia" => "iowa",
+    "ks" => "kansas", "ky" => "kentucky", "la" => "louisiana", "me" => "maine", "md" => "maryland",
+    "ma" => "massachusetts", "mi" => "michigan", "mn" => "minnesota", "ms" => "mississippi", "mo" => "missouri",
+    "mt" => "montana", "ne" => "nebraska", "nv" => "nevada", "nh" => "new hampshire", "nj" => "new jersey",
+    "nm" => "new mexico", "ny" => "new york", "nc" => "north carolina", "nd" => "north dakota", "oh" => "ohio",
+    "ok" => "oklahoma", "or" => "oregon", "pa" => "pennsylvania", "ri" => "rhode island", "sc" => "south carolina",
+    "sd" => "south dakota", "tn" => "tennessee", "tx" => "texas", "ut" => "utah", "vt" => "vermont",
+    "va" => "virginia", "wa" => "washington", "wv" => "west virginia", "wi" => "wisconsin", "wy" => "wyoming",
+    "dc" => "district of columbia",
+    _ => return None,
+  })
+}
+
 fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
   let raw_lower = raw_location.trim().to_lowercase();
   let query_tokens = keyword_set(&raw_lower)
@@ -7077,6 +7192,16 @@ fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
   }
   if !admin1.is_empty() && raw_lower.contains(&admin1) {
     score += 1.2;
+  }
+  // A US state abbreviation in the query (e.g. "Durham, NC") should strongly match its full admin1
+  // name ("North Carolina"); this prevents drifting to a same-named city in another state/country.
+  if !admin1.is_empty() {
+    let abbrev_match = raw_lower.split(|c: char| !c.is_ascii_alphanumeric())
+      .any(|token| us_state_from_abbrev(token).is_some_and(|full| full == admin1));
+    if abbrev_match {
+      score += 3.0;
+      if country == "united states" { score += 0.8; }
+    }
   }
   if !postcode.is_empty() && raw_lower.contains(&postcode) {
     score += 4.0;
@@ -7345,6 +7470,17 @@ mod weather_tests {
     assert_eq!(result.observed_at, None);
     assert_eq!(result.forecast.high_f, 70.0);
     assert_eq!(result.forecast.precipitation_probability_percent, None);
+  }
+
+  #[test]
+  fn state_abbreviation_disambiguates_same_named_cities() {
+    let durham_nc = serde_json::json!({"name":"Durham","admin1":"North Carolina","country":"United States","feature_code":"PPLA2","population":283506});
+    let durham_uk = serde_json::json!({"name":"Durham","admin1":"England","country":"United Kingdom","feature_code":"PPLA2","population":48069});
+    let durham_ny = serde_json::json!({"name":"Durham","admin1":"New York","country":"United States","feature_code":"PPL","population":2700});
+    assert!(score_geocode_result(&durham_nc, "Durham, NC") > score_geocode_result(&durham_uk, "Durham, NC"));
+    assert!(score_geocode_result(&durham_nc, "Durham, NC") > score_geocode_result(&durham_ny, "Durham, NC"));
+    // Abbreviation expansion is state-specific: NY must not win a "NC" query.
+    assert!(score_geocode_result(&durham_ny, "Durham, NY") > score_geocode_result(&durham_nc, "Durham, NY"));
   }
 }
 

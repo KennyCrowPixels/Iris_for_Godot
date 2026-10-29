@@ -144,7 +144,15 @@ fn read_evidence(app: &tauri::AppHandle, task: &AgentTask, args: &Value) -> Resu
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SkillStats { successes: u64, failures: u64, verified_checkpoints: u64 }
+struct SkillStats {
+    successes: u64,
+    failures: u64,
+    verified_checkpoints: u64,
+    // Consecutive recent failures; resets to 0 on any success so a tool that starts working
+    // again immediately stops tightening the review cadence. Lifetime totals never gate behavior.
+    #[serde(default)]
+    recent_failures: u64,
+}
 
 fn load_skills(app: &tauri::AppHandle) -> HashMap<String, SkillStats> {
     memory_dir(app).ok().and_then(|dir| fs::read_to_string(dir.join("agent_skills.json")).ok())
@@ -156,10 +164,15 @@ fn update_skill(app: &tauri::AppHandle, name: &str, ok: bool, verified: bool) ->
     let _lock = LOCK.lock().map_err(|_| "Skill statistics lock unavailable")?;
     let mut skills = load_skills(app);
     let stats = skills.entry(name.to_string()).or_default();
-    if verified { stats.verified_checkpoints += 1; }
-    else if ok { stats.successes += 1; }
-    else { stats.failures += 1; }
+    if verified { stats.verified_checkpoints += 1; stats.recent_failures = 0; }
+    else if ok { stats.successes += 1; stats.recent_failures = 0; }
+    else { stats.failures += 1; stats.recent_failures += 1; }
     atomic_write_json(&memory_dir(app)?.join("agent_skills.json"), &serde_json::to_string_pretty(&skills).map_err(|err| err.to_string())?)
+}
+
+// A tool currently in a short failure streak tightens the review cadence; any success clears it.
+fn skills_need_tighter_review(skills: &HashMap<String, SkillStats>) -> bool {
+    skills.values().any(|stats| stats.recent_failures >= 3)
 }
 
 pub(super) fn skill_report(app: &tauri::AppHandle) -> Value {
@@ -243,6 +256,7 @@ async fn model_budget(model: &str) -> ModelBudget {
 }
 
 const ACTION_PROTOCOL: &str = r#"You are Iris, a local AI companion and practical assistant. Answer naturally, matching the user's depth and tone. Conversation, explanations, creative writing and roleplay need no plan, review, tools or permission. Write ordinary answers as plain text immediately. In fiction, write the scene; application tools are not character abilities. Never expose private reasoning, the tool registry or host protocol in answers.
+Never invent project facts (file, scene, or node names, their count or contents), connection/desktop state, or tool results. State a specific project or desktop fact only when a successful tool observation this turn shows it; quote what the observation returned. If you cannot inspect because a bridge, repository, or desktop tool is unavailable, disabled, or not linked, say so plainly and name what to enable, instead of guessing or describing a plausible result. "I could not inspect X" is a correct answer; a fabricated inventory is not.
 For changing real-world information, verify with an enabled tool before answering: training memory and earlier chat are not current evidence. Honor explicit lookup requests. Preserve the user's actual subject: do not replace an ambiguous role or unfamiliar title with a remembered name. Resolve identity and time from fresh sources or clarify the ambiguity. If lookup fails or evidence is inconclusive, change the query, source or provider before giving up; never fill the gap with a guess. Distinguish current observations from forecasts, announcements from releases, and publication dates from event dates. Cite factual online claims with the actual source URL and relevant date. Prefer primary sources; search snippets are leads, read the source to verify precise claims.
 For an external lookup or action, emit ONE JSON request with no surrounding prose:
 {"action":"tool","tool":"tool_name","arguments":{}}
@@ -580,7 +594,7 @@ async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequ
     let mut need: agent_research::EvidenceNeed=serde_json::from_str(&raw).map_err(|error|format!("Could not assess evidence needs: {error}"))?;
     let lookups=network_action_schema(tools);
     if need.route=="web" && lookups["oneOf"].as_array().is_some_and(|choices|!choices.is_empty()) {
-        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
+        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. Copy the location, place, or subject VERBATIM from the current user question into the tool arguments; never substitute a different place or reuse a location mentioned earlier in the chat. Include the region/state/country when the user gave it (for example 'Durham, NC'). Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
         if let Ok(raw)=next_action(client,&request.model,messages,&intake_budget,control,Some(lookups),|_|{}).await {
             need.lookup=parse_model_action(&raw,tools).ok();
         }
@@ -680,8 +694,11 @@ pub(super) async fn run(
     }
     let mut budget = model_budget(&request.model).await;
     budget.apply_persistence_mode(&read_setup_flags(app).permission_mode);
-    if load_skills(app).values().any(|stats| stats.failures > 2 && stats.failures > stats.successes / 2) {
-        budget.review_interval = 2;
+    // Tighten self-review only while a tool is CURRENTLY struggling (a recent failure streak),
+    // not because of old lifetime failures. One success clears the streak, so this never builds
+    // up into a permanent restriction after a transient outage (e.g. a bridge that was offline).
+    if skills_need_tighter_review(&load_skills(app)) {
+        budget.review_interval = budget.review_interval.min(2);
     }
     let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(budget.request_timeout_secs)).build().map_err(|err| err.to_string())?;
@@ -692,6 +709,12 @@ pub(super) async fn run(
     let mut turn_request=request.clone();
     if attached.is_some() {
         turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:format!("Attached project context: {project_context}. Prefer its repository/bridge evidence for project-specific questions. Never claim that attached resources are absent or inspected without checking. For code snippets, use the project's verified engine/API version; if it is unknown and materially affects code, ask which version or inspect the linked references. Do not fabricate APIs."),images:None,tool_calls:None});
+    }
+    // Brain-like associative memory: recall relevant long-term entries from the dataweb and offer
+    // them as unverified context. No-op when nothing is stored, so ordinary chats are unaffected.
+    let memory_digest = recall_memory_digest(app, task.project_id.as_deref(), &task.goal, 1200);
+    if !memory_digest.trim().is_empty() {
+        turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:format!("{memory_digest}\nThis recalled memory is background only; it is not proof. Verify with a tool before stating it as a current fact."),images:None,tool_calls:None});
     }
     let mut feedback = String::new();
     let mut last_action_error = String::new();
@@ -1119,6 +1142,27 @@ async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_review_tightening_self_heals_and_never_hard_gates() {
+        // A short recent-failure streak tightens review; a single success clears it.
+        let mut skills: HashMap<String, SkillStats> = HashMap::new();
+        let entry = skills.entry("call_project_tool".into()).or_default();
+        entry.failures = 50; // heavy lifetime history must NOT gate on its own
+        entry.recent_failures = 0;
+        assert!(!skills_need_tighter_review(&skills));
+        skills.get_mut("call_project_tool").unwrap().recent_failures = 3;
+        assert!(skills_need_tighter_review(&skills));
+        // Simulate update_skill success clearing the streak.
+        skills.get_mut("call_project_tool").unwrap().recent_failures = 0;
+        assert!(!skills_need_tighter_review(&skills));
+        // The gate only ever lowers the review interval; no tool is blocked by stats.
+        let mut budget = ModelBudget::for_capacity(16, 7.0, 8192);
+        let before = budget.review_interval;
+        skills.get_mut("call_project_tool").unwrap().recent_failures = 5;
+        if skills_need_tighter_review(&skills) { budget.review_interval = budget.review_interval.min(2); }
+        assert!(budget.review_interval <= before && budget.review_interval >= 2);
+    }
 
     #[test]
     fn recovery_schema_requires_exact_tool_arguments() {
