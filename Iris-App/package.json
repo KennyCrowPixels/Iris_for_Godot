@@ -1,7 +1,7 @@
 {
   "name": "iris-app",
   "private": true,
-  "version": "0.3.2-alpha.0",
+  "version": "0.3.3-alpha.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420",

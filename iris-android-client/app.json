@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "Iris Companion",
+    "slug": "iris-companion",
+    "version": "0.3.3-alpha.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "iris-companion",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.pixelcrowgames.iriscompanion",
+      "permissions": [
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "ACCESS_WIFI_STATE",
+        "CHANGE_WIFI_MULTICAST_STATE",
+        "RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Iris uses the microphone only to turn your speech into text on this phone.",
+          "speechRecognitionPermission": "Iris transcribes speech locally on this phone; no audio is sent to the desktop."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Iris attaches photos you pick so the desktop can analyze them."
+        }
+      ]
+    ]
+  }
+}

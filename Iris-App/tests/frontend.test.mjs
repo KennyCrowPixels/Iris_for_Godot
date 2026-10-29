@@ -13,6 +13,29 @@ const { themeTokens } = await loadTypescript("../src/lib/theme.ts");
 const { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } = await loadTypescript("../src/lib/automation.ts");
 const { patchLastLLMBubble, clearProvisionalReply, reorderTabs } = await loadTypescript("../src/state/tabs.ts");
 const { persistSnapshot } = await loadTypescript("../src/state/memory.ts");
+const { sanitizeForSpeech, chunkForSpeech } = await loadTypescript("../src/lib/voice.ts");
+
+test("TTS sanitization strips code, markdown, URLs and citation lists", () => {
+  assert.equal(sanitizeForSpeech("Hello **world**!"), "Hello world!");
+  assert.equal(sanitizeForSpeech("Use `cargo test` to run"), "Use cargo test to run");
+  assert.equal(sanitizeForSpeech("See [the docs](https://example.com) now"), "See the docs now");
+  assert.equal(sanitizeForSpeech("Here:\n```rust\nfn main() {}\n```\nDone"), "Here: Done");
+  assert.equal(sanitizeForSpeech("# Heading\n- item one\n- item two"), "Heading item one item two");
+  const cited = sanitizeForSpeech("Current conditions: 70 F.\n\nSources:\n- [Retrieved data](<https://api.open-meteo.com/x>)");
+  assert.equal(cited, "Current conditions: 70 F.");
+  assert.equal(sanitizeForSpeech(""), "");
+});
+
+test("TTS chunking splits long text at sentence boundaries without dropping content", () => {
+  assert.deepEqual(chunkForSpeech(""), []);
+  const short = chunkForSpeech("Just one sentence.");
+  assert.deepEqual(short, ["Just one sentence."]);
+  const long = chunkForSpeech("First sentence here. Second sentence here. Third sentence here.", 30);
+  assert.ok(long.length >= 2);
+  assert.ok(long.every((chunk) => chunk.length <= 30));
+  assert.ok(long.join(" ").includes("First sentence"));
+  assert.ok(long.join(" ").includes("Third sentence"));
+});
 
 test("snapshot updates retain saved reasoning logs", async () => {
   const originalWindow = globalThis.window;

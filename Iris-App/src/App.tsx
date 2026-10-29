@@ -4,10 +4,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
-import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, Mic, MicOff, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
 import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
 import { themeTokens } from "./lib/theme";
 import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
+import { VoiceRecognizer, speak, cancelSpeech, isSpeechRecognitionSupported, isSpeechSynthesisSupported } from "./lib/voice";
 import "@fontsource-variable/manrope";
 import "./App.css";
 import type { ChatMessage, Artifact } from "./types/models";
@@ -3012,6 +3013,14 @@ function App() {
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [chatDragActive, setChatDragActive] = useState(false);
+  // Voice Mode: mic dictation (STT) and spoken replies (TTS) via built-in browser APIs.
+  const [micListening, setMicListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const voiceRecognizerRef = useRef<VoiceRecognizer | null>(null);
+  const voiceDraftBaseRef = useRef<string>("");
+  const speakReplyOnDoneRef = useRef<Record<number, boolean>>({});
+  const sttSupported = isSpeechRecognitionSupported();
+  const ttsSupported = isSpeechSynthesisSupported();
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -5286,7 +5295,7 @@ function App() {
       });
       setTabProjectMap((previous) => ({ ...previous, [tabId]: snapshot.associatedProjectId ?? null }));
     };
-    void listen<{ tabId: number; jobId: string; input: string }>("controller-turn-started", async ({ payload }) => {
+    void listen<{ tabId: number; jobId: string; input: string; images?: string[] }>("controller-turn-started", async ({ payload }) => {
       if (disposed || activeRustRequestRef.current !== null || isGeneratingRef.current) return;
       activeRustRequestRef.current = payload.tabId;
       try {
@@ -5296,7 +5305,7 @@ function App() {
         rustHadDeltaByTabRef.current[payload.tabId] = false;
         rustDeltaQueueByTabRef.current[payload.tabId] = "";
         rustStreamDoneByTabRef.current[payload.tabId] = false;
-        updateTabMessages(payload.tabId, (messages) => updateMessagesAppendUser(messages, payload.input));
+        updateTabMessages(payload.tabId, (messages) => updateMessagesAppendUser(messages, payload.input, payload.images));
         setIsGenerating(true);
         isGeneratingRef.current = true;
         setRespondingTab(payload.tabId);
@@ -9460,6 +9469,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     stopRustDeltaDrain(tabId);
     setIsGenerating(false);
     setRustEngineStatus("");
+    maybeSpeakReply(tabId);
   }
 
   function startRustDeltaDrain(tabId: number) {
@@ -9498,6 +9508,80 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       showRuntimeToast("Could not copy the message to the clipboard.");
     }
   }
+
+  // Interrupt any active spoken reply immediately (UX safety: starting to listen or pressing stop).
+  function stopSpeaking() {
+    cancelSpeech();
+    setIsSpeaking(false);
+  }
+
+  function stopVoiceInput() {
+    voiceRecognizerRef.current?.stop();
+  }
+
+  function startVoiceInput() {
+    if (!sttSupported) {
+      showRuntimeToast("Voice input is not available in this environment.");
+      return;
+    }
+    stopSpeaking();
+    if (!voiceRecognizerRef.current) voiceRecognizerRef.current = new VoiceRecognizer(10000);
+    voiceDraftBaseRef.current = input.trim();
+    const dictationTab = activeTab;
+    const started = voiceRecognizerRef.current.start({
+      onTranscript: (text) => {
+        const base = voiceDraftBaseRef.current;
+        setInput(base ? `${base} ${text}` : text);
+      },
+      onEnd: (finalText) => {
+        setMicListening(false);
+        const spoken = finalText.trim();
+        if (!spoken) return;
+        const base = voiceDraftBaseRef.current;
+        const combined = (base ? `${base} ${spoken}` : spoken).trim();
+        // Seamless loop: submit the dictated turn and flag it to read Iris's reply aloud.
+        if (!isGeneratingRef.current && currentTab?.type === "chat" && dictationTab === activeTab) {
+          speakReplyOnDoneRef.current[dictationTab] = true;
+          setInput(combined);
+          queueMicrotask(() => chatFormRef.current?.requestSubmit());
+        } else {
+          setInput(combined);
+        }
+      },
+      onError: (message) => {
+        setMicListening(false);
+        showRuntimeToast(`Voice input error: ${message}`);
+      },
+    });
+    setMicListening(started);
+  }
+
+  function toggleVoiceInput() {
+    if (micListening) stopVoiceInput();
+    else startVoiceInput();
+  }
+
+  // Speak a completed reply aloud when the turn was started by voice. Clears the per-tab flag.
+  function maybeSpeakReply(tabId: number) {
+    if (!speakReplyOnDoneRef.current[tabId]) return;
+    speakReplyOnDoneRef.current[tabId] = false;
+    if (!ttsSupported) return;
+    const tab = tabsRef.current.find((t) => t.id === tabId);
+    const lastLlm = [...(tab?.messages || [])].reverse().find((m) => m.role === "llm");
+    const text = lastLlm?.text || "";
+    if (!text.trim()) return;
+    speak(text, {
+      onStart: () => setIsSpeaking(true),
+      onEnd: () => setIsSpeaking(false),
+    });
+  }
+
+  useEffect(() => {
+    return () => {
+      voiceRecognizerRef.current?.stop();
+      cancelSpeech();
+    };
+  }, []);
 
   useLayoutEffect(() => {
     autoResize();
@@ -14330,6 +14414,29 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               }
             }}
           />
+          {sttSupported && (
+            <button
+              type="button"
+              className={`mic-btn${micListening ? " listening" : ""}`}
+              aria-label={micListening ? "Stop recording" : "Start voice input"}
+              title={micListening ? "Listening — click to stop (auto-stops after 10s of silence)" : "Speak your message"}
+              disabled={menuLocked || (respondingTab !== null && respondingTab !== activeTab && !isGenerating)}
+              onClick={toggleVoiceInput}
+            >
+              {micListening ? <MicOff size={18} /> : <Mic size={18} />}
+            </button>
+          )}
+          {isSpeaking && (
+            <button
+              type="button"
+              className="mic-btn speaking"
+              aria-label="Stop speaking"
+              title="Stop speaking"
+              onClick={stopSpeaking}
+            >
+              <VolumeX size={18} />
+            </button>
+          )}
           <button
             className="send-btn"
             type="submit"

@@ -1816,6 +1816,12 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .chat-input::placeholder, .chat-root.light-theme .chat-input::placeholder { color: var(--app-muted); }
 .send-btn, .chat-root.light-theme .send-btn { width: 44px; height: 44px; padding: 0; display: grid; place-items: center; background: var(--app-accent); color: var(--app-accent-ink); border-radius: 6px; }
 .send-btn:hover:not(:disabled) { filter: brightness(1.08); }
+.mic-btn { flex: 0 0 44px; width: 44px; height: 44px; padding: 0; display: grid; place-items: center; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface); color: var(--app-text); }
+.mic-btn:hover:not(:disabled) { border-color: var(--app-accent); background: rgba(var(--app-accent-rgb), 0.1); }
+.mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.mic-btn.listening { background: var(--app-accent); color: var(--app-accent-ink); border-color: var(--app-accent); animation: mic-pulse 1.3s ease-in-out infinite; }
+.mic-btn.speaking { border-color: var(--app-accent); color: var(--app-accent); }
+@keyframes mic-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(var(--app-accent-rgb), 0.45); } 50% { box-shadow: 0 0 0 5px rgba(var(--app-accent-rgb), 0); } }
 .setup-modal, .autonomous-modal { border-radius: 8px; color: var(--app-text); background: var(--app-panel-bg); border-color: var(--app-border); box-shadow: var(--app-shadow); max-height: 86dvh; overflow-y: auto; }
 .setup-modal h2, .setup-modal p { color: var(--app-text); }
 .setup-modal p { overflow-wrap: anywhere; }
@@ -1899,6 +1905,7 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .mcp-context-status { display: grid; gap: 4px; margin-top: 10px; font-size: 12px; color: var(--app-muted); overflow-wrap: anywhere; }
 .mcp-context-status strong { color: var(--app-text); }
 .controller-notice { margin-top: 12px; font-size: 12px; color: var(--app-muted); }
+.pairing-pin { font-size: 20px; font-weight: 700; letter-spacing: 3px; color: var(--app-accent); padding: 2px 8px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface); }
 .controller-job { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--app-border); font-size: 12px; }
 .controller-job code, .controller-job p { grid-column: 1 / -1; overflow-wrap: anywhere; color: var(--app-muted); }
 .research-history { padding-bottom: 24px; margin-bottom: 24px; border-bottom: 1px solid var(--app-border); }

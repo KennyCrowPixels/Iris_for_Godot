@@ -133,6 +133,7 @@ fn main() {
                     commands::controller_server::get_controller_token,
                     commands::controller_server::controller_frontend_ready,
                     commands::controller_server::rotate_controller_token,
+                    commands::controller_server::rotate_controller_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
