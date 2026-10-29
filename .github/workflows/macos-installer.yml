@@ -51,7 +51,7 @@ jobs:
         run: |
           APP_ROOT="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/iris-app.app"
           file "$APP_ROOT/Contents/MacOS/iris-app"
-          lipo -verify_arch arm64 "$APP_ROOT/Contents/MacOS/iris-app"
+          lipo "$APP_ROOT/Contents/MacOS/iris-app" -verify_arch arm64
           mkdir -p src-tauri/target/aarch64-apple-darwin/release/bundle/metadata
           printf '%s\n' "$GITHUB_SHA" > src-tauri/target/aarch64-apple-darwin/release/bundle/metadata/source-revision.txt
           shasum -a 256 src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg > src-tauri/target/aarch64-apple-darwin/release/bundle/metadata/SHA256SUMS.txt
