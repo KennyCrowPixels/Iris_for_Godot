@@ -173,6 +173,8 @@ pub struct AgentTask {
     pub total_actions: usize,
     pub pending_writes: Vec<u64>,
     pub last_message: String,
+    #[serde(default)]
+    pub reasoning_log: Vec<Value>,
 }
 
 impl AgentTask {
@@ -183,7 +185,14 @@ impl AgentTask {
             steps: Vec::new(), observations: Vec::new(), review: String::new(),
             actions_since_review: 0, total_actions: 0, pending_writes: Vec::new(),
             last_message: String::new(),
+            reasoning_log: Vec::new(),
         }
+    }
+
+    pub fn record_reasoning(&mut self, text: &str) {
+        self.reasoning_log.push(serde_json::json!({"ts":time::OffsetDateTime::now_utc().unix_timestamp()*1000,"text":excerpt(text,1000)}));
+        let overflow=self.reasoning_log.len().saturating_sub(80);
+        self.reasoning_log.drain(..overflow);
     }
 
     pub fn plan(&mut self, items: Vec<PlanItem>, parent_id: Option<u32>) -> Result<(), String> {
@@ -326,6 +335,17 @@ pub fn excerpt(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_log_is_bounded_and_older_task_files_remain_readable() {
+        let mut task=AgentTask::new("log".into(),1,None,"Goal".into(),"model".into());
+        for index in 0..100 {task.record_reasoning(&format!("Observed step {index}"));}
+        assert_eq!(task.reasoning_log.len(),80);
+        assert_eq!(task.reasoning_log.last().unwrap()["text"],"Observed step 99");
+        let mut legacy=serde_json::to_value(&task).unwrap();
+        legacy.as_object_mut().unwrap().remove("reasoningLog");
+        assert!(serde_json::from_value::<AgentTask>(legacy).unwrap().reasoning_log.is_empty());
+    }
 
     #[test]
     fn persistence_modes_expand_work_not_context_or_permissions() {

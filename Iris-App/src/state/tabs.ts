@@ -6,6 +6,16 @@ export type Message = {
   images?: string[];
 };
 
+export function reorderTabs<T extends { id: number }>(tabs: T[], sourceId: number, targetId: number): T[] {
+  const sourceIndex = tabs.findIndex((tab) => tab.id === sourceId);
+  const targetIndex = tabs.findIndex((tab) => tab.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return tabs;
+  const reordered = [...tabs];
+  const [moved] = reordered.splice(sourceIndex, 1);
+  reordered.splice(targetIndex, 0, moved);
+  return reordered;
+}
+
 export function updateMessagesAppendUser(prev: Message[], text: string, images?: string[]): Message[] {
   return [...prev, { role: "user", text, time: Math.floor(Date.now() / 1000), ...(images && images.length ? { images } : {}) } as any];
 }

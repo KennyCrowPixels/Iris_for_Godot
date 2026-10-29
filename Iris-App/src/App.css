@@ -485,12 +485,14 @@ button {
   position: absolute;
   right: 8px;
   bottom: 92px;
-  width: 28px;
+  width: 36px;
+  min-width: 36px;
   height: 42px;
+  padding: 0;
   border: 1px solid var(--app-border, #4f5c6e);
   border-radius: 8px;
-  background: rgba(20, 28, 40, 0.9);
-  color: #d9e6f8;
+  background: var(--app-accent);
+  color: var(--app-accent-ink);
   font-size: 17px;
   line-height: 1;
   display: flex;
@@ -498,6 +500,8 @@ button {
   justify-content: center;
   z-index: 30;
 }
+
+.autonomous-reveal-handle svg { flex: 0 0 20px; }
 
 .autonomous-overlay {
   position: fixed;
@@ -1005,7 +1009,7 @@ button {
   outline: none;
   min-height: 20px;       /* Slightly less than before */
   max-height: 192px;      /* 8 lines x 24px, keep as is */
-  overflow-y: auto;
+  overflow-y: hidden;
   resize: none;
   line-height: 20px;      /* Match min-height for 1 line */
   font-family: 'Segoe UI', Arial, sans-serif;
@@ -1131,6 +1135,7 @@ button {
 
 .tab-wrapper {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   position: relative;
   z-index: 1;
@@ -1150,9 +1155,9 @@ button {
   margin: 0 4px;
 }
 
-.tab, .tab-wrapper {
-  cursor: default !important;
-}
+.tab-list { display: flex; gap: 4px; min-width: 0; max-width: calc(100% - 44px); overflow-x: auto; scrollbar-width: thin; }
+.tab[data-rfd-drag-handle-draggable-id] { cursor: grab; }
+.tab-wrapper.dragging .tab { cursor: grabbing; }
 
 .tab {
   background: var(--app-tab-bg, #222);
@@ -1806,7 +1811,8 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .bubble-meta, .thinking-indicator { color: var(--app-muted); }
 .bubble-copy-btn, .bubble-edit-btn { background: var(--app-surface); color: var(--app-muted); }
 .chat-input-row { margin-bottom: 0; padding: 16px 20px 18px; gap: 10px; background: linear-gradient(180deg,transparent,rgba(var(--app-accent-rgb),0.025)),var(--app-bg); }
-.chat-input, .chat-root.light-theme .chat-input { font-family: inherit; min-width: 0; min-height: 44px; line-height: 22px; padding: 11px 14px; font-size: 13px; background: var(--app-input-bg); color: var(--app-text); border: 1px solid var(--app-border); border-radius: 6px; }
+.chat-input, .chat-root.light-theme .chat-input { box-sizing: border-box; font-family: inherit; min-width: 0; min-height: 46px; line-height: 22px; padding: 11px 14px; font-size: 13px; background: var(--app-input-bg); color: var(--app-text); border: 1px solid var(--app-border); border-radius: 6px; }
+.copy-feedback { font-size: 11px; color: var(--app-text); }
 .chat-input::placeholder, .chat-root.light-theme .chat-input::placeholder { color: var(--app-muted); }
 .send-btn, .chat-root.light-theme .send-btn { width: 44px; height: 44px; padding: 0; display: grid; place-items: center; background: var(--app-accent); color: var(--app-accent-ink); border-radius: 6px; }
 .send-btn:hover:not(:disabled) { filter: brightness(1.08); }
@@ -1890,6 +1896,8 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .controller-config label { display: flex; align-items: center; gap: 9px; }
 .controller-config input[type=number] { width: 110px; background: var(--app-input-bg); color: var(--app-text); border: 1px solid var(--app-border); }
 .controller-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mcp-context-status { display: grid; gap: 4px; margin-top: 10px; font-size: 12px; color: var(--app-muted); overflow-wrap: anywhere; }
+.mcp-context-status strong { color: var(--app-text); }
 .controller-notice { margin-top: 12px; font-size: 12px; color: var(--app-muted); }
 .controller-job { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--app-border); font-size: 12px; }
 .controller-job code, .controller-job p { grid-column: 1 / -1; overflow-wrap: anywhere; color: var(--app-muted); }
@@ -1911,6 +1919,11 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 @keyframes service-spin { to { transform: rotate(360deg); } }
 .agent-progress-strip > svg { color: var(--app-accent); flex-shrink: 0; }
 .agent-progress-status { text-transform: capitalize; color: var(--app-accent); font-weight: 650; }
+.agent-progress-strip.paused { background: rgba(var(--app-accent-rgb), 0.1); border-top-color: var(--app-accent); }
+.agent-task-control { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 38px; flex-shrink: 0; padding: 7px 12px; border: 1px solid var(--app-accent); border-radius: 5px; background: var(--app-surface); color: var(--app-text); font-size: 12px; font-weight: 650; }
+.agent-task-control.resume { background: var(--app-accent); color: var(--app-accent-ink); }
+.agent-task-control svg { flex-shrink: 0; }
+.agent-task-control:disabled { opacity: 0.55; cursor: not-allowed; }
 .agent-progress-step { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-progress-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .icon-button { display: inline-grid; place-items: center; width: 30px; height: 30px; flex: 0 0 30px; border: 1px solid var(--app-border); border-radius: 5px; background: transparent; padding: 0; color: var(--app-text); }

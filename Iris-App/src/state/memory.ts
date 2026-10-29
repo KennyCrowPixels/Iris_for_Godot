@@ -2,7 +2,7 @@
 // Thin, resilient wrappers around Tauri commands.
 // If Tauri isn't injected yet, we return safe defaults instead of throwing.
 
-export type ChatMessage = { role: "user" | "llm"; text: string; time?: number };
+export type ChatMessage = { role: "user" | "llm"; text: string; time?: number; thinkingLog?: unknown; images?: string[] };
 
 export type Artifact = {
   filename?: string | null;
@@ -138,6 +138,8 @@ export async function persistSnapshot(tabId: number, snapshotLike: Snapshot): Pr
       role: m.role,
       text: m.text,
       time: typeof m.time === "number" ? m.time : now,
+      ...(m.thinkingLog && typeof m.thinkingLog === "object" ? { thinkingLog: m.thinkingLog } : {}),
+      ...(Array.isArray(m.images) && m.images.length ? { images: m.images } : {}),
     }));
     const snapToSend: Snapshot = {
       tab_id: tabId,

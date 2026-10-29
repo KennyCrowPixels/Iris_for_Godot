@@ -3,7 +3,8 @@ import ReactMarkdown from 'react-markdown';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { Activity, ArrowDown, ArrowUp, BookOpen, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, PanelRightClose, PanelRightOpen, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, X } from "lucide-react";
+import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
+import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, X } from "lucide-react";
 import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
 import { themeTokens } from "./lib/theme";
 import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
@@ -26,6 +27,7 @@ import {
   insertLLMBubble,
   patchLastLLMBubble,
   clearProvisionalReply,
+  reorderTabs,
   extractArtifacts,
 } from "./state/tabs";
 import useOllamaStream from "./hooks/useOllamaStream";
@@ -538,6 +540,7 @@ type ResolvePermissionPayload = {
 type IrisEvent =
   | { type: "Status"; payload: string }
   | { type: "AgentProgress"; payload: AgentTaskProgress }
+  | { type: "Reasoning"; payload: string }
   | { type: "Delta"; payload: string }
   | { type: "ResetAnswer" }
   | { type: "GodotError"; payload: string }
@@ -3010,6 +3013,8 @@ function App() {
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [chatDragActive, setChatDragActive] = useState(false);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
+  const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
+  const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [messageLogViewer, setMessageLogViewer] = useState<MessageLogViewerState | null>(null);
   const [autonomousPanelEnabled, setAutonomousPanelEnabled] = useState<boolean>(() => readAutonomousPanelPrefs().enabled);
   const [autonomousPanelCollapsed, setAutonomousPanelCollapsed] = useState<boolean>(() => readAutonomousPanelPrefs().collapsed);
@@ -3030,13 +3035,13 @@ function App() {
     { id: 1, title: "Tab #1", type: "chat", messages: [], promptHistory: [] }
   ]);
   const [activeTab, setActiveTab] = useState(1);
+  const lastContextChatRef = useRef(1);
   const [readinessChecklistHidden, setReadinessChecklistHidden] = useState(() => {
     try { return localStorage.getItem("iris.ui.readinessChecklistHidden") === "true"; }
     catch { return false; }
   });
   const [editingTabId, setEditingTabId] = useState<number | null>(null);
   const [editingTabTitle, setEditingTabTitle] = useState("");
-  const [draggingTabId, setDraggingTabId] = useState<number | null>(null);
   const [openMenu, setOpenMenu] = useState<null | "file" | "options">(null);
   const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
   const abortController = useRef<AbortController | null>(null);
@@ -3433,9 +3438,14 @@ function App() {
     promptHistoryDraftRef.current = "";
   }, [activeTab]);
   const activeProject = repoStore.projects.find((p) => p.id === activeProjectId) || null;
+  useEffect(() => {
+    if (currentTab?.type === "chat") lastContextChatRef.current = activeTab;
+  }, [activeTab, currentTab?.type]);
+  const contextChat = currentTab?.type === "chat" ? currentTab : tabs.find((tab) => tab.id === lastContextChatRef.current && tab.type === "chat") ?? tabs.find((tab) => tab.type === "chat");
+  const contextProject = repoStore.projects.find((project) => project.id === (contextChat ? tabProjectMap[contextChat.id] : null) && project.enabled);
+  const contextMcpCount = repoStore.mcps.filter((connection) => connection.enabled && contextProject?.mcpIds.includes(connection.id)).length;
   const activeProjectMcpIds = new Set((activeProject?.mcpIds || []).map((id) => String(id)));
   const activeProjectSshIds = new Set((activeProject?.sshIds || []).map((id) => String(id)));
-  const activeProjectHasEnabledMcp = !!activeProject && repoStore.mcps.some((m) => m.enabled && activeProjectMcpIds.has(String(m.id)));
   const launchableProjectMcps = activeProject
     ? repoStore.mcps.filter((m) => {
         if (!m.enabled || !activeProjectMcpIds.has(String(m.id))) return false;
@@ -3756,7 +3766,7 @@ function App() {
   const liveTokenBudget = organizerNumCtxLive;
   const livePlannerTokenBudget = derivePlannerTokenBudget(llmProfile, organizerNumCtxLive);
   const reposContextActive = reposEnabled;
-  const mcpContextActive = mcpEnabled && activeProjectHasEnabledMcp;
+  const mcpContextActive = mcpEnabled && contextMcpCount > 0;
   const safeStringify = (v: unknown) => {
     try { return JSON.stringify(v); } catch { return "__ERR__"; }
   };
@@ -5172,6 +5182,9 @@ function App() {
         case "AgentProgress":
           setAgentProgressByTab((previous) => ({ ...previous, [currentTabId]: incoming.payload }));
           break;
+        case "Reasoning":
+          appendWorkLog(currentTabId, incoming.payload);
+          break;
         case "Delta":
           rustHadDeltaByTabRef.current[currentTabId] = true;
           queueRustDelta(currentTabId, String(incoming.payload || ""));
@@ -5549,19 +5562,8 @@ function App() {
     setEditingTabTitle("");
   }
 
-  function moveChatTab(dragTabId: number, targetTabId: number) {
-    if (dragTabId === targetTabId) return;
-    setTabs(prev => {
-      const utilityTabs = prev.filter(tab => tab.type !== "chat");
-      const chatTabs = prev.filter(tab => tab.type === "chat");
-      const fromIndex = chatTabs.findIndex(tab => tab.id === dragTabId);
-      const toIndex = chatTabs.findIndex(tab => tab.id === targetTabId);
-      if (fromIndex === -1 || toIndex === -1) return prev;
-      const reordered = [...chatTabs];
-      const [moved] = reordered.splice(fromIndex, 1);
-      reordered.splice(toIndex, 0, moved);
-      return [...reordered, ...utilityTabs];
-    });
+  function moveWorkspaceTab(dragTabId: number, targetTabId: number) {
+    setTabs(prev => reorderTabs(prev, dragTabId, targetTabId));
   }
 
   function removeImageFromMessage(tabId: number, msgIndex: number, imageIndex: number) {
@@ -5661,7 +5663,7 @@ function App() {
       ? (msg.thinkingLog as IrisMessageThinkingLog)
       : null;
     setMessageLogViewer({
-      title: `${assistantLabel} response #${idx + 1}`,
+      title: `${assistantLabel} reasoning log / response #${idx + 1}`,
       timestamp: formatMessageTimestamp(msg.time) || "(no timestamp)",
       log,
     });
@@ -5848,6 +5850,8 @@ function App() {
   ): Promise<AgentTaskProgress | null> {
     if (activeRustRequestRef.current !== null) throw new Error("An agent task is already running. Stop it before starting another.");
     activeRustRequestRef.current = requestTabId;
+    clearWorkLog(requestTabId);
+    clearActionTrace(requestTabId);
     setIsGenerating(true);
     setRespondingTab(requestTabId);
     setRustEngineStatus("Preparing local agent...");
@@ -5874,7 +5878,15 @@ function App() {
         rustDeltaQueueByTabRef.current[requestTabId] = "";
         appendRustDelta(requestTabId, pending);
       }
-      return await invoke<AgentTaskProgress | null>("get_agent_task", { tabId: requestTabId });
+      const progress = await invoke<AgentTaskProgress | null>("get_agent_task", { tabId: requestTabId });
+      if (progress) setAgentProgressByTab((previous) => ({ ...previous, [requestTabId]: progress }));
+      const saved = await readTabSnapshot(requestTabId).catch(() => null);
+      const reply = saved ? normalizeMessages(saved.messages).slice().reverse().find((message) => message.role === "llm") : null;
+      if (reply?.thinkingLog) updateTabMessages(requestTabId, (messages) => {
+        const last = messages.length - 1;
+        return messages.map((message, index) => index === last && message.role === "llm" && message.text === reply.text ? { ...message, thinkingLog: reply.thinkingLog } : message);
+      });
+      return progress;
     } catch (error) {
       const message = String((error as Error)?.message || error);
       setRustEngineStatus(message);
@@ -9405,10 +9417,17 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
   function autoResize() {
     const el = inputRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    const singleLineHeight = 24;
-    const maxHeight = singleLineHeight * 8;
-    el.style.height = Math.min(el.scrollHeight, maxHeight) + "px";
+    const styles = getComputedStyle(el);
+    const lineHeight = parseFloat(styles.lineHeight) || 22;
+    const padding = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
+    const border = parseFloat(styles.borderTopWidth) + parseFloat(styles.borderBottomWidth);
+    const maxHeight = lineHeight * 8 + padding + border;
+    el.style.overflowY = "hidden";
+    el.style.height = "0px";
+    const contentHeight = el.scrollHeight + border;
+    el.style.maxHeight = `${maxHeight}px`;
+    el.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+    el.style.overflowY = contentHeight > maxHeight + 1 ? "auto" : "hidden";
   }
 
   function stopRustDeltaDrain(tabId: number) {
@@ -9466,27 +9485,36 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     startRustDeltaDrain(tabId);
   }
 
-  async function copyChatMessageText(text: string) {
+  async function copyChatMessageText(text: string, key: string) {
     const value = String(text || "");
     if (!value.trim()) return;
     try {
       await navigator.clipboard.writeText(value);
-      setRustEngineStatus("Copied message to clipboard.");
-      window.setTimeout(() => {
-        setRustEngineStatus((current) => (current === "Copied message to clipboard." ? "" : current));
-      }, 1200);
+      if (copyFeedbackTimerRef.current) clearTimeout(copyFeedbackTimerRef.current);
+      setCopiedMessageKey(key);
+      copyFeedbackTimerRef.current = setTimeout(() => setCopiedMessageKey(null), 1800);
     } catch (err) {
       console.warn("Failed to copy chat message", err);
-      setRustEngineStatus("Copy failed.");
+      showRuntimeToast("Could not copy the message to the clipboard.");
     }
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     autoResize();
-  }, [input]);
+  }, [input, activeTab]);
+
+  useEffect(() => {
+    if (currentTab?.type !== "chat" || isGenerating || !(window as any).__TAURI_INTERNALS__) return;
+    let disposed = false;
+    void invoke<AgentTaskProgress | null>("get_agent_task", { tabId: activeTab }).then((progress) => {
+      if (progress && !disposed) setAgentProgressByTab((previous) => ({ ...previous, [activeTab]: progress }));
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [activeTab, currentTab?.type, isGenerating]);
 
   useEffect(() => {
     return () => {
+      if (copyFeedbackTimerRef.current) clearTimeout(copyFeedbackTimerRef.current);
       for (const key of Object.keys(rustDeltaDrainTimerByTabRef.current)) {
         const timer = rustDeltaDrainTimerByTabRef.current[Number(key)];
         if (timer) clearInterval(timer);
@@ -10652,28 +10680,22 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       </div>
 
       <div className="tab-bar">
-        {tabs.map(tab => (
+        <DragDropContext onDragEnd={({ draggableId, destination }) => {
+          if (destination && tabs[destination.index]) moveWorkspaceTab(Number(draggableId), tabs[destination.index].id);
+        }}>
+        <Droppable droppableId="workspace-tabs" direction="horizontal">
+          {(dropProvided) => <div className="tab-list" ref={dropProvided.innerRef} {...dropProvided.droppableProps}>
+        {tabs.map((tab, index) => (
+          <Draggable key={tab.id} draggableId={String(tab.id)} index={index} isDragDisabled={editingTabId !== null} disableInteractiveElementBlocking>
+          {(dragProvided, dragState) => (
           <div
-            key={tab.id}
-            className={`tab-wrapper${tab.id === activeTab ? " active" : ""}${draggingTabId === tab.id ? " dragging" : ""}`}
-            draggable={tab.type === "chat"}
-            onDragStart={() => {
-              if (tab.type !== "chat") return;
-              setDraggingTabId(tab.id);
-            }}
-            onDragOver={(e) => {
-              if (tab.type !== "chat" || draggingTabId == null || draggingTabId === tab.id) return;
-              e.preventDefault();
-            }}
-            onDrop={(e) => {
-              if (tab.type !== "chat" || draggingTabId == null) return;
-              e.preventDefault();
-              moveChatTab(draggingTabId, tab.id);
-              setDraggingTabId(null);
-            }}
-            onDragEnd={() => setDraggingTabId(null)}
+            ref={dragProvided.innerRef}
+            {...dragProvided.draggableProps}
+            className={`tab-wrapper${tab.id === activeTab ? " active" : ""}${dragState.isDragging ? " dragging" : ""}`}
           >
             <button
+              {...dragProvided.dragHandleProps}
+              type="button"
               className={tab.id === activeTab ? "tab active" : "tab"}
               onClick={() => setActiveTab(tab.id)}
               onDoubleClick={() => {
@@ -10717,7 +10739,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               </button>
             )}
           </div>
+          )}
+          </Draggable>
         ))}
+          {dropProvided.placeholder}
+          </div>}
+        </Droppable>
+        </DragDropContext>
         {canAddChatTab && (
           <button
             type="button"
@@ -11126,7 +11154,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <button type="button" className="setup-btn" onClick={() => setMessageLogViewer(null)}>Close</button>
             </div>
             {!messageLogViewer.log ? (
-              <div style={{ fontSize: 13, opacity: 0.84 }}>No thinking log was captured for this message.</div>
+              <div style={{ fontSize: 13, opacity: 0.84 }}>No reasoning log was saved with this older message.</div>
             ) : (
               <div style={{ display: "grid", gap: 12, fontSize: 12, lineHeight: 1.5 }}>
                 <div><strong>Planner:</strong> {messageLogViewer.log.plannerPath || "(n/a)"} | {messageLogViewer.log.plannerIntent || "(n/a)"} | {messageLogViewer.log.plannerStrategy || "(n/a)"}</div>
@@ -11135,7 +11163,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}</div>
                 <div><strong>Phase hints:</strong> {messageLogViewer.log.plannerPhase || "(n/a)"}{messageLogViewer.log.plannerResumeHint ? ` | ${messageLogViewer.log.plannerResumeHint}` : ""}{messageLogViewer.log.checkpointCount ? ` | checkpoints: ${messageLogViewer.log.checkpointCount}` : ""}</div>
                 <div>
-                  <strong>Work log</strong>
+                  <strong>Reasoning summaries</strong>
                   <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
                     {messageLogViewer.log.workLog.length
                       ? messageLogViewer.log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n")
@@ -11230,23 +11258,24 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   onMouseEnter={() => setHoveredMessageKey(key)}
                   onMouseLeave={() => setHoveredMessageKey((prev) => (prev === key ? null : prev))}
                 >
-                  <div className={`bubble-meta ${isHovered ? "show" : ""}`}>
+                  <div className={`bubble-meta ${isHovered || copiedMessageKey === key ? "show" : ""}`}>
                     {timestamp ? <span>{timestamp}</span> : null}
                     <button
                       type="button"
                       className="bubble-copy-btn"
-                      title="Copy message"
-                      aria-label="Copy message"
-                      onClick={() => void copyChatMessageText(msg.text)}
+                      title={copiedMessageKey === key ? "Copied to clipboard" : "Copy message"}
+                      aria-label={copiedMessageKey === key ? "Copied to clipboard" : "Copy message"}
+                      onClick={() => void copyChatMessageText(msg.text, key)}
                     >
-                      <Copy size={13} />
+                      {copiedMessageKey === key ? <Check size={16} /> : <Copy size={13} />}
                     </button>
+                    {copiedMessageKey === key && <span role="status" className="copy-feedback">Copied</span>}
                     {msg.role === "llm" && (
                       <button
                         type="button"
                         className="bubble-copy-btn"
-                        title="View activity log"
-                        aria-label="View activity log"
+                        title="View reasoning log"
+                        aria-label="View reasoning log"
                         onClick={() => openMessageThinkingLog(msg as Message, idx)}
                       >
                         <ClipboardList size={13} />
@@ -11599,10 +11628,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               type="button"
               className="autonomous-reveal-handle"
               onClick={() => setAutonomousPanelCollapsed(false)}
-              title="Show autonomous tasks panel"
+              title="Show Auto Tasks"
               aria-label="Show Auto Tasks"
+              aria-expanded={false}
             >
-              <PanelRightOpen size={16} />
+              <ArrowRight size={20} aria-hidden="true" />
             </button>
           )}
 
@@ -11615,7 +11645,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <div className="autonomous-overlay" onClick={() => setAutonomousThoughtsTaskId(null)}>
                 <div className="autonomous-modal" onClick={(e) => e.stopPropagation()}>
                   <div className="autonomous-modal-top">
-                    <strong>{task.title || "Task"} activity</strong>
+                    <strong>{task.title || "Task"} reasoning log</strong>
                     <button type="button" className="setup-btn" onClick={() => setAutonomousThoughtsTaskId(null)}>Close</button>
                   </div>
                   <div style={{ marginBottom: 10, fontSize: 12, opacity: 0.9 }}>
@@ -12741,8 +12771,20 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 Configure external MCP and SSH endpoints Iris can use. Projects can opt into one or more bridge connections.
               </p>
               <div style={{ marginBottom: 12, border: "1px solid var(--app-border)", background: isLightMode ? "rgba(86, 112, 138, 0.14)" : "#17202a", borderRadius: 8, padding: "9px 10px" }}>
-                <div style={{ fontSize: 12, color: isLightMode ? "#2f4359" : "#cfd9e8" }}>
-                  MCP context is now implicit: Iris enables bridge context when your active chat is linked to a project that has at least one enabled MCP connection.
+                <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14 }}>
+                  <input type="checkbox" checked={mcpEnabled} disabled={menuLocked} onChange={async (event) => {
+                    const enabled = event.target.checked;
+                    try {
+                      await invoke("set_setup_flags", { args: { mcpEnabled: enabled } });
+                      setMcpEnabled(enabled);
+                    } catch (error) { showRuntimeToast(`Could not update MCP access: ${String(error)}`); }
+                  }} />
+                  Enable MCP access
+                </label>
+                <div className="mcp-context-status" role="status">
+                  <strong>MCP context: {mcpContextActive ? "ON" : "OFF"}</strong>
+                  <span>{contextChat?.title || "No chat selected"} / {contextProject?.name || "No linked project"}</span>
+                  <span>{!mcpEnabled ? "MCP access is disabled." : !contextProject ? "This chat has no enabled project linked." : contextMcpCount ? `${contextMcpCount} enabled project bridge${contextMcpCount === 1 ? "" : "s"}` : "This project has no enabled MCP bridge linked."}</span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
                   <button
@@ -12760,7 +12802,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   </span>
                 </div>
                 <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
-                  Active MCP context right now: {mcpContextActive ? "ON" : "OFF"}. Desktop Tools OFF prevents any automatic window/screenshot routine.
+                  Desktop tools: {desktopToolsEnabled ? "ON" : "OFF"}
                 </div>
               </div>
               <div className="llm-settings-actions" style={{ marginBottom: 12 }}>
@@ -14059,12 +14101,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         {(() => {
           const progress = agentProgressByTab[activeTab];
           const running = isGenerating && respondingTab === activeTab;
-          const status = running ? activeInlinePermission ? "Awaiting approval" : "Working" : progress?.status === "completed" ? "Ready" : progress?.status || "Ready";
+          const resumable = !!progress && !running && progress.status !== "completed";
+          const status = running ? activeInlinePermission ? "Awaiting approval" : "Working" : resumable ? "Paused: progress saved" : "Ready";
           const elapsed = Math.max(0, Math.floor((runtimeNow - (agentStartedAtByTab[activeTab] || runtimeNow)) / 1000));
           const task = autonomousTasks.find((item) => autonomousRuntimeById[item.id]?.linkedTabId === activeTab);
           const activity = (workLogByTab[activeTab] || []).slice(-8);
           return <div className="agent-status-area">
-          <div className="agent-progress-strip">
+          <div className={`agent-progress-strip${resumable ? " paused" : ""}`}>
             <Activity size={15} aria-hidden="true" />
             <span className="agent-progress-status" role="status" aria-live="polite">{status}</span>
             <span className="agent-progress-step" title={agentStatusByTab[activeTab]}>{running ? agentStatusByTab[activeTab] || "Preparing" : progress?.currentStep || progress?.model || "Local agent"}</span>
@@ -14081,19 +14124,19 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               } catch (error) { showRuntimeToast(String(error)); }
             }}><BookOpen size={16} /></button>
             {running ? (
-              <button type="button" className="icon-button" title="Pause and save progress" aria-label="Pause and save progress" onClick={() => {
+              <button type="button" className="agent-task-control" title="Pause and save progress" aria-label="Pause and save progress" onClick={() => {
                 if (task) void toggleAutonomousPause(task.id);
                 else void invoke("cancel_agent_turn", { tabId: activeTab }).catch((error) => showRuntimeToast(String(error)));
-              }}><Pause size={16} /></button>
+              }}><Pause size={18} /> Pause</button>
             ) : progress.status !== "completed" ? (
-              <button type="button" className="icon-button" title="Resume saved task" aria-label="Resume saved task" disabled={isGenerating} onClick={() => {
+              <button type="button" className="agent-task-control resume" title="Resume saved task" aria-label="Resume saved task" disabled={isGenerating} onClick={() => {
                 if (task) void toggleAutonomousPause(task.id);
                 else void sendRustTurn(activeTab, "Continue the saved task from its notes; inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null, networkEnabledRef.current, true);
-              }}><Play size={16} /></button>
+              }}><Play size={18} /> Resume</button>
             ) : null}
             </>}
           </div>
-          {!!activity.length && <details className="agent-activity"><summary>Recent activity</summary><ol>{activity.map((entry, index) => <li key={`${entry.ts}_${index}`}>{entry.text}</li>)}</ol></details>}
+          {!!activity.length && <details className="agent-activity"><summary>Reasoning log</summary><ol>{activity.map((entry, index) => <li key={`${entry.ts}_${index}`}>{entry.text}</li>)}</ol></details>}
           </div>;
         })()}
         {hwToast && (

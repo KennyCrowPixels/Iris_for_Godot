@@ -11,7 +11,35 @@ async function loadTypescript(relative) {
 const { readOllamaStream } = await loadTypescript("../src/hooks/useOllamaStream.ts");
 const { themeTokens } = await loadTypescript("../src/lib/theme.ts");
 const { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } = await loadTypescript("../src/lib/automation.ts");
-const { patchLastLLMBubble, clearProvisionalReply } = await loadTypescript("../src/state/tabs.ts");
+const { patchLastLLMBubble, clearProvisionalReply, reorderTabs } = await loadTypescript("../src/state/tabs.ts");
+const { persistSnapshot } = await loadTypescript("../src/state/memory.ts");
+
+test("snapshot updates retain saved reasoning logs", async () => {
+  const originalWindow = globalThis.window;
+  let saved;
+  globalThis.window = { __TAURI__: { core: { invoke: async (command, args) => {
+    assert.equal(command, "update_snapshot_memory");
+    saved = args.args.snapshot;
+  } } } };
+  try {
+    const log = { workLog: [{ ts: 1, text: "Reviewed actual evidence" }] };
+    await persistSnapshot(1, { title: "Renamed", messages: [{ role: "llm", text: "Answer", thinkingLog: log }], artifacts: [], summary: "", microSummary: "", dialogueBullets: "" });
+    assert.deepEqual(saved.messages[0].thinkingLog, log);
+    assert.equal(saved.title, "Renamed");
+  } finally { globalThis.window = originalWindow; }
+});
+
+test("tab reordering preserves chat data, utility tabs, and stable identities", () => {
+  const tabs = [{ id: 1, type: "chat", messages: [{ text: "saved conversation" }] }, { id: 2, type: "settings" }, { id: 3, type: "chat", title: "Renamed" }];
+  const reordered = reorderTabs(tabs, 3, 1);
+  assert.deepEqual(reordered.map((tab) => tab.id), [3, 1, 2]);
+  assert.equal(reordered[0], tabs[2]);
+  assert.equal(reordered[1], tabs[0]);
+  assert.equal(reordered[2], tabs[1]);
+  assert.deepEqual(tabs.map((tab) => tab.id), [1, 2, 3]);
+  assert.equal(reorderTabs(tabs, 99, 1), tabs);
+  assert.equal(reorderTabs(tabs, 1, 1), tabs);
+});
 
 test("invalid provisional controller text is removed without touching earlier turns", () => {
   const earlier = [{role:"user",text:"hello"},{role:"llm",text:"Hello!"},{role:"user",text:"search"}];

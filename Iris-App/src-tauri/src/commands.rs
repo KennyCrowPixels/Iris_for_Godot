@@ -190,6 +190,7 @@ pub struct OllamaChatStreamChunk {
 #[allow(dead_code)]
 pub enum IrisEvent {
   Status(String),
+  Reasoning(String),
   AgentProgress(Value),
   Delta(String),
   ResetAnswer,
@@ -2310,7 +2311,7 @@ fn persist_rust_turn_snapshot(
       role: "llm".to_string(),
       text: assistant_text.to_string(),
       time: ts,
-      thinking_log: None,
+      thinking_log: agent_executor::message_reasoning_log(app,tab_id,assistant_text),
     });
   }
   if snap.title.trim().is_empty() {
