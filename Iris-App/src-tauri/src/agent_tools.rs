@@ -203,11 +203,22 @@ fn extract_web_content(body: &str, content_type: &str, url: &str, offset: usize)
     Ok(serde_json::json!({"url":url,"title":excerpt(&title,200),"publishedAt":published,"retrievedAt":now_ts(),"evidenceKind":"page_text","page":paged_text(&normalized,offset,6000),"links":links}))
 }
 
+pub(super) fn requires_plan(tool: &str, args: &Value) -> bool {
+    match tool {
+        "project_files" => !matches!(args["action"].as_str(), Some("list" | "search" | "read")),
+        "ssh_action" => !matches!(args["action"].as_str(), Some("list" | "read")),
+        "desktop_action" => args["action"].as_str() != Some("list"),
+        "call_project_tool" => args["effect"].as_str() != Some("read"),
+        "clone_repository" => true,
+        _ => false,
+    }
+}
+
 pub(super) async fn execute(
     app: &tauri::AppHandle, window: &tauri::Window, event_name: &str, control: &RunControl,
     task: &AgentTask, tool: &str, args: &Value, policy_read_only: bool,
 ) -> Result<AgentToolResult, String> {
-    if matches!(tool,"call_project_tool"|"project_files"|"ssh_action"|"desktop_action"|"clone_repository") && task.steps.is_empty() {
+    if requires_plan(tool,args) && task.steps.is_empty() {
         return Err("Plan small steps with verifiable acceptance criteria before project/desktop work".into());
     }
     let mut attempted_mutation = false;
@@ -215,7 +226,7 @@ pub(super) async fn execute(
     let result: Result<Value,String> = async { Ok(match tool {
         "project_connections" => {
             let (project,store) = project_for_task(app,task)?;
-            serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description},
+            serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
                 "mcps":store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>(),
                 "sshs":store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>(),
                 "repositories":store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>()})
@@ -237,6 +248,7 @@ pub(super) async fn execute(
                 if let Err(err) = validator.validate(&arguments) { return Err(format!("MCP arguments failed validation: {err}. Correct them; no call was made.")); }
                 let read_only_hint = entry.annotations.get("readOnlyHint").and_then(Value::as_bool);
                 let read_only = read_only_hint.unwrap_or(args.get("effect").and_then(Value::as_str)==Some("read"));
+                if !read_only && task.steps.is_empty() { return Err("This MCP operation changes state. Create a small verifiable plan before executing it.".into()); }
                 if policy_read_only && read_only_hint != Some(true) {return Err("Read-only policy requires an explicitly read-only MCP capability".into());}
                 verifies_state = read_only;
                 if read_only_hint != Some(true) {
@@ -318,6 +330,21 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_can_inform_a_plan_but_mutations_still_require_one() {
+        for (tool,args) in [
+            ("list_project_tools",json!({"connection_id":"godot"})),
+            ("project_files",json!({"action":"read"})),
+            ("project_files",json!({"action":"search"})),
+            ("call_project_tool",json!({"effect":"read"})),
+            ("ssh_action",json!({"action":"list"})),
+            ("desktop_action",json!({"action":"list"})),
+        ] { assert!(!requires_plan(tool,&args),"{tool}"); }
+        assert!(requires_plan("project_files",&json!({"action":"write"})));
+        assert!(requires_plan("call_project_tool",&json!({"effect":"write"})));
+        assert!(requires_plan("ssh_action",&json!({"action":"exec"})));
+    }
 
     #[test]
     fn web_content_prefers_article_and_excludes_hidden_scripts() {

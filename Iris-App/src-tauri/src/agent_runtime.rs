@@ -45,6 +45,14 @@ impl ResearchBudget {
 }
 
 impl ModelBudget {
+    pub fn apply_persistence_mode(&mut self, mode: &str) {
+        let multiplier=if mode=="testing" {3} else {2};
+        self.max_actions=self.max_actions.saturating_mul(multiplier).min(192);
+        self.research.max_searches=self.research.max_searches.saturating_mul(multiplier).min(40);
+        self.research.max_reads=self.research.max_reads.saturating_mul(multiplier).min(60);
+        self.research.max_reviews=self.research.max_reviews.saturating_mul(multiplier).max(12).min(36);
+    }
+
     pub fn for_capacity(memory_gib: u64, model_billions: f64, model_context: usize) -> Self {
         let constrained = memory_gib < 12 || (memory_gib <= 16 && model_billions >= 12.0);
         let context_tokens = if constrained { 4096 } else if memory_gib <= 16 { 8192 } else { 16384 }
@@ -318,6 +326,16 @@ pub fn excerpt(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_modes_expand_work_not_context_or_permissions() {
+        let mut balanced=ModelBudget::for_capacity(16,7.0,8192);
+        let mut testing=balanced.clone();
+        balanced.apply_persistence_mode("balanced");testing.apply_persistence_mode("testing");
+        assert!(testing.max_actions>balanced.max_actions);
+        assert_eq!(testing.context_tokens,balanced.context_tokens);
+        assert!(testing.max_actions<=192);
+    }
 
     #[test]
     fn research_capacity_scales_without_forcing_a_search_count() {

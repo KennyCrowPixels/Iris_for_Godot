@@ -514,6 +514,7 @@ type UserTurnPayload = {
   images: string[];
   associated_project_id?: string | null;
   network_allowed?: boolean;
+  resume_task?: boolean;
 };
 
 type AgentTaskProgress = {
@@ -5365,7 +5366,7 @@ function App() {
     }
     if (useRustEngine && action === "resume") {
       if (activeRustRequestRef.current !== null) return false;
-      return (await sendRustTurn(activeTab, "Continue the saved task from its notes. Inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null)) !== null;
+      return (await sendRustTurn(activeTab, "Continue the saved task from its notes. Inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null, networkEnabledRef.current, true)) !== null;
     }
     if (useRustEngine && activeRustRequestRef.current !== null) return false;
     try {
@@ -5843,6 +5844,7 @@ function App() {
     images: string[],
     projectId: string | null,
     networkAllowed = networkEnabledRef.current,
+    resumeTask = false,
   ): Promise<AgentTaskProgress | null> {
     if (activeRustRequestRef.current !== null) throw new Error("An agent task is already running. Stop it before starting another.");
     activeRustRequestRef.current = requestTabId;
@@ -5863,7 +5865,7 @@ function App() {
       if (inputText) updateTabPromptHistory(requestTabId, inputText);
       const payload: UserTurnPayload = {
         tab_id: requestTabId, input_text: inputText, images,
-        associated_project_id: projectId, network_allowed: networkAllowed,
+        associated_project_id: projectId, network_allowed: networkAllowed, resume_task: resumeTask,
       };
       await invoke("submit_turn", { payload });
       const pending = rustDeltaQueueByTabRef.current[requestTabId] || "";
@@ -10509,11 +10511,6 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           </div>
         </div>
       )}
-        {hwToast && (
-          <div className="hw-toast-root" role="status" onClick={() => setHwToast(null)}>
-            {hwToast}
-          </div>
-        )}
       <div
         className={`chat-root${isLightMode ? " light-theme" : ""}`}
         data-theme={themePreset}
@@ -14091,7 +14088,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             ) : progress.status !== "completed" ? (
               <button type="button" className="icon-button" title="Resume saved task" aria-label="Resume saved task" disabled={isGenerating} onClick={() => {
                 if (task) void toggleAutonomousPause(task.id);
-                else void sendRustTurn(activeTab, "Continue the saved task from its notes; inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null);
+                else void sendRustTurn(activeTab, "Continue the saved task from its notes; inspect uncertain state before retrying.", [], tabProjectMap[activeTab] ?? null, networkEnabledRef.current, true);
               }}><Play size={16} /></button>
             ) : null}
             </>}
@@ -14099,6 +14096,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
           {!!activity.length && <details className="agent-activity"><summary>Recent activity</summary><ol>{activity.map((entry, index) => <li key={`${entry.ts}_${index}`}>{entry.text}</li>)}</ol></details>}
           </div>;
         })()}
+        {hwToast && (
+          <div className="runtime-notice" role="status">
+            <Activity size={14} aria-hidden="true" />
+            <span>{hwToast}</span>
+            <button type="button" className="icon-button" title="Dismiss notification" aria-label="Dismiss notification" onClick={() => setHwToast(null)}><X size={14} /></button>
+          </div>
+        )}
         {activeInlinePermission && (
           <div className="inline-permission-card">
             <div className="inline-permission-title">{activeInlinePermission.title}</div>

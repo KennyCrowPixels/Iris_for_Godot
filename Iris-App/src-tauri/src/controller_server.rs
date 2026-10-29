@@ -150,7 +150,7 @@ async fn submit(State(state): State<ControllerState>, ApiPath(tab_id): ApiPath<u
             let _=state.app.emit("controller-chat-updated",json!({"tabId":tab_id}));
             return;
         }
-        let turn=submit_turn(state.app.clone(),UserTurnPayload {tab_id,input_text:body.input,images:vec![],associated_project_id:None,network_allowed:Some(body.network_allowed)},window);
+        let turn=submit_turn(state.app.clone(),UserTurnPayload {tab_id,input_text:body.input,images:vec![],associated_project_id:None,network_allowed:Some(body.network_allowed),resume_task:false},window);
         tokio::pin!(turn);
         let mut interval=tokio::time::interval(Duration::from_millis(200));
         let result=loop {

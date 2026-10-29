@@ -1852,6 +1852,10 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .inline-permission-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-progress-strip { display: flex; align-items: center; gap: 9px; padding: 5px 20px; min-height: 34px; background: transparent; color: var(--app-muted); font-size: 11px; flex-shrink: 0; }
 .agent-status-area { flex-shrink: 0; border-top: 1px solid var(--app-border); background: var(--app-panel-bg); }
+.runtime-notice { display: flex; align-items: center; gap: 9px; flex: 0 0 auto; box-sizing: border-box; width: 100%; min-height: 34px; padding: 4px 20px; border-top: 1px solid var(--app-border); background: var(--app-panel-bg); color: var(--app-muted); font-size: 12px; }
+.runtime-notice > svg { color: var(--app-accent); flex-shrink: 0; }
+.runtime-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.runtime-notice .icon-button { width: 26px; height: 26px; flex-basis: 26px; border: 0; }
 .agent-progress-strip .icon-button { width: 26px; height: 26px; flex-basis: 26px; border: 0; }
 .agent-network-state { color: var(--app-muted); white-space: nowrap; }
 .agent-activity { border-top: 1px solid var(--app-border); padding: 4px 20px; font-size: 11px; color: var(--app-muted); }

@@ -10,6 +10,7 @@ const networkTest = process.argv.includes("--network");
 const weatherTest = process.argv.includes("--weather");
 const serviceTest = process.argv.includes("--services");
 const controllerTest = process.argv.includes("--controller");
+const resumeTest = process.argv.includes("--resume");
 const promptIndex = process.argv.indexOf("--prompt");
 const prompt = promptIndex >= 0 ? process.argv[promptIndex + 1] : "";
 const fresh = process.argv.includes("--fresh");
@@ -22,7 +23,7 @@ await new Promise((resolve, reject) => {
   socket.addEventListener("error", reject, { once: true });
 });
 
-async function nativeTurn({ tabId: testTab, toolTest: useTool, networkTest: useNetwork, weatherTest: useWeather, serviceTest: checkServices, fresh: createFresh, prompt: customPrompt }) {
+async function nativeTurn({ tabId: testTab, toolTest: useTool, networkTest: useNetwork, weatherTest: useWeather, serviceTest: checkServices, fresh: createFresh, prompt: customPrompt, resumeTest: testResume }) {
   const invoke = window.__TAURI__.core.invoke;
   if (checkServices) {
     return { server: await invoke("get_server_status"), search: await invoke("test_network_search", { query: "newest Adventure Time series official announcement" }), weather: await invoke("weather_lookup", { location: "Durham, NC", dayOffset: 0 }) };
@@ -55,12 +56,19 @@ async function nativeTurn({ tabId: testTab, toolTest: useTool, networkTest: useN
       images: [], associated_project_id: null, network_allowed: useNetwork || useWeather,
     } });
     const task = await invoke("get_agent_task", { tabId: testTab });
+    let resumed = null;
+    if (testResume && task.status !== "completed") {
+      await invoke("submit_turn", {payload:{tab_id:testTab,input_text:"Continue the saved task from its notes; inspect uncertain state before retrying.",images:[],associated_project_id:null,network_allowed:useNetwork||useWeather,resume_task:true}});
+      const after=await invoke("get_agent_task", {tabId:testTab});
+      resumed={sameTask:after.id===task.id,sameGoal:after.goal===task.goal,actionsAdded:after.totalActions-task.totalActions,status:after.status};
+    }
     const proficiency = useNetwork || useWeather ? await invoke("get_agent_proficiency") : null;
     return {
       id: task.id, status: task.status, actions: task.totalActions, steps: task.steps.length,
       deltas, firstDeltaMs, permissions,
       tools: task.observations.map((entry) => ({ tool: entry.tool, ok: entry.ok, summary: entry.summary })),
       answer: task.lastMessage,
+      resumed,
       research: proficiency?.research?.find((report) => report.taskId === task.id),
     };
   } finally {
@@ -142,7 +150,7 @@ try {
   if (controllerTest) {
     console.log(JSON.stringify(await controllerSmoke(), null, 2));
   } else {
-  const message = await evaluate(`(${nativeTurn.toString()})(${JSON.stringify({ tabId, toolTest, networkTest, weatherTest, serviceTest, fresh, prompt })})`);
+  const message = await evaluate(`(${nativeTurn.toString()})(${JSON.stringify({ tabId, toolTest, networkTest, weatherTest, serviceTest, fresh, prompt, resumeTest })})`);
   console.log(JSON.stringify(message, null, 2));
   if (serviceTest) {
     assert.equal(message.server.online, true);
@@ -151,7 +159,11 @@ try {
     assert.ok(message.weather.observedAt);
     assert.ok(message.weather.forecast);
   } else {
-  assert.equal(message.status, "completed");
+  if (resumeTest && message.resumed) {
+    assert.equal(message.resumed.sameTask,true);
+    assert.equal(message.resumed.sameGoal,true);
+    assert.ok(message.resumed.actionsAdded>0);
+  } else assert.equal(message.status, "completed");
   assert.equal(message.permissions, 0);
   assert.doesNotMatch(message.answer, /\{\s*"action"\s*:/);
   if (networkTest || weatherTest) {

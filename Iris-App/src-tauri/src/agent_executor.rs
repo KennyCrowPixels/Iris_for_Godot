@@ -114,7 +114,7 @@ fn save_task(app: &tauri::AppHandle, task: &AgentTask) -> Result<(), String> {
     let json = serde_json::to_string_pretty(task).map_err(|err| err.to_string())?;
     atomic_write_json(&task_dir(app, &task.id)?.join("task.json"), &json)?;
     atomic_write_json(&task_root(app)?.join(format!("tab_{}.json", task.tab_id)), &json)?;
-    if !task.steps.is_empty() {
+    if !task.steps.is_empty() || !task.observations.is_empty() {
         let path = task_root(app)?.join(format!("resume_tab_{}.json", task.tab_id));
         if task.status != TaskStatus::Completed {
             atomic_write_json(&path, &json)?;
@@ -296,6 +296,12 @@ fn tool_contracts(tools: &[Value]) -> String {
     }).collect::<Vec<_>>().join("; ")
 }
 
+fn network_action_schema(tools: &[Value]) -> Value {
+    let choices=tools.iter().filter(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(agent_research::handles))
+        .map(|tool|json!({"type":"object","properties":{"action":{"const":"tool"},"tool":{"const":tool["function"]["name"]},"arguments":tool["function"]["parameters"]},"required":["action","tool","arguments"],"additionalProperties":false})).collect::<Vec<_>>();
+    json!({"oneOf":choices})
+}
+
 fn tool_feedback(tool: &str, value: &Value, limit: usize) -> String {
     if let Some(hits) = value.get("hits").and_then(Value::as_array) {
         let mut text = format!("Search snippets, not verified page contents. Provider: {}. Retrieved: {}. Query: {}\n", value["provider"].as_str().unwrap_or("web"), value["retrievedAt"], value["query"].as_str().unwrap_or(""));
@@ -333,7 +339,7 @@ fn action_messages(
         protocol.push_str("\nLive web search is disabled for this turn. Do not claim a current lookup or fabricate sources.");
     }
     if !task.steps.is_empty() || task.review_due(budget) { protocol.push_str(&format!("\n{TASK_PROTOCOL}")); }
-    if let Some(prior) = previous.filter(|prior| prior.status != TaskStatus::Completed && !prior.steps.is_empty() && prior.project_id == task.project_id) {
+    if let Some(prior) = previous.filter(|prior| prior.status != TaskStatus::Completed && (!prior.steps.is_empty() || !prior.observations.is_empty()) && prior.project_id == task.project_id) {
         protocol.push_str(&format!("\nUnfinished work is available: {}. Only if the user asks to continue that work, use {{\"action\":\"resume\"}}. Otherwise answer their current message.", excerpt(&prior.goal, 200)));
     }
     let persona = request.messages.iter().filter(|message| message.role == "system").map(|message| message.content.as_str()).collect::<Vec<_>>().join("\n");
@@ -352,7 +358,7 @@ fn action_messages(
     }
     let remaining = input_budget.saturating_sub(system.chars().count() + observation.chars().count() + assistant_action.chars().count() + 2);
     let latest = request.messages.iter().rposition(|message| message.role == "user");
-    let goal = latest.map(|index| request.messages[index].content.as_str()).unwrap_or(&task.goal);
+    let goal = task.goal.as_str();
     let mut messages = vec![serde_json::json!({"role":"system","content":system})];
     let user = excerpt(goal, remaining);
     let mut history_room = remaining.saturating_sub(user.chars().count());
@@ -421,7 +427,7 @@ async fn next_action(
     };
     let mut request = serde_json::json!({
         "model": model, "messages": messages, "stream": true, "think": false, "keep_alive": "5m",
-        "options": {"num_ctx": budget.context_tokens, "num_predict": budget.output_tokens, "temperature": 0.6, "repeat_penalty": 1.1}
+        "options": {"num_ctx": budget.context_tokens, "num_predict": budget.output_tokens, "temperature": if schema.is_some() {0.1} else {0.6}, "repeat_penalty": 1.1}
     });
     if let Some(schema) = schema { request["format"] = schema; }
     let mut response = tokio::select! {
@@ -487,7 +493,12 @@ async fn review_research(
         let context=research.review_context(&task.goal,&budget.research,lessons);
         let messages=vec![json!({"role":"system","content":protocol}),json!({"role":"user","content":excerpt(&context,room)})];
         let raw=next_action(client,&task.model,messages,budget,control,Some(agent_research::review_schema()), |_|{}).await?;
-        let assessment=serde_json::from_str::<agent_research::Assessment>(&raw).map_err(|error|format!("Invalid research review: {error}"));
+        let assessment=serde_json::from_str::<agent_research::Assessment>(&raw).map(|mut assessment| {
+            if assessment.subject.trim().is_empty() {assessment.subject=excerpt(&task.goal,180);}
+            if assessment.time_scope.trim().is_empty() {assessment.time_scope="As requested by the user".into();}
+            if assessment.strategy.trim().is_empty() {assessment.strategy=format!("{}: {}",assessment.next_step,excerpt(&assessment.next_input,180));}
+            assessment
+        }).map_err(|error|format!("Invalid research review: {error}"));
         match assessment.and_then(|assessment|research.accept(assessment)) {
             Ok(()) => return Ok(()),
             Err(error) => research.last_error=error,
@@ -496,16 +507,39 @@ async fn review_research(
     Err(format!("The model could not substantiate its research assessment: {}",research.last_error))
 }
 
-async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequest, budget: &ModelBudget, control: &RunControl) -> Result<agent_research::EvidenceNeed,String> {
+async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequest, budget: &ModelBudget, control: &RunControl, project_context: &str, saved_goal: Option<&str>) -> Result<agent_research::EvidenceNeed,String> {
     let mut intake_budget=budget.clone();
-    intake_budget.output_tokens=192;
+    intake_budget.output_tokens=96;
     let latest=request.messages.iter().rposition(|message|message.role=="user").unwrap_or(0);
     let context=request.messages[..latest].iter().rev().filter(|message|matches!(message.role.as_str(),"user"|"assistant")).take(4)
         .map(|message|format!("{}: {}",message.role,excerpt(&message.content,350))).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
     let question=request.messages.get(latest).map(|message|message.content.as_str()).unwrap_or("");
-    let messages=vec![json!({"role":"system","content":agent_research::INTAKE_PROTOCOL}),json!({"role":"user","content":format!("Current UTC date: {}\nRecent conversation:\n{}\nCurrent user message:\n{}",time::OffsetDateTime::now_utc().date(),context,excerpt(question,2400))})];
+    let messages=vec![
+        json!({"role":"system","content":agent_research::INTAKE_PROTOCOL}),
+        json!({"role":"user","content":"Introduce yourself and explain what you can help with."}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\"}"}),
+        json!({"role":"user","content":"Write an example movement script. This is a code snippet, not a request to inspect files."}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\"}"}),
+        json!({"role":"user","content":"Which version is documented in the repository attached to this chat?"}),
+        json!({"role":"assistant","content":"{\"route\":\"project\",\"input\":\"\"}"}),
+        json!({"role":"user","content":"Tell me about Springfield, but I have not specified which place with that name I mean."}),
+        json!({"role":"assistant","content":"{\"route\":\"clarify\",\"input\":\"Which Springfield do you mean?\"}"}),
+        json!({"role":"user","content":"Search online for the current ratings and reviews of Example Quest."}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\"}"}),
+        json!({"role":"user","content":"Continue the saved unfinished task from its notes."}),
+        json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\"}"}),
+        json!({"role":"user","content":format!("Today: {}\nAttached project: {}\nSaved unfinished objective: {}\nRecent conversation:\n{}\nCURRENT MESSAGE:\n{}",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),context,excerpt(question,1600))})
+    ];
     let raw=next_action(client,&request.model,messages,&intake_budget,control,Some(agent_research::intake_schema()),|_|{}).await?;
     serde_json::from_str(&raw).map_err(|error|format!("Could not assess evidence needs: {error}"))
+}
+
+fn resumed_task(previous: Option<&AgentTask>, project_id: Option<&String>, model: &str) -> Result<AgentTask,String> {
+    let mut task=previous.filter(|task|task.status!=TaskStatus::Completed && task.project_id.as_ref()==project_id)
+        .cloned().ok_or("No unfinished task is saved for this chat and project.")?;
+    task.status=TaskStatus::Running;
+    task.model=model.into();
+    Ok(task)
 }
 
 fn clear_provisional_answer(window: &tauri::Window, event_name: &str, displayed: &mut String) {
@@ -516,6 +550,7 @@ fn clear_provisional_answer(window: &tauri::Window, event_name: &str, displayed:
 
 pub(super) async fn run(
     app: &tauri::AppHandle, tab_id: u32, window: &tauri::Window, event_name: &str, request: &OllamaChatRequest,
+    resume_task: bool,
 ) -> Result<String, String> {
     let control = Arc::new(RunControl { cancelled: AtomicBool::new(false), notify: Notify::new() });
     {
@@ -524,37 +559,65 @@ pub(super) async fn run(
         runs.insert(tab_id, Arc::clone(&control));
     }
     let _guard = RunGuard(tab_id);
-    let previous = load_resumable_task(app, tab_id)?;
-    let project_id = iris_read_snapshot_file(&tab_file(app, tab_id)?).ok().and_then(|snapshot| snapshot.associated_project_id);
+    let snapshot = iris_read_snapshot_file(&tab_file(app, tab_id)?).ok();
+    let previous = load_resumable_task(app, tab_id)?.filter(|task|snapshot.as_ref().is_some_and(|snapshot|snapshot.messages.iter().any(|message|message.role=="user" && message.text==task.goal)));
+    let project_id = snapshot.and_then(|snapshot| snapshot.associated_project_id);
     let goal = latest_user_message(&request.messages).unwrap_or("").to_string();
     let id = format!("tab{}_{}_{}", tab_id, now_ts(), NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let mut task = AgentTask::new(id, tab_id, project_id, goal, request.model.clone());
+    if resume_task {
+        task = resumed_task(previous.as_ref(),task.project_id.as_ref(),&request.model)?;
+    }
     let mut budget = model_budget(&request.model).await;
+    budget.apply_persistence_mode(&read_setup_flags(app).permission_mode);
     if load_skills(app).values().any(|stats| stats.failures > 2 && stats.failures > stats.successes / 2) {
         budget.review_interval = 2;
     }
     let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(budget.request_timeout_secs)).build().map_err(|err| err.to_string())?;
     let tools = available_tools(app, request);
+    let store=read_repo_project_store(app);
+    let attached=store.projects.iter().find(|project|Some(&project.id)==task.project_id.as_ref());
+    let project_context=attached.map(|project|format!("{}; description: {}; cached engine version (verify if needed): {}; linked reference repositories: {}; {} MCP bridges. Resources are attached, not yet inspected this turn.",project.name,excerpt(&project.description,300),if project.godot_version_cached.is_empty(){"unknown"}else{&project.godot_version_cached},store.repos.iter().filter(|repo|project.repo_ids.contains(&repo.id)).map(|repo|repo.name.as_str()).collect::<Vec<_>>().join(", "),project.mcp_ids.len())).unwrap_or_else(||"none".into());
+    let mut turn_request=request.clone();
+    if attached.is_some() {
+        turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:format!("Attached project context: {project_context}. Prefer its repository/bridge evidence for project-specific questions. Never claim that attached resources are absent or inspected without checking. For code snippets, use the project's verified engine/API version; if it is unknown and materially affects code, ask which version or inspect the linked references. Do not fabricate APIs."),images:None,tool_calls:None});
+    }
     let mut feedback = String::new();
     let mut previous_response = String::new();
     let mut repair_schema = None;
     let mut rejected = 0usize;
     let mut bookkeeping_actions = 0usize;
     let mut displayed = String::new();
-    let mut research = agent_research::ResearchSession::default();
-    let mut research_pending = false;
+    let mut research: agent_research::ResearchSession = if resume_task {
+        fs::read_to_string(task_dir(app,&task.id)?.join("research.json")).ok().and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or_default()
+    } else { agent_research::ResearchSession::default() };
+    research.begin_window();
+    let mut action_start = task.total_actions;
+    let mut research_pending = resume_task && research.active();
     let mut research_next = None;
     let lessons = research_method_notes(app);
     let mut repeated_calls: HashMap<String, usize> = HashMap::new();
     save_task(app, &task)?;
-    if tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search")) {
+    if !resume_task && (attached.is_some() || tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search"))) {
         let _=window.emit(event_name,IrisEvent::Status("Checking whether this request needs current evidence...".into()));
-        match assess_evidence_need(&client,request,&budget,&control).await {
-            Ok(need) if need.research => {
-                research_next=Some(AgentAction::Tool{tool:"universal_web_search".into(),arguments:json!({"query":if need.query.trim().is_empty(){task.goal.clone()}else{need.query}})});
-            }
-            Ok(_) => {},
+        match assess_evidence_need(&client,request,&budget,&control,&project_context,previous.as_ref().filter(|task|task.status!=TaskStatus::Completed).map(|task|task.goal.as_str())).await {
+            Ok(need) => match need.route.as_str() {
+                "web" if tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search")) => {
+                    repair_schema=Some(network_action_schema(&tools));
+                    feedback=format!("This request needs live evidence. Choose the most directly relevant enabled lookup and supply its required arguments. Suggested discovery query: {}. No source has been retrieved yet.",need.input);
+                }
+                "project" if attached.is_some() => research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})}),
+                "clarify" if !need.input.trim().is_empty() => research_next=Some(AgentAction::Finish{message:need.input}),
+                "resume" => {
+                    if let Ok(saved)=resumed_task(previous.as_ref(),task.project_id.as_ref(),&request.model) {
+                        task=saved;
+                        research=fs::read_to_string(task_dir(app,&task.id)?.join("research.json")).ok().and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or_default();
+                        research.begin_window();action_start=task.total_actions;research_pending=research.active();
+                    }
+                }
+                _ => {},
+            },
             Err(error) => {
                 feedback=format!("Evidence assessment unavailable: {}. If this request needs current or uncertain facts, use the enabled web tools before answering. Never substitute training-memory claims.",excerpt(&error,300));
             }
@@ -570,6 +633,7 @@ pub(super) async fn run(
         save_task(app,&task)?;
     }
     for _ in 0..budget.max_actions {
+        if task.total_actions.saturating_sub(action_start)>=budget.max_actions {break;}
         if control.cancelled.load(Ordering::SeqCst) {
             task.status = TaskStatus::Cancelled;
             task.last_message = "Stopped. Task notes and evidence are saved. Any already-started external action may still finish; inspect its state before retrying.".into();
@@ -577,7 +641,7 @@ pub(super) async fn run(
         }
         if research_pending {
             clear_provisional_answer(window,event_name,&mut displayed);
-            if research.assessments.len() >= budget.research.max_reviews || task.total_actions >= budget.max_actions {
+            if research.window_reviews() >= budget.research.max_reviews || task.total_actions.saturating_sub(action_start) >= budget.max_actions {
                 task.status=TaskStatus::Paused;
                 task.last_message=research.partial_answer();
                 break;
@@ -597,17 +661,27 @@ pub(super) async fn run(
             let _=window.emit(event_name,IrisEvent::Status("Checking source relevance, dates and remaining gaps...".into()));
             if let Err(error)=review_research(&client,&task,&mut research,&budget,&control,&lessons).await {
                 research.last_error=error;
-                task.status=if control.cancelled.load(Ordering::SeqCst) {TaskStatus::Cancelled} else {TaskStatus::Paused};
-                task.last_message=research.partial_answer();
-                break;
+                if control.cancelled.load(Ordering::SeqCst) {task.status=TaskStatus::Cancelled;task.last_message=research.partial_answer();break;}
+                let context=research.discovery_context(&task.goal);
+                let messages=vec![json!({"role":"system","content":"The previous evidence review failed. Take one concrete recovery step using a relevant unread source or a different query. Do not search for protocol instructions or claim a result. Return a tool action."}),json!({"role":"user","content":excerpt(&format!("{context}\nReview failure: {}",research.last_error),budget.input_char_budget().saturating_sub(500))})];
+                match next_action(&client,&task.model,messages,&budget,&control,Some(research.discovery_schema()),|_|{}).await.and_then(|raw|parse_model_action(&raw,&tools)) {
+                    Ok(action @ AgentAction::Tool{..})=>{research_next=Some(action);research_pending=false;save_research(app,&task,&research,&budget)?;continue;}
+                    _=>{task.status=TaskStatus::Paused;task.last_message=research.partial_answer();break;}
+                }
             }
             research_pending=false;
             repair_schema=None;
             save_research(app,&task,&research,&budget)?;
-            if research.assessments.last().is_some_and(|assessment|matches!(assessment.next_step.as_str(),"stop"|"clarify")) {
+            if research.assessments.last().is_some_and(|assessment|assessment.next_step=="clarify") {
                 task.status=TaskStatus::Blocked;
                 task.last_message=research.partial_answer();
                 break;
+            }
+            if research.assessments.last().is_some_and(|assessment|assessment.next_step=="stop") {
+                research.last_error="The previous approach was inconclusive; selecting another source or query.".into();
+                let messages=vec![json!({"role":"system","content":"Choose one alternative source or a concrete revised query for the original question. A failed or inconclusive approach is not proof no answer exists. Return one tool action."}),json!({"role":"user","content":excerpt(&research.discovery_context(&task.goal),budget.input_char_budget().saturating_sub(400))})];
+                if let Ok(action @ AgentAction::Tool{..})=next_action(&client,&task.model,messages,&budget,&control,Some(research.discovery_schema()),|_|{}).await.and_then(|raw|parse_model_action(&raw,&tools)) {research_next=Some(action);continue;}
+                task.status=TaskStatus::Paused;task.last_message=research.partial_answer();break;
             }
             research_next=research.next_action();
             feedback=format!("Research notebook: {}\n{}",research.notebook(budget.research.notebook_chars),if research.ready() {"Answer the original question using only the supported findings, with source citations and the relevant date. Do not introduce unsupported details."} else {"Continue the selected research approach."});
@@ -616,7 +690,7 @@ pub(super) async fn run(
         task.total_actions += 1;
         emit_progress(window, event_name, &task, &budget);
         let _ = window.emit(event_name, IrisEvent::Status(format!("Agent action {} | {}", task.total_actions, task.current_step().map(|step| step.title.as_str()).unwrap_or("assessing request"))));
-        let messages = action_messages(request, &task, previous.as_ref(), &budget, &tools, &feedback, &previous_response);
+        let messages = action_messages(&turn_request, &task, previous.as_ref(), &budget, &tools, &feedback, &previous_response);
         let can_stream = task.completion_ready().is_ok() && (!research.active() || research.ready());
         let generated = if let Some(action)=research_next.take() { Ok(serde_json::to_string(&action).map_err(|error|error.to_string())?) } else { next_action(&client, &task.model, messages, &budget, &control, repair_schema.take(), |delta| {
             if can_stream {
@@ -700,6 +774,8 @@ pub(super) async fn run(
                     task.status = TaskStatus::Running;
                     task.model = request.model.clone();
                     research=fs::read_to_string(task_dir(app,&task.id)?.join("research.json")).ok().and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or_default();
+                    research.begin_window();
+                    action_start=task.total_actions;
                     research_pending=research.active();
                     Ok("Resumed saved work. Inspect current external state before retrying any action whose outcome is uncertain.".into())
                 } else { Err("No unfinished task for this project is available to resume.".into()) }
@@ -766,7 +842,8 @@ pub(super) async fn run(
             Err(err) => {
                 clear_provisional_answer(window, event_name, &mut displayed);
                 feedback = format!("Action rejected: {err}. Enabled tools and required arguments: {}. Return a valid request using these names only; do not describe an unexecuted tool call as an answer.", tool_contracts(&tools));
-                repair_schema = retry_schema.or_else(|| Some(response_schema(&tools, &task, &budget, false)));
+                repair_schema = if err.starts_with("Arguments for") { retry_schema } else { None }
+                    .or_else(|| Some(response_schema(&tools, &task, &budget, false)));
                 rejected += 1;
             }
         }
@@ -878,6 +955,47 @@ async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_evidence_choice_uses_enabled_schemas_not_a_fixed_search_route() {
+        let schema=network_action_schema(&build_default_tools());
+        let validator=jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"action":"tool","tool":"get_current_weather","arguments":{"location":"Durham, NC"}})));
+        assert!(validator.is_valid(&json!({"action":"tool","tool":"universal_web_search","arguments":{"query":"current reviews"}})));
+        assert!(!validator.is_valid(&json!({"action":"tool","tool":"get_current_weather","arguments":{}})));
+        assert!(!validator.is_valid(&json!({"action":"tool","tool":"invented_search","arguments":{}})));
+    }
+
+    #[test]
+    fn explicit_resume_keeps_original_goal_and_rejects_project_mismatch() {
+        let mut previous=AgentTask::new("saved".into(),1,Some("project".into()),"Research the requested game's reviews".into(),"model".into());
+        previous.status=TaskStatus::Paused;
+        previous.total_actions=80;
+        let resumed=resumed_task(Some(&previous),Some(&"project".into()),"new-model").unwrap();
+        assert_eq!(resumed.goal,previous.goal);
+        assert_eq!(resumed.id,previous.id);
+        assert_eq!(resumed.total_actions,80);
+        assert!(resumed_task(Some(&previous),None,"model").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires an installed local organizer model"]
+    async fn live_intake_preserves_conversation_project_and_clarification_lanes() {
+        let model=std::env::var("IRIS_TEST_MODEL").unwrap_or_else(|_|"iris-organizer:latest".into());
+        let budget=model_budget(&model).await;
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(90)).build().unwrap();
+        let control=RunControl{cancelled:AtomicBool::new(false),notify:Notify::new()};
+        for (prompt,project,expected) in [
+            ("What is your purpose?","none","answer"),
+            ("What version does the repository attached to this project reference?","Godot project with a linked Godot documentation repository and MCP bridge","project"),
+            ("Tell me about Lebanon. I mean one of the places with that name, but haven't said which.","none","clarify"),
+        ] {
+            let request=OllamaChatRequest{model:model.clone(),messages:vec![OllamaMessage{role:"user".into(),content:prompt.into(),images:None,tool_calls:None}],stream:true,keep_alive:None,tools:None,network_allowed:true,read_only:false};
+            let result=assess_evidence_need(&client,&request,&budget,&control,project,None).await.unwrap();
+            println!("{prompt}: {}",result.route);
+            assert_eq!(result.route,expected);
+        }
+    }
 
     #[test]
     fn network_contracts_and_evidence_preserve_inputs_and_sources() {

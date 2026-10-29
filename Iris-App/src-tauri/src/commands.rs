@@ -1,4 +1,15 @@
 ﻿use std::process::{Command, Stdio};
+
+fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+  let mut command=Command::new(program);
+  command.stdin(Stdio::null());
+  #[cfg(target_os = "windows")]
+  {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+  }
+  command
+}
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -33,6 +44,8 @@ pub struct UserTurnPayload {
   pub associated_project_id: Option<Option<String>>,
   #[serde(default)]
   pub network_allowed: Option<bool>,
+  #[serde(default)]
+  pub resume_task: bool,
 }
 
 fn deserialize_project_association<'de, Deserializer: serde::Deserializer<'de>>(
@@ -496,7 +509,7 @@ pub async fn submit_turn(
 
         let mut request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
         request.network_allowed = payload.network_allowed != Some(false);
-        match execute_ollama_chat_stream(&app, payload.tab_id, &window, &event_name, &request).await {
+        match execute_ollama_chat_stream(&app, payload.tab_id, &window, &event_name, &request, payload.resume_task).await {
           Ok(reply) => {
             let _ = transition_cognitive_runtime_state_internal(
               &app,
@@ -1553,8 +1566,9 @@ async fn execute_ollama_chat_stream(
   window: &tauri::Window,
   event_name: &str,
   request: &OllamaChatRequest,
+  resume_task: bool,
 ) -> Result<String, String> {
-  let result = agent_executor::run(app, tab_id, window, event_name, request).await;
+  let result = agent_executor::run(app, tab_id, window, event_name, request, resume_task).await;
   if let Err(err) = &result { let _ = window.emit(event_name, IrisEvent::Error(err.clone())); }
   result
 }
@@ -3510,7 +3524,7 @@ fn resolve_executable(command: &str) -> Option<String> {
   }
 
   if cfg!(target_os = "windows") {
-    if let Ok(out) = Command::new("where").arg(c).output() {
+    if let Ok(out) = background_command("where").arg(c).output() {
       if out.status.success() {
         let txt = String::from_utf8_lossy(&out.stdout);
         if let Some(first) = txt.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
@@ -3656,7 +3670,7 @@ fn try_probe_protocol(
 ) -> Result<ProbeSuccess, String> {
   let resolved = resolve_executable(command).ok_or_else(|| format!("Command '{}' not found", command))?;
 
-  let mut child = Command::new(&resolved)
+  let mut child = background_command(&resolved)
     .args(args)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
@@ -5570,6 +5584,12 @@ pub struct ProjectDef {
   pub name: String,
   pub enabled: bool,
   pub description: String,
+  #[serde(default)]
+  pub godot_version_cached: String,
+  #[serde(default)]
+  pub last_bridge_sync_at: i64,
+  #[serde(default)]
+  pub last_full_project_pull_at: i64,
   #[serde(default)]
   pub manipulation_root_path: String,
   #[serde(default = "default_true_flag")]
@@ -8442,7 +8462,7 @@ pub async fn get_server_status() -> Result<Value, String> {
 pub async fn start_local_ollama() -> Result<Value, String> {
   let status = get_server_status().await?;
   if status["online"] == true { return Ok(status); }
-  Command::new(resolve_ollama_executable()).arg("serve")
+  background_command(resolve_ollama_executable()).arg("serve")
     .env("OLLAMA_HOST", "127.0.0.1:11434").env("OLLAMA_NUM_PARALLEL", "1").env("OLLAMA_MAX_LOADED_MODELS", "1")
     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
     .map_err(|error| format!("Could not start Ollama: {error}. Check that Ollama is installed."))?;
@@ -8468,7 +8488,7 @@ pub fn ensure_ollama_running_once() {
           let already = client.get(format!("{OLLAMA_BASE}/api/version")).send().is_ok_and(|response|response.status().is_success());
             if !already {
               let ollama_bin = resolve_ollama_executable();
-              let _ = Command::new(ollama_bin)
+              let _ = background_command(ollama_bin)
                     .arg("serve")
                   .env("OLLAMA_HOST", "127.0.0.1:11434")
                   .env("OLLAMA_NUM_PARALLEL", "1")
@@ -9274,7 +9294,7 @@ fn make_temp_modelfile_with_from(src: &std::path::Path, from_model: &str) -> Res
 
 #[tauri::command]
 pub fn check_ollama_installed() -> bool {
-  let via_path = Command::new(resolve_ollama_executable())
+  let via_path = background_command(resolve_ollama_executable())
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -9485,7 +9505,7 @@ pub struct HardwareProfile {
 /// Returns (gb, gpu_name, note).
 fn probe_vram() -> (f64, String, String) {
   // Attempt 1: nvidia-smi
-  if let Ok(out) = Command::new("nvidia-smi")
+  if let Ok(out) = background_command("nvidia-smi")
     .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
     .output()
   {
@@ -9507,7 +9527,7 @@ fn probe_vram() -> (f64, String, String) {
   // Attempt 2: PowerShell Win32_VideoController (Windows only)
   #[cfg(target_os = "windows")]
   {
-    if let Ok(out) = Command::new("powershell")
+    if let Ok(out) = background_command("powershell")
       .args(["-NoProfile", "-Command",
         "Get-CimInstance Win32_VideoController | Select-Object -First 1 Name,AdapterRAM | ConvertTo-Json -Compress"])
       .output()
@@ -10785,7 +10805,7 @@ pub fn launch_mcp_server(mcp_id: Option<String>, command: String, args: Vec<Stri
     }
   }
   let resolved = resolve_executable(&command).ok_or_else(|| "Missing command".to_string())?;
-  let child = Command::new(&resolved)
+  let child = background_command(&resolved)
     .args(&args)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
