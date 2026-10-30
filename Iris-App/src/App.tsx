@@ -9946,40 +9946,57 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       : (parsed.url || mcp.target);
     const args = Array.isArray(mcp.launchArgs) ? mcp.launchArgs : (parsed.args ?? []);
 
-    const conn = await withTimeout(
-      invoke("connect_mcp_server", {
-        mcpId: mcp.id,
-        target: mcp.target,
-        connectionType,
-        command,
-        args,
-      }) as Promise<{ connected: boolean; pid?: number | null; protocol?: string | null }>,
-      65000,
-      `connect_mcp_server:${mcp.name}`
-    );
+    let conn: { connected: boolean; pid?: number | null; protocol?: string | null };
+    try {
+      conn = await withTimeout(
+        invoke("connect_mcp_server", {
+          mcpId: mcp.id,
+          target: mcp.target,
+          connectionType,
+          command,
+          args,
+        }) as Promise<{ connected: boolean; pid?: number | null; protocol?: string | null }>,
+        65000,
+        `connect_mcp_server:${mcp.name}`
+      );
+    } catch (connectErr: any) {
+      // Step 1 (connect) failed: the process/URL never came up. Report this layer explicitly so
+      // the user knows it is not a tool-listing problem.
+      const detail = String(connectErr?.message || connectErr || "connection failed");
+      throw new Error(`Could not start/connect the bridge (${connectionType === "stdio" ? `command: ${command || "none"}` : `url: ${command || "none"}`}): ${detail}`);
+    }
 
     if (conn?.connected && typeof conn?.pid === "number" && conn.pid > 0) {
       setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: conn.pid!, launched: true } }));
     }
 
-    const tools = await withTimeout(
-      invoke("mcp_list_tools", {
-        mcpId: mcp.id,
-        target: mcp.target,
-        connectionType,
-        command,
-        args,
-      }) as Promise<Array<{ name: string }>>,
-      35000,
-      `mcp_list_tools:${mcp.name}`
-    );
+    let tools: Array<{ name: string }>;
+    try {
+      tools = await withTimeout(
+        invoke("mcp_list_tools", {
+          mcpId: mcp.id,
+          target: mcp.target,
+          connectionType,
+          command,
+          args,
+        }) as Promise<Array<{ name: string }>>,
+        35000,
+        `mcp_list_tools:${mcp.name}`
+      );
+    } catch (listErr: any) {
+      // Step 2 (tool discovery) failed: the bridge connected but did not answer tools/list. This
+      // usually means the server started but its backend (e.g. the Godot editor + plugin) is not
+      // reachable, or it speaks a protocol we could not parse.
+      const detail = String(listErr?.message || listErr || "tool discovery failed");
+      throw new Error(`Bridge connected but tool discovery failed: ${detail}. If this is a Godot/GDAI bridge, make sure the Godot editor is open with the MCP plugin active.`);
+    }
 
     const toolCount = Array.isArray(tools) ? tools.length : 0;
     const proto = conn?.protocol ? ` · ${conn.protocol}` : "";
     return {
       connected: !!conn?.connected,
       toolCount,
-      message: toolCount > 0 ? `connected (${toolCount} tools${proto})` : `connected (0 tools${proto})`,
+      message: toolCount > 0 ? `connected (${toolCount} tools${proto})` : `connected but 0 tools advertised${proto}`,
     };
   }
 
@@ -9993,6 +10010,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     mcpProbeAbortedRef.current.delete(mcp.id);
     setMcpLaunchStatus((prev) => ({ ...prev, [mcp.id]: { pid: 0, launched: true } }));
     setMcpHealthStatus((prev) => ({ ...prev, [mcp.id]: { state: "launching", message: "establishing connection..." } }));
+    // Force the browser to paint the "Launching..." spinner BEFORE the blocking connect call, so
+    // the loading feedback appears before any brief stall rather than after it. Two animation
+    // frames guarantee React has committed and the compositor has drawn the spinner.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     try {
       const readiness = await probeMcpReadiness(mcp);
       // If Stop was pressed during the probe, ignore result.

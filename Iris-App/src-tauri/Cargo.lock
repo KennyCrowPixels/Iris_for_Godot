@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "iris-app"
-version = "0.3.4-alpha.0"
+version = "0.3.5-alpha.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
