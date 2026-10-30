@@ -731,6 +731,9 @@ pub(super) async fn run(
     let mut feedback = String::new();
     let mut last_action_error = String::new();
     let mut direct_answer = false;
+    // Set when the turn is inspecting an attached project that actually has an inspectable bridge
+    // or repo: the model must call a real data tool before it may state scene/node/file facts.
+    let mut project_inspection = false;
     let mut previous_response = String::new();
     let mut repair_schema = None;
     let mut rejected = 0usize;
@@ -767,7 +770,10 @@ pub(super) async fn run(
                     tools.clear();
                     feedback="Answer the current message directly using stable knowledge or the conversation. No new external research is needed. Do not turn prior research failures into a plan for this different question; state uncertainty if necessary.".into();
                 }
-                "project" if attached.is_some() => research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})}),
+                "project" if attached.is_some() => {
+                    project_inspection = attached.is_some_and(|project| !project.mcp_ids.is_empty() || !project.repo_ids.is_empty() || !project.manipulation_root_path.trim().is_empty());
+                    research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})});
+                }
                 "act" => {
                     feedback="This request asks for a local device, app, file or bridge action. If the matching tool is enabled, call it and report only its real observed result. If no such tool is enabled, tell the user plainly which capability to enable in Settings (Desktop Tools, or link an MCP bridge or repository to this project); never claim you are only a text-based model or unable to see the screen or control apps.".into();
                 }
@@ -981,6 +987,8 @@ pub(super) async fn run(
                 if research.active() && !research.ready() {
                     research_pending=true;
                     Err("The research evidence has not yet resolved the original question. Review the subject, dates, source support and remaining gaps.".into())
+                } else if project_inspection && !task.observations.iter().any(|observation| matches!(observation.tool.as_str(), "call_project_tool" | "project_files" | "ssh_action")) {
+                    Err("You have not inspected the project yet, so you cannot know its scenes, nodes, or files. Do NOT invent names. First call list_project_tools to see the linked bridge's tools, then call_project_tool with effect:read (or project_files for a repo) and report ONLY what a successful call returns. If a call fails, say plainly that inspection failed and why.".into())
                 } else {
                     task.finish(&research.cite(&agent_stream::visible_answer(&message))).map(|_| "Completed".into())
                 }
@@ -1009,7 +1017,20 @@ pub(super) async fn run(
                     let signature = format!("{tool}:{}", arguments);
                     let count = repeated_calls.get(&signature).copied().unwrap_or(0);
                     if count >= 2 {
-                        Err("Repeated identical action blocked. Use stored evidence, change the approach, or pause.".into())
+                        // Instead of pausing, hand the model back the evidence it already retrieved
+                        // with these exact arguments so it answers from the cache rather than
+                        // re-calling the same tool. This fixes both the repeated-action stall and
+                        // the "answer arrived only on a later prompt" symptom.
+                        let prior = task.observations.iter().rev()
+                            .filter(|observation| observation.tool == tool && observation.ok)
+                            .take(2)
+                            .map(|observation| format!("evidence #{}: {}", observation.id, excerpt(&observation.summary, 600)))
+                            .collect::<Vec<_>>().join("\n");
+                        if prior.is_empty() {
+                            Err(format!("You already tried {tool} with these exact arguments twice and it did not return usable data. Do NOT repeat it. Call a DIFFERENT tool or change the arguments, or tell the user plainly what could not be retrieved."))
+                        } else {
+                            Err(format!("You already called {tool} with these exact arguments and already have its result:\n{prior}\nDo NOT call it again identically. Answer the user's actual question now using this stored evidence, or call a DIFFERENT tool or different arguments only for what is still genuinely missing."))
+                        }
                     } else {
                         record_reasoning(window,event_name,&mut task,&format!("Selected tool: {tool}. Awaiting its actual result before making a claim."));
                         match run_tool(app, window, event_name, &control, request, &task, &budget, &tool, &arguments).await {

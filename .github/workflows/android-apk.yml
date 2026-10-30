@@ -36,6 +36,12 @@ jobs:
         run: npm install --no-audit --no-fund
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install
+      - name: Tune Gradle/Kotlin memory for the CI runner
+        working-directory: iris-android-client/android
+        run: |
+          echo "org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx2g" >> gradle.properties
+          echo "org.gradle.workers.max=2" >> gradle.properties
       - name: Build debug APK (installable, debug-signed)
         working-directory: iris-android-client/android
         run: ./gradlew assembleDebug --no-daemon --stacktrace

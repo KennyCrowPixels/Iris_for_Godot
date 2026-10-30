@@ -12015,7 +12015,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                     className={`setup-btn${permissionSettings.mode === "testing" ? " primary" : ""}`}
                     onClick={() => void persistPermissionSettings({ ...permissionSettings, mode: "testing" })}
                   >
-                    Testing Mode
+                    Autopilot
                   </button>
                 </div>
 
@@ -12041,7 +12041,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
 
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <span style={{ color: "var(--app-text)", fontSize: 12 }}>Testing confidence threshold</span>
+                  <span style={{ color: "var(--app-text)", fontSize: 12 }}>Autopilot confidence threshold</span>
                   <input
                     type="number"
                     min={0}
@@ -12057,7 +12057,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   <span style={{ color: isLightMode ? "#526272" : "#9da8b8", fontSize: 12 }}>/ 100</span>
                 </div>
                 <p style={{ marginTop: 0, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
-                  Testing mode asks permission whenever confidence drops below the threshold. Confidence is estimated from dynamic Agent Stats.
+                  Autopilot runs tasks to completion on its own and only stops for a real permission approval or a genuine blocker — it will not pause just to ask you to continue. It still asks permission when confidence drops below the threshold below.
                 </p>
               </div>
 
