@@ -17,6 +17,22 @@ The bridge connection works, but the agent loop around it was mishandling result
 - **No more invented scene/node names.** A project-inspection turn can no longer finish stating scenes, nodes, or files unless it actually called a real inspection tool (`call_project_tool`, `project_files`, or `ssh_action`). If it hasn't inspected, it must do so; if inspection fails, it says so honestly instead of fabricating a plausible list.
 - **Repeated-action stalls now recover instead of pausing.** When the model tries the exact same tool call again, it is handed back **its own cached result** for those arguments and told to answer from that evidence (or try a different tool/args). This fixes both the "kept pausing / Resume loop" and the "the answer only showed up on a later prompt" symptom — the data was already retrieved; the loop just wasn't delivering it.
 - Combined with Autopilot declining premature pauses, the delete/replace-a-node style task no longer gets stuck repeating "no evidence supports completion"; it is pushed to take the concrete bridge action.
+- **The actual MCP bug, fixed.** Reasoning logs showed the model was calling the inspection tool with `mcp_id`, while the schema demanded `connection_id` — so **every inspection call failed schema validation** and got trapped in a resume loop. The bridge id aliases (`mcp_id` / `connectionId`) are now accepted, `call_project_tool` tolerates an omitted `arguments`/`effect` (defaults to a no-arg read), and `project_connections` now **eagerly hands the model each connected bridge's live tool list (or its connection error)** so it can read the project in one step instead of the error-prone multi-step dance.
+- **Project turns stay on the project.** A project-inspection turn no longer has web tools, and the model is told the MCP bridge is its own built-in way to see the project — so it stops web-searching "what is an MCP bridge" (it once even read the Malayan Communist Party Wikipedia page). External research (games, companies, topics) no longer misroutes to project inspection just because a project is attached.
+
+## Long-task reliability ("Trudge")
+
+For tasks that exceed a small model's one-shot ability (deep research, multi-source essays), the loop now trudges to a real result instead of looping forever:
+
+- **It always delivers.** When the research loop exhausts its budget, Iris now **synthesizes a best-effort answer from the sources it actually read** (clearly flagging what's uncertain), instead of the old empty "Research paused — 155 lookups, 0 verified." You get the essay built from real evidence.
+- **It reads instead of re-searching.** After a search, if there are unread results, the model is now **required to open one** rather than re-running near-identical searches. This ends the runaway "dozens of identical lookups, zero pages read" behaviour.
+- The exact-quote citation gate still guards factual claims, but it no longer prevents a usable answer from being delivered when the small model can't produce a verbatim quote for every sentence.
+
+## Activity logs & mic
+
+- **Copy activity logs.** Options ▾ → **Copy activity logs** copies every saved reasoning/activity log for the current chat to the clipboard in one go (handy for reporting issues). The per-message reasoning-log viewer also got a sticky, non-selectable header with its own Copy button.
+- **Mic feedback.** The listening state now shows an animated indicator + a "Listening…" pill instead of a confusing muted-mic icon, and a failed desktop mic now explains clearly that the webview's speech service is unavailable (the Android companion uses native on-device speech). Reliable desktop dictation needs native capture and is planned separately.
+
 
 ## Smarter, more honest conversation
 

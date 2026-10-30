@@ -103,7 +103,7 @@ pub(super) fn intake_schema() -> Value {
     json!({"type":"object","properties":{"route":{"enum":["answer","project","web","act","clarify","resume"]},"input":{"type":"string","maxLength":240}},"required":["route","input"],"additionalProperties":false})
 }
 
-pub(super) const INTAKE_PROTOCOL: &str = "Choose the evidence lane for the CURRENT message, not previous requests. answer: greetings, your purpose, jokes, fiction, writing, code snippets, ordinary stable knowledge, recall, or explaining what happened in this chat. project: questions about the attached project's files, scenes, repositories, versions or bridge state; inspect local sources, never web-search the user's repo. web: the user asks to look something up, search, check, or find out; or wants news, prices, reviews, ratings, releases, schedules, scores, or any real-world fact that could have changed since training. When a factual request is about the outside world and you are unsure whether answer or web fits, prefer web. Live web tools are available when enabled; never decide you cannot look something up. act: the message asks to perform a local device, app, desktop, file or bridge action (take or look at a screenshot, see the screen, move or click the mouse, type, open or control an app, read or write a local file, run a linked bridge tool); keep input empty. clarify: the requested entity, place, version or scope has materially different interpretations and context does not resolve it; input must be one short question. Do not invent a specific interpretation or expand a simple question into government/history research. resume: the user asks to continue the saved unfinished task. For web, input is a concise query naming the subject. When the current message refers to its subject indirectly (the game, it, that show, this book), resolve the reference to the exact named entity from the recent conversation and put that proper name in the query; never swap in a different, similarly spelled entity and never turn a descriptive word in the request (such as 'reviews' or 'average') into a new proper name. For project/answer/act/resume input is empty. Live tools are available, but routine code generation does not require a web investigation. Return only route and input.";
+pub(super) const INTAKE_PROTOCOL: &str = "Choose the evidence lane for the CURRENT message, not previous requests. answer: greetings, your purpose, jokes, fiction, writing, code snippets, ordinary stable knowledge, recall, or explaining what happened in this chat. project: questions about THIS attached software project itself — its own files, scenes, nodes, repositories, engine version or bridge state; inspect local sources, never web-search the user's repo. Researching external games, companies, people, products or general topics is web or answer, NOT project, even while a project is attached. web: the user asks to look something up, search, check, or find out; or wants news, prices, reviews, ratings, releases, schedules, scores, or any real-world fact that could have changed since training, or asks to research/compare named external subjects. When a factual request is about the outside world and you are unsure whether answer or web fits, prefer web. Live web tools are available when enabled; never decide you cannot look something up. act: the message asks to perform a local device, app, desktop, file or bridge action (take or look at a screenshot, see the screen, move or click the mouse, type, open or control an app, read or write a local file, run a linked bridge tool); keep input empty. clarify: the requested entity, place, version or scope has materially different interpretations and context does not resolve it; input must be one short question. Do not invent a specific interpretation or expand a simple question into government/history research. resume: the user asks to continue the saved unfinished task. For web, input is a concise query naming the subject. When the current message refers to its subject indirectly (the game, it, that show, this book), resolve the reference to the exact named entity from the recent conversation and put that proper name in the query; never swap in a different, similarly spelled entity and never turn a descriptive word in the request (such as 'reviews' or 'average') into a new proper name. For project/answer/act/resume input is empty. Live tools are available, but routine code generation does not require a web investigation. Return only route and input.";
 
 impl ResearchSession {
     pub fn begin_window(&mut self) {
@@ -246,11 +246,17 @@ impl ResearchSession {
 
     pub fn discovery_schema(&self) -> Value {
         let urls=self.unread_leads().iter().filter_map(|lead|lead["url"].as_str()).collect::<Vec<_>>();
-        let mut choices=vec![json!({"type":"object","properties":{"action":{"const":"tool"},"tool":{"const":"universal_web_search"},"arguments":{"type":"object","properties":{"query":{"type":"string","minLength":8,"maxLength":240},"provider":{"enum":["auto","duckduckgo","bing","news","encyclopedia"]},"recency":{"enum":["any","day","week","month","year"]}},"required":["query","provider","recency"],"additionalProperties":false}},"required":["action","tool","arguments"],"additionalProperties":false})];
-        if !urls.is_empty() {
-            choices.insert(0,json!({"type":"object","properties":{"action":{"const":"tool"},"tool":{"const":"read_web_page"},"arguments":{"type":"object","properties":{"url":{"enum":urls}},"required":["url"],"additionalProperties":false}},"required":["action","tool","arguments"],"additionalProperties":false}));
+        let search=json!({"type":"object","properties":{"action":{"const":"tool"},"tool":{"const":"universal_web_search"},"arguments":{"type":"object","properties":{"query":{"type":"string","minLength":8,"maxLength":240},"provider":{"enum":["auto","duckduckgo","bing","news","encyclopedia"]},"recency":{"enum":["any","day","week","month","year"]}},"required":["query","provider","recency"],"additionalProperties":false}},"required":["action","tool","arguments"],"additionalProperties":false});
+        // After a search, if any unread lead exists, require READING one: a small model otherwise
+        // loops re-running near-identical searches instead of opening a source. A fresh search is
+        // only offered when no readable lead remains. The review step after the read can still
+        // reformulate the query.
+        if urls.is_empty() {
+            json!({"oneOf":[search]})
+        } else {
+            let read=json!({"type":"object","properties":{"action":{"const":"tool"},"tool":{"const":"read_web_page"},"arguments":{"type":"object","properties":{"url":{"enum":urls}},"required":["url"],"additionalProperties":false}},"required":["action","tool","arguments"],"additionalProperties":false});
+            json!({"oneOf":[read]})
         }
-        json!({"oneOf":choices})
     }
 
     pub fn discovery_context(&self, question: &str) -> String {
@@ -396,10 +402,18 @@ mod tests {
     #[test]
     fn discovery_can_read_real_leads_or_change_the_query() {
         let mut session=ResearchSession::default();
+        // With an unread lead, discovery FORCES reading it (no re-search option) so a small model
+        // cannot loop re-running near-identical searches instead of opening a source.
         session.observe(1,"universal_web_search",&json!({"query":"a new release"}),true,&json!({"hits":[{"url":"https://example.com/release","title":"Publisher"}]}));
         let schema=session.discovery_schema();
-        assert_eq!(schema["oneOf"].as_array().unwrap().len(),2);
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(),1);
+        assert_eq!(schema["oneOf"][0]["properties"]["tool"]["const"],"read_web_page");
         assert_eq!(schema["oneOf"][0]["properties"]["arguments"]["properties"]["url"]["enum"][0],"https://example.com/release");
+        // Once every lead is read, a fresh search is offered again.
+        session.observe(2,"read_web_page",&json!({"url":"https://example.com/release"}),true,&json!({"url":"https://example.com/release","page":{"content":"content"}}));
+        let schema=session.discovery_schema();
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(),1);
+        assert_eq!(schema["oneOf"][0]["properties"]["tool"]["const"],"universal_web_search");
     }
 
     #[test]

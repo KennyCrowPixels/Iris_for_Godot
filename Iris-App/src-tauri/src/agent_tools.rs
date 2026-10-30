@@ -4,7 +4,7 @@ pub(super) fn catalog(flags: &SetupFlags) -> Vec<Value> {
     let mut tools = vec![schema("project_connections", "List configured project and connection ids; not proof of connectivity.", serde_json::json!({}), &[])];
     if flags.mcp_enabled {
         tools.push(schema("list_project_tools", "List a linked MCP bridge's tools. connection_id is the exact mcp id from project_connections (mcp_id is also accepted).", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0}}), &[]));
-        tools.push(schema("call_project_tool", "Call one tool on a linked MCP bridge. connection_id is the exact mcp id (mcp_id accepted); tool_name is one of that bridge's listed tools.", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object"},"effect":{"enum":["read","write"]}}), &["tool_name","arguments","effect"]));
+        tools.push(schema("call_project_tool", "Call one tool on a linked MCP bridge. connection_id is the exact mcp id (mcp_id accepted); tool_name is one of that bridge's listed tools. arguments defaults to {} when the tool takes none; effect defaults to read.", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object"},"effect":{"enum":["read","write"]}}), &["tool_name"]));
         tools.push(schema("ssh_action", "Use linked SSH within its root. Mutation/exec needs approval.", serde_json::json!({"connection_id":{"type":"string"},"action":{"enum":["list","read","write","mkdir","move","delete","exec"]},"arguments":{"type":"object"}}), &["connection_id","action","arguments"]));
     }
     if flags.repos_enabled {
@@ -217,7 +217,7 @@ pub(super) fn requires_plan(tool: &str, args: &Value) -> bool {
         "project_files" => !matches!(args["action"].as_str(), Some("list" | "search" | "read")),
         "ssh_action" => !matches!(args["action"].as_str(), Some("list" | "read")),
         "desktop_action" => args["action"].as_str() != Some("list"),
-        "call_project_tool" => args["effect"].as_str() != Some("read"),
+        "call_project_tool" => args.get("effect").and_then(Value::as_str) == Some("write"),
         "clone_repository" => true,
         _ => false,
     }
@@ -280,11 +280,11 @@ pub(super) async fn execute(
             } else {
                 let name = string_arg(args,"tool_name")?.to_string();
                 let entry = catalog.iter().find(|entry|entry.name==name).ok_or("Tool is not advertised by this MCP server")?;
-                let arguments = args.get("arguments").cloned().ok_or("arguments is required")?;
+                let arguments = args.get("arguments").cloned().filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
                 let validator = jsonschema::validator_for(&entry.input_schema).map_err(|err|format!("Server schema is invalid: {err}"))?;
                 if let Err(err) = validator.validate(&arguments) { return Err(format!("MCP arguments failed validation: {err}. Correct them; no call was made.")); }
                 let read_only_hint = entry.annotations.get("readOnlyHint").and_then(Value::as_bool);
-                let read_only = read_only_hint.unwrap_or(args.get("effect").and_then(Value::as_str)==Some("read"));
+                let read_only = read_only_hint.unwrap_or(args.get("effect").and_then(Value::as_str) != Some("write"));
                 if !read_only && task.steps.is_empty() { return Err("This MCP operation changes state. Create a small verifiable plan before executing it.".into()); }
                 if policy_read_only && read_only_hint != Some(true) {return Err("Read-only policy requires an explicitly read-only MCP capability".into());}
                 verifies_state = read_only;

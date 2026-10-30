@@ -796,6 +796,10 @@ pub(super) async fn run(
                 }
                 "project" if attached.is_some() => {
                     project_inspection = attached.is_some_and(|project| !project.mcp_ids.is_empty() || !project.repo_ids.is_empty() || !project.manipulation_root_path.trim().is_empty());
+                    // A project-inspection turn must use the project's OWN tools, not the web. Dropping
+                    // the web tools stops a confused small model from web-searching "what is an MCP bridge".
+                    tools.retain(|tool| !matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("universal_web_search") | Some("read_web_page")));
+                    feedback="Inspect the linked project with its OWN tools. project_connections (being called now) lists each connected bridge and the tools it offers; then call call_project_tool with that exact connection_id and one listed tool_name to read scenes/nodes. The MCP bridge and these project tools are your built-in way to see this project; never web-search to learn what an 'MCP bridge' is or whether it is enabled.".into();
                     research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})});
                 }
                 "act" => {
@@ -859,7 +863,7 @@ pub(super) async fn run(
             clear_provisional_answer(window,event_name,&mut displayed);
             if research.window_reviews() >= budget.research.max_reviews || task.total_actions.saturating_sub(action_start) >= budget.max_actions {
                 task.status=TaskStatus::Paused;
-                task.last_message=research.partial_answer();
+                task.last_message=deliver_best_effort(&client,&task,&research,&budget,&control).await.unwrap_or_else(||research.partial_answer());
                 break;
             }
             if research.attempts.last().is_some_and(|attempt|attempt.tool=="universal_web_search") {
@@ -1037,7 +1041,7 @@ pub(super) async fn run(
                     Err(format!("Tool '{tool}' is not enabled. Choose from the current catalog."))
                 } else if agent_research::handles(&tool) && research.before_call(&tool,&budget.research).is_err() {
                     task.status=TaskStatus::Paused;
-                    task.last_message=research.partial_answer();
+                    task.last_message=deliver_best_effort(&client,&task,&research,&budget,&control).await.unwrap_or_else(||research.partial_answer());
                     Ok("Research budget reached; supported findings preserved.".into())
                 } else {
                     let signature = format!("{tool}:{}", arguments);

@@ -5681,6 +5681,47 @@ function App() {
     });
   }
 
+  // Gather every saved reasoning/activity log in the active chat into one clipboard blob so the
+  // user can paste the whole chat's agent trace somewhere (e.g. to report an issue).
+  async function copyChatActivityLogs() {
+    const tab = tabsRef.current.find((t) => t.id === activeTab) || currentTab;
+    const msgs = (tab?.messages || []) as Message[];
+    const blocks: string[] = [];
+    let responseIndex = 0;
+    for (const msg of msgs) {
+      if (msg.role !== "llm") continue;
+      responseIndex += 1;
+      const log = msg.thinkingLog && typeof msg.thinkingLog === "object" ? (msg.thinkingLog as IrisMessageThinkingLog) : null;
+      if (!log) continue;
+      blocks.push([
+        `=== ${assistantLabel} reasoning log / response #${responseIndex} — ${formatMessageTimestamp(msg.time) || "(no timestamp)"} ===`,
+        `Planner: ${log.plannerPath || "(n/a)"} | ${log.plannerIntent || "(n/a)"} | ${log.plannerStrategy || "(n/a)"}`,
+        `Route: ${log.routeSummary || "(n/a)"}`,
+        `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}`,
+        "",
+        "Reasoning summaries:",
+        log.workLog?.length ? log.workLog.map((e) => `${new Date(e.ts).toLocaleTimeString()} | ${e.text}`).join("\n") : "(empty)",
+        "",
+        "Action trace:",
+        log.actionTrace?.length ? log.actionTrace.map((e) => `${new Date(e.ts * 1000).toLocaleTimeString()} | ${e.action} | ${e.reason} | ${e.outcome}`).join("\n") : "(empty)",
+        "",
+        "Prompt snapshot:",
+        log.prompt || "(empty)",
+      ].join("\n"));
+    }
+    if (!blocks.length) {
+      showRuntimeToast("No activity logs are saved for this chat yet.");
+      return;
+    }
+    const full = `Activity logs — ${tab?.title || `Tab #${activeTab}`} (${blocks.length} entries)\n\n${blocks.join("\n\n\n")}`;
+    try {
+      await navigator.clipboard.writeText(full);
+      showRuntimeToast(`Copied ${blocks.length} activity log${blocks.length === 1 ? "" : "s"} for this chat to the clipboard.`);
+    } catch {
+      showRuntimeToast("Couldn't access the clipboard to copy the logs.");
+    }
+  }
+
   function setRoutineStepStatus(stepId: string, patch: Partial<RoutineStep>) {
     setActiveRoutine(prev => {
       if (!prev) return prev;
@@ -9565,7 +9606,14 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       onError: (message) => {
         setMicListening(false);
         clearNoAudioTimer();
-        showRuntimeToast(`Voice input error: ${message}`);
+        const normalized = String(message || "").toLowerCase();
+        if (normalized.includes("network")) {
+          showRuntimeToast("Voice input needs the browser speech service, which this desktop webview can't reach. Desktop dictation isn't supported here yet — the Android companion app uses native on-device speech instead.");
+        } else if (normalized.includes("not-allowed") || normalized.includes("service-not-allowed")) {
+          showRuntimeToast("Microphone access was blocked. Allow the mic for this app and try again.");
+        } else {
+          showRuntimeToast(`Voice input error: ${message}`);
+        }
       },
     });
     setMicListening(started);
@@ -10726,6 +10774,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <div className="dropdown-item" onClick={handleSettings}>Settings</div>
               <div className="dropdown-item" onClick={handleToolsCenter}>Tools Center</div>
               <div className="dropdown-item" onClick={() => { handleAgentStats(); setOpenMenu(null); }}>Agent Stats</div>
+              <div className="dropdown-item" onClick={() => { void copyChatActivityLogs(); setOpenMenu(null); }}>Copy activity logs</div>
 
               {ENABLE_DEVELOPER_TOOLS && <div
                 className="dropdown-item"
