@@ -4,11 +4,19 @@ A deep-polish milestone focused on autonomy, conversational quality, and getting
 
 ## Autopilot that actually keeps going
 
-Testing Mode is meant to run like autopilot — work to completion on its own and only stop for a real permission or a genuine blocker. It now behaves that way:
+Testing Mode is meant to run like autopilot — work to completion on its own and only stop for a real permission or a genuine blocker. It is now **renamed "Autopilot"** (clearer label, same setting) and actually behaves that way:
 
 - The agent protocol explicitly tells the model to **work autonomously to completion** and to **never pause to ask whether to continue**, to confirm an obvious next step, or just because several steps have passed. The only valid reasons to stop are a concrete external blocker it cannot work around, or an ambiguity only you can resolve. Permission prompts are handled separately and are not a reason to stop.
-- In Testing Mode, a premature model-requested pause is **declined and converted into "keep working"** up to a bounded number of times, and the rejection/bookkeeping thresholds are raised, so the task pushes through instead of handing back to you.
+- In Autopilot, a premature model-requested pause is **declined and converted into "keep working"** up to a bounded number of times, and the rejection/bookkeeping thresholds are raised, so the task pushes through instead of handing back to you.
 - Autonomous (scheduled) tasks continue to auto-resume incomplete work, which now compounds with the above so a run reaches completion far more often without manual "Resume".
+
+## MCP / Godot bridge polish
+
+The bridge connection works, but the agent loop around it was mishandling results. Fixed the three biggest failure modes from real testing:
+
+- **No more invented scene/node names.** A project-inspection turn can no longer finish stating scenes, nodes, or files unless it actually called a real inspection tool (`call_project_tool`, `project_files`, or `ssh_action`). If it hasn't inspected, it must do so; if inspection fails, it says so honestly instead of fabricating a plausible list.
+- **Repeated-action stalls now recover instead of pausing.** When the model tries the exact same tool call again, it is handed back **its own cached result** for those arguments and told to answer from that evidence (or try a different tool/args). This fixes both the "kept pausing / Resume loop" and the "the answer only showed up on a later prompt" symptom — the data was already retrieved; the loop just wasn't delivering it.
+- Combined with Autopilot declining premature pauses, the delete/replace-a-node style task no longer gets stuck repeating "no evidence supports completion"; it is pushed to take the concrete bridge action.
 
 ## Smarter, more honest conversation
 
