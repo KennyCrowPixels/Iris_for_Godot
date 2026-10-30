@@ -2,7 +2,7 @@
   "expo": {
     "name": "Iris Companion",
     "slug": "iris-companion",
-    "version": "0.3.3-alpha.0",
+    "version": "0.3.4-alpha.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "scheme": "iris-companion",

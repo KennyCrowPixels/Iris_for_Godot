@@ -7412,7 +7412,11 @@ fn parse_weather_response(geo: &WeatherGeoTarget, forecast_json: &Value, day_off
     .collect::<Vec<_>>()
     .join(", ");
   let summary = match temperature_f {
-    Some(temperature) => format!("Current conditions: {temperature:.1} F, {conditions}, as of {} {timezone}. Daily highs and lows are forecasts, not the current temperature.", observed_at.as_deref().unwrap_or("")),
+    Some(temperature) => {
+      let local_time = observed_at.as_deref().and_then(|stamp| stamp.split('T').nth(1)).unwrap_or("");
+      let place = if location_label.trim().is_empty() { "this location".to_string() } else { location_label.clone() };
+      format!("Current weather in {place}: {temperature:.1} F, {conditions}, as of {local_time} local time.")
+    }
     None => format!("Forecast for {date}: {conditions}, high {max_temp:.1} F, low {min_temp:.1} F."),
   };
 

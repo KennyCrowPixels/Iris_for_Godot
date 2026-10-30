@@ -1,6 +1,6 @@
 [package]
 name = "iris-app"
-version = "0.3.3-alpha.0"
+version = "0.3.4-alpha.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

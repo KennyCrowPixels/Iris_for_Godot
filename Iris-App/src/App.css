@@ -1924,6 +1924,8 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .research-review p { margin: 6px 0; }
 .service-checking { animation: service-spin 1.4s linear infinite; }
 @keyframes service-spin { to { transform: rotate(360deg); } }
+.mcp-spinner { display: inline-block; width: 11px; height: 11px; border: 2px solid rgba(var(--app-accent-rgb), 0.3); border-top-color: var(--app-accent); border-radius: 50%; animation: service-spin 0.7s linear infinite; vertical-align: -1px; margin-right: 5px; }
+.setup-btn:disabled { opacity: 0.75; cursor: progress; }
 .agent-progress-strip > svg { color: var(--app-accent); flex-shrink: 0; }
 .agent-progress-status { text-transform: capitalize; color: var(--app-accent); font-weight: 650; }
 .agent-progress-strip.paused { background: rgba(var(--app-accent-rgb), 0.1); border-top-color: var(--app-accent); }

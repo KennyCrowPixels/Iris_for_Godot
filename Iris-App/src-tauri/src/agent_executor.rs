@@ -358,7 +358,7 @@ fn action_messages(
     let input_budget = budget.input_char_budget();
     let catalog = tool_contracts(tools);
     let mut protocol = if tools.is_empty() && task.steps.is_empty() {
-        "You are Iris, a local AI companion and practical assistant. Answer the CURRENT user message directly in ordinary text, matching their tone and requested depth. This is conversation, stable knowledge, writing or recall, not an agent/tool planning turn. Preserve conversation context and character details when relevant. Do not output JSON, a tool request, a plan or private reasoning. No live lookup was performed; do not claim one. State uncertainty if needed. For a simple factual question, give its answer in one short sentence.".to_string()
+        "You are Iris, a local AI companion and practical assistant. Answer the CURRENT user message directly in ordinary text, matching their tone and requested depth. This is conversation, stable knowledge, writing or recall, not an agent/tool planning turn. Preserve conversation context and character details when relevant. Do not output JSON, a tool request, a plan or private reasoning. No live lookup was performed; do not claim one. State uncertainty if needed. You are a desktop companion that can also use optional desktop-control, project and web tools when the user enables them; never claim to be merely a text-based model or unable to see the screen, run apps, or search the web. If the request needs such a capability and it was not available this turn, say briefly that it can be enabled in Settings (Desktop Tools, an MCP bridge for a project, or web search) rather than denying the ability. For a simple factual question, give its answer in one short sentence.".to_string()
     } else {
         format!("{ACTION_PROTOCOL}\nCurrent UTC date: {}.\nEnabled tools with required arguments (private): {catalog}", time::OffsetDateTime::now_utc().date())
     };
@@ -585,6 +585,8 @@ async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequ
         json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\"}"}),
         json!({"role":"user","content":"How warm is it in Oslo, Norway right now?"}),
         json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\"}"}),
+        json!({"role":"user","content":"Take a screenshot of my screen and tell me what you see."}),
+        json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\"}"}),
         json!({"role":"user","content":"Continue the saved unfinished task from its notes."}),
         json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\"}"}),
         json!({"role":"system","content":format!("Context for resolving references only, not the current request. Today: {}. Attached project: {}. Saved unfinished objective: {}. Recent conversation:\n{}\nClassify only the user's next message.",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),context)}),
@@ -594,7 +596,7 @@ async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequ
     let mut need: agent_research::EvidenceNeed=serde_json::from_str(&raw).map_err(|error|format!("Could not assess evidence needs: {error}"))?;
     let lookups=network_action_schema(tools);
     if need.route=="web" && lookups["oneOf"].as_array().is_some_and(|choices|!choices.is_empty()) {
-        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. Copy the location, place, or subject VERBATIM from the current user question into the tool arguments; never substitute a different place or reuse a location mentioned earlier in the chat. Include the region/state/country when the user gave it (for example 'Durham, NC'). Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
+        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. For a general web search, set the query to the resolved subject in 'Evidence needed', which already names the exact entity from the conversation; keep that proper name intact. For a location or measurement tool (such as weather), copy the place VERBATIM from the current user question, include the region/state/country when the user gave it (for example 'Durham, NC'), and never reuse a place mentioned earlier in the chat. Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
         if let Ok(raw)=next_action(client,&request.model,messages,&intake_budget,control,Some(lookups),|_|{}).await {
             need.lookup=parse_model_action(&raw,tools).ok();
         }
@@ -740,10 +742,11 @@ pub(super) async fn run(
         let _=window.emit(event_name,IrisEvent::Status("Checking whether this request needs current evidence...".into()));
         match assess_evidence_need(&client,request,&budget,&control,&project_context,previous.as_ref().filter(|task|task.status!=TaskStatus::Completed).map(|task|task.goal.as_str()),&tools).await {
             Ok(need) => match {
-                record_reasoning(window,event_name,&mut task,&format!("Request assessment: {}. {}",need.route,match need.route.as_str(){"answer"=>"Stable knowledge or conversation; no external lookup required.","web"=>"Fresh evidence is needed; select a directly relevant lookup.","project"=>"Inspect the linked project before making project-specific claims.","clarify"=>"The current request needs a clarification.",_=>"Continue from the saved objective."}));
+                record_reasoning(window,event_name,&mut task,&format!("Request assessment: {}. {}",need.route,match need.route.as_str(){"answer"=>"Stable knowledge or conversation; no external lookup required.","web"=>"Fresh evidence is needed; select a directly relevant lookup.","project"=>"Inspect the linked project before making project-specific claims.","act"=>"A local device, app, or bridge action is requested; use the enabled tool or name what to enable.","clarify"=>"The current request needs a clarification.",_=>"Continue from the saved objective."}));
                 need.route.as_str()
             } {
                 "web" if tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search")) => {
+                    research.set_subject(&need.input);
                     research_next=need.lookup.filter(|action|matches!(action,AgentAction::Tool{tool,..} if agent_research::handles(tool)));
                     if research_next.is_none() {repair_schema=Some(network_action_schema(&tools));}
                     feedback=format!("This request needs live evidence. Choose the most directly relevant enabled lookup and supply its required arguments. Suggested discovery query: {}. No source has been retrieved yet.",need.input);
@@ -754,6 +757,9 @@ pub(super) async fn run(
                     feedback="Answer the current message directly using stable knowledge or the conversation. No new external research is needed. Do not turn prior research failures into a plan for this different question; state uncertainty if necessary.".into();
                 }
                 "project" if attached.is_some() => research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})}),
+                "act" => {
+                    feedback="This request asks for a local device, app, file or bridge action. If the matching tool is enabled, call it and report only its real observed result. If no such tool is enabled, tell the user plainly which capability to enable in Settings (Desktop Tools, or link an MCP bridge or repository to this project); never claim you are only a text-based model or unable to see the screen or control apps.".into();
+                }
                 "clarify" if !need.input.trim().is_empty() => research_next=Some(AgentAction::Finish{message:need.input}),
                 "resume" => {
                     if let Ok(saved)=resumed_task(previous.as_ref(),task.project_id.as_ref(),&request.model) {

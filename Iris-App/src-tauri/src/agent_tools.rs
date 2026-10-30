@@ -232,7 +232,7 @@ pub(super) async fn execute(
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
             let guidance = if can_bridge {
-                "Use list_project_tools then call_project_tool on a linked MCP id to inspect or edit scenes/nodes. Report only what a successful call returns; never invent scene, node, or file names."
+                "To inspect scenes/nodes, call list_project_tools with the mcp id, then call_project_tool with that id, the exact tool_name, its arguments, and effect:read (a read needs no plan). Report only what a successful call returns; never invent scene, node, or file names. If a bridge call returns an error, state the error and that the bridge may be offline; do not guess the result."
             } else if can_files {
                 "No MCP bridge is linked, but a repository/project root is available: use project_files to inspect files. Report only what it returns; do not invent names."
             } else {
@@ -250,7 +250,7 @@ pub(super) async fn execute(
                 let filtered:Vec<_> = catalog.into_iter().filter(|entry| query.is_empty() || format!("{} {}",entry.name,entry.description).to_lowercase().contains(&query)).collect();
                 let total = filtered.len();
                 let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                serde_json::json!({"tools":filtered.into_iter().skip(offset).take(3).collect::<Vec<_>>(),"totalTools":total,"nextOffset":if offset+3<total {Some(offset+3)}else{None}})
+                serde_json::json!({"tools":filtered.into_iter().skip(offset).take(8).collect::<Vec<_>>(),"totalTools":total,"nextOffset":if offset+8<total {Some(offset+8)}else{None}})
             } else {
                 let name = string_arg(args,"tool_name")?.to_string();
                 let entry = catalog.iter().find(|entry|entry.name==name).ok_or("Tool is not advertised by this MCP server")?;

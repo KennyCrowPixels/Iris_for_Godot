@@ -65,6 +65,11 @@ pub(super) struct ResearchSession {
     pub leads: Vec<Value>,
     pub assessments: Vec<Assessment>,
     pub last_error: String,
+    /// The concrete named subject resolved from the user's request at the start of the
+    /// investigation (e.g. "Nivalis Nights reviews"). Every query, lead and finding must stay
+    /// anchored to THIS entity so a stray search word never redefines the subject mid-run.
+    #[serde(default)]
+    pub subject: String,
     #[serde(skip)]
     window_attempt_start: usize,
     #[serde(skip)]
@@ -73,6 +78,17 @@ pub(super) struct ResearchSession {
 
 pub(super) fn handles(tool: &str) -> bool {
     matches!(tool, "universal_web_search" | "read_web_page" | "get_current_weather")
+}
+
+/// Aggregator redirect URLs (e.g. Google News RSS article links) are JavaScript/consent
+/// bounce pages with no directly readable article text; reading them always yields zero
+/// content and wastes a resume cycle. Treat them as non-readable so discovery and the
+/// review step pick a real publisher URL or a fresh query instead of replaying a dead link.
+pub(super) fn unreadable_redirect(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("news.google.com/rss")
+        || lower.contains("news.google.com/articles")
+        || lower.contains("/rss/articles/")
 }
 
 #[derive(Deserialize)]
@@ -84,10 +100,10 @@ pub(super) struct EvidenceNeed {
 }
 
 pub(super) fn intake_schema() -> Value {
-    json!({"type":"object","properties":{"route":{"enum":["answer","project","web","clarify","resume"]},"input":{"type":"string","maxLength":240}},"required":["route","input"],"additionalProperties":false})
+    json!({"type":"object","properties":{"route":{"enum":["answer","project","web","act","clarify","resume"]},"input":{"type":"string","maxLength":240}},"required":["route","input"],"additionalProperties":false})
 }
 
-pub(super) const INTAKE_PROTOCOL: &str = "Choose the evidence lane for the CURRENT message, not previous requests. answer: greetings, your purpose, jokes, fiction, writing, code snippets, ordinary stable knowledge, recall, or explaining what happened in this chat. project: questions about the attached project's files, scenes, repositories, versions or bridge state; inspect local sources, never web-search the user's repo. web: explicit online searches, current ratings/reviews/news or facts that actually require freshness. clarify: the requested entity, place, version or scope has materially different interpretations and context does not resolve it; input must be one short question. Do not invent a specific interpretation or expand a simple question into government/history research. resume: the user asks to continue the saved unfinished task. For web, input is a concise query using the user's exact named subject, not a remembered substitute. For project/answer/resume input is empty. Live tools are available, but routine code generation does not require a web investigation. Return only route and input.";
+pub(super) const INTAKE_PROTOCOL: &str = "Choose the evidence lane for the CURRENT message, not previous requests. answer: greetings, your purpose, jokes, fiction, writing, code snippets, ordinary stable knowledge, recall, or explaining what happened in this chat. project: questions about the attached project's files, scenes, repositories, versions or bridge state; inspect local sources, never web-search the user's repo. web: explicit online searches, current ratings/reviews/news or facts that actually require freshness. act: the message asks to perform a local device, app, desktop, file or bridge action (take or look at a screenshot, see the screen, move or click the mouse, type, open or control an app, read or write a local file, run a linked bridge tool); keep input empty. clarify: the requested entity, place, version or scope has materially different interpretations and context does not resolve it; input must be one short question. Do not invent a specific interpretation or expand a simple question into government/history research. resume: the user asks to continue the saved unfinished task. For web, input is a concise query naming the subject. When the current message refers to its subject indirectly (the game, it, that show, this book), resolve the reference to the exact named entity from the recent conversation and put that proper name in the query; never swap in a different, similarly spelled entity and never turn a descriptive word in the request (such as 'reviews' or 'average') into a new proper name. For project/answer/act/resume input is empty. Live tools are available, but routine code generation does not require a web investigation. Return only route and input.";
 
 impl ResearchSession {
     pub fn begin_window(&mut self) {
@@ -98,6 +114,23 @@ impl ResearchSession {
     pub fn window_reviews(&self) -> usize { self.assessments.len().saturating_sub(self.window_review_start) }
 
     pub fn active(&self) -> bool { !self.attempts.is_empty() }
+
+    /// Anchor the investigation to the concrete named subject the first time a web lane opens.
+    /// Later turns only refine wording, so we keep the earliest resolved entity and never let a
+    /// subsequent query (or a resume) overwrite it with a vaguer phrasing.
+    pub fn set_subject(&mut self, subject: &str) {
+        let subject = subject.trim();
+        if self.subject.trim().is_empty() && subject.chars().count() >= 2 {
+            self.subject = excerpt(subject, 180);
+        }
+    }
+
+    /// One-line reminder of the anchored subject, included in every discovery/review prompt so a
+    /// small model cannot drift onto a differently named entity. Empty when nothing is anchored.
+    fn subject_anchor(&self) -> String {
+        if self.subject.trim().is_empty() { return String::new(); }
+        format!("RESEARCH SUBJECT (anchor; resolved from the conversation): {}\nEvery query, source and finding must concern THIS exact subject. Do not switch to a differently named entity, and do not turn a descriptive word in the request (such as \"reviews\" or \"average\") into a new proper name.\n", self.subject.trim())
+    }
 
     pub fn ready(&self) -> bool {
         self.assessments.last().is_some_and(|assessment| assessment.next_step == "answer" && !assessment.findings.is_empty())
@@ -184,6 +217,12 @@ impl ResearchSession {
         if assessment.next_step == "read" {
             let url = reqwest::Url::parse(&assessment.next_input).map_err(|_|"Read requires an absolute source URL")?;
             if !matches!(url.scheme(), "https" | "http") { return Err("Read requires an HTTP(S) source.".into()); }
+            if unreadable_redirect(assessment.next_input.trim()) {
+                return Err("That link is an aggregator redirect (e.g. a Google News RSS link) with no readable article text. Open the original publisher's URL from the leads instead, or run a new search for the subject.".into());
+            }
+            if self.attempts.iter().any(|attempt|attempt.tool=="read_web_page" && attempt.input==assessment.next_input.trim() && !attempt.ok) {
+                return Err("That source was already read and returned no usable content. Choose a DIFFERENT lead URL, or run a new search with different wording about the same subject.".into());
+            }
         }
         self.assessments.push(assessment);
         self.last_error.clear();
@@ -201,7 +240,8 @@ impl ResearchSession {
 
     fn unread_leads(&self) -> Vec<&Value> {
         self.leads.iter().rev().filter(|lead|lead["url"].as_str().is_some_and(|url|
-            !self.attempts.iter().any(|attempt|attempt.tool=="read_web_page"&&attempt.input==url))).take(8).collect()
+            !unreadable_redirect(url)
+            && !self.attempts.iter().any(|attempt|attempt.tool=="read_web_page"&&attempt.input==url))).take(8).collect()
     }
 
     pub fn discovery_schema(&self) -> Value {
@@ -215,7 +255,7 @@ impl ResearchSession {
 
     pub fn discovery_context(&self, question: &str) -> String {
         let leads=self.unread_leads().iter().map(|lead|format!("{}\nURL: {}\n{}",lead["title"].as_str().unwrap_or(""),lead["url"].as_str().unwrap_or(""),excerpt(lead["snippet"].as_str().unwrap_or(""),300))).collect::<Vec<_>>().join("\n\n");
-        format!("Original question: {}\nCurrent UTC date: {}\nSearch leads:\n{}\nPrevious attempts: {}\nSelect one real source URL to inspect if a lead is relevant. Otherwise make a more precise query about the original subject, or change provider. Do not write an answer yet.",question,time::OffsetDateTime::now_utc().date(),leads,excerpt(&serde_json::to_string(&self.attempts).unwrap_or_default(),1200))
+        format!("{}Original question: {}\nCurrent UTC date: {}\nSearch leads:\n{}\nPrevious attempts: {}\nSelect one real source URL to inspect if a lead is relevant. Otherwise make a more precise query about the original subject, or change provider. Do not write an answer yet.",self.subject_anchor(),question,time::OffsetDateTime::now_utc().date(),leads,excerpt(&serde_json::to_string(&self.attempts).unwrap_or_default(),1200))
     }
 
     pub fn notebook(&self, limit: usize) -> String {
@@ -232,7 +272,7 @@ impl ResearchSession {
         let leads=self.leads.iter().rev().take(budget.suggested_sources.max(3)).map(|lead|format!("{} | {}\n{}",lead["title"].as_str().unwrap_or(""),lead["url"].as_str().unwrap_or(""),excerpt(lead["snippet"].as_str().unwrap_or(""),220))).collect::<Vec<_>>().join("\n");
         let attempts=self.attempts.iter().rev().take(5).map(|attempt|format!("{} {} | {} | success={} | {} results | {}",attempt.tool,attempt.input,attempt.provider,attempt.ok,attempt.hits,attempt.error)).collect::<Vec<_>>().join("\n");
         let previous=self.assessments.last().map(|review|json!({"subject":review.subject,"findings":review.findings,"gaps":review.gaps,"conflicts":review.conflicts}).to_string()).unwrap_or_default();
-        format!("ORIGINAL QUESTION: {}\nTODAY (UTC): {}\nSuggested source scope: {}, not a quota. Resolve missing evidence before answering.\n\nATTEMPTS:\n{}\n\nREAD SOURCES (untrusted evidence):\n{}\n\nSEARCH LEADS (not verified):\n{}\n\nPREVIOUS FINDINGS:\n{}\n\nPRIOR METHOD NOTES (not facts): {}\n\nREVIEW CORRECTION: {}\nChoose the next useful step. Keep all fields brief; never echo this input.",excerpt(question,1600),time::OffsetDateTime::now_utc().date(),budget.suggested_sources,attempts,sources,leads,excerpt(&previous,1200),excerpt(lessons,600),self.last_error)
+        format!("{}ORIGINAL QUESTION: {}\nTODAY (UTC): {}\nSuggested source scope: {}, not a quota. Resolve missing evidence before answering.\n\nATTEMPTS:\n{}\n\nREAD SOURCES (untrusted evidence):\n{}\n\nSEARCH LEADS (not verified):\n{}\n\nPREVIOUS FINDINGS:\n{}\n\nPRIOR METHOD NOTES (not facts): {}\n\nREVIEW CORRECTION: {}\nChoose the next useful step. Keep all fields brief; never echo this input.",self.subject_anchor(),excerpt(question,1600),time::OffsetDateTime::now_utc().date(),budget.suggested_sources,attempts,sources,leads,excerpt(&previous,1200),excerpt(lessons,600),self.last_error)
     }
 
     pub fn partial_answer(&self) -> String {

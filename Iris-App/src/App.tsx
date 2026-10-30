@@ -10959,8 +10959,14 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           )}
                         </div>
                         <div style={{ display: "flex", gap: 6 }}>
-                          <button className="setup-btn" onClick={() => toggleMcpServer(mcp)}>
-                            {mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
+                          <button
+                            className="setup-btn"
+                            disabled={mcpHealthStatus[mcp.id]?.state === "launching"}
+                            onClick={() => toggleMcpServer(mcp)}
+                          >
+                            {mcpHealthStatus[mcp.id]?.state === "launching"
+                              ? (<><span className="mcp-spinner" />Launching…</>)
+                              : mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
                           </button>
                           <button
                             className="setup-btn"
@@ -12977,10 +12983,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       {parseMcpTarget(mcp.target).type === "stdio" && (
                         <button
                           className="setup-btn"
+                          disabled={mcpHealthStatus[mcp.id]?.state === "launching"}
                           onClick={() => toggleMcpServer(mcp)}
                           title={mcpLaunchStatus[mcp.id]?.launched ? "Stop launched bridge process" : "Launch MCP server process from target command"}
                         >
-                          {mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
+                          {mcpHealthStatus[mcp.id]?.state === "launching"
+                            ? (<><span className="mcp-spinner" />Launching…</>)
+                            : mcpLaunchStatus[mcp.id]?.launched ? "Stop" : "Launch"}
                         </button>
                       )}
                       <button
