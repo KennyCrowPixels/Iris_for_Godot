@@ -30,7 +30,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest ships a ready Android SDK (ANDROID_HOME set, licenses accepted);
+      # no setup-android step is needed and the deprecated 'tools' package it installs fails.
       - name: Install JS dependencies
         run: npm install --no-audit --no-fund
       - name: Generate native Android project
