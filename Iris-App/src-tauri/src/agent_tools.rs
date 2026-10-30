@@ -3,8 +3,8 @@ use super::*;
 pub(super) fn catalog(flags: &SetupFlags) -> Vec<Value> {
     let mut tools = vec![schema("project_connections", "List configured project and connection ids; not proof of connectivity.", serde_json::json!({}), &[])];
     if flags.mcp_enabled {
-        tools.push(schema("list_project_tools", "Discover exact MCP schemas. Page with offset or filter by query.", serde_json::json!({"connection_id":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0}}), &["connection_id"]));
-        tools.push(schema("call_project_tool", "Call exact MCP schema. effect classifies unannotated tools; unknown reads still require approval.", serde_json::json!({"connection_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object"},"effect":{"enum":["read","write"]}}), &["connection_id","tool_name","arguments","effect"]));
+        tools.push(schema("list_project_tools", "List a linked MCP bridge's tools. connection_id is the exact mcp id from project_connections (mcp_id is also accepted).", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0}}), &[]));
+        tools.push(schema("call_project_tool", "Call one tool on a linked MCP bridge. connection_id is the exact mcp id (mcp_id accepted); tool_name is one of that bridge's listed tools.", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object"},"effect":{"enum":["read","write"]}}), &["tool_name","arguments","effect"]));
         tools.push(schema("ssh_action", "Use linked SSH within its root. Mutation/exec needs approval.", serde_json::json!({"connection_id":{"type":"string"},"action":{"enum":["list","read","write","mkdir","move","delete","exec"]},"arguments":{"type":"object"}}), &["connection_id","action","arguments"]));
     }
     if flags.repos_enabled {
@@ -39,6 +39,15 @@ fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -
 
 fn string_arg<'value>(args: &'value Value, key: &str) -> Result<&'value str, String> {
     args.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty()).ok_or_else(|| format!("'{key}' is required"))
+}
+
+// The model often passes the bridge id as mcp_id (the guidance calls it the "mcp id"); accept the
+// common aliases so a correct intent is not rejected on a parameter-name technicality.
+fn connection_arg(args: &Value) -> Result<String, String> {
+    ["connection_id", "mcp_id", "connectionId", "id"].iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()))
+        .map(str::to_string)
+        .ok_or_else(|| "connection_id is required: use the exact mcp id shown in project_connections.".to_string())
 }
 
 fn project_for_task(app: &tauri::AppHandle, task: &AgentTask) -> Result<(ProjectDef, RepoProjectStore), String> {
@@ -226,13 +235,30 @@ pub(super) async fn execute(
     let result: Result<Value,String> = async { Ok(match tool {
         "project_connections" => {
             let (project,store) = project_for_task(app,task)?;
-            let mcps = store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>();
+            // Eagerly fetch each linked bridge's live tool catalog so the model can call a tool in
+            // ONE step (call_project_tool) with the exact id, instead of the separate
+            // list_project_tools round-trip it frequently malforms. An unresponsive bridge is
+            // reported here with its error so the model can tell the user instead of looping.
+            let mut mcps = Vec::new();
+            let mut any_reachable = false;
+            for item in store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)) {
+                match mcp_list_tools(item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone()).await {
+                    Ok(catalog) => {
+                        any_reachable = true;
+                        let tools = catalog.iter().take(40).map(|entry|serde_json::json!({"tool_name":entry.name,"description":excerpt(&entry.description,140)})).collect::<Vec<_>>();
+                        mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"connected","toolCount":catalog.len(),"tools":tools}));
+                    }
+                    Err(error) => mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"unreachable","error":excerpt(&error,400)})),
+                }
+            }
             let sshs = store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>();
             let repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
-            let guidance = if can_bridge {
-                "To inspect scenes/nodes, call list_project_tools with the mcp id, then call_project_tool with that id, the exact tool_name, its arguments, and effect:read (a read needs no plan). Report only what a successful call returns; never invent scene, node, or file names. If a bridge call returns an error, state the error and that the bridge may be offline; do not guess the result."
+            let guidance = if any_reachable {
+                "Each connected mcps entry already lists its tools. To read data (scene list, current scene, node names), call call_project_tool NOW with connection_id set to that EXACT id, tool_name set to one of its listed tool_name values, arguments set to the tool's inputs (often {}), and effect:\"read\". You do NOT need list_project_tools. Report ONLY what the call returns; never invent scene, node, or file names."
+            } else if can_bridge {
+                "The linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user the bridge is unreachable and quote the error; for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and that the launch command (e.g. uv) is installed. Do NOT invent scene, node, or file names."
             } else if can_files {
                 "No MCP bridge is linked, but a repository/project root is available: use project_files to inspect files. Report only what it returns; do not invent names."
             } else {
@@ -240,10 +266,10 @@ pub(super) async fn execute(
             };
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
                 "mcps":mcps,"sshs":sshs,"repositories":repositories,
-                "inspectable":can_bridge||can_files,"guidance":guidance})
+                "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"guidance":guidance})
         }
         "list_project_tools" | "call_project_tool" => {
-            let connection = linked_mcp(app,task,string_arg(args,"connection_id")?)?;
+            let connection = linked_mcp(app,task,&connection_arg(args)?)?;
             let catalog = mcp_list_tools(connection.id.clone(),connection.target.clone(),connection.connection_type.clone(),connection.launch_command.clone(),connection.launch_args.clone()).await?;
             if tool=="list_project_tools" {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();

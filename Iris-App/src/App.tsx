@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
-import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, Mic, MicOff, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, Mic, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
 import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
 import { themeTokens } from "./lib/theme";
 import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
@@ -3018,6 +3018,8 @@ function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const voiceRecognizerRef = useRef<VoiceRecognizer | null>(null);
   const voiceDraftBaseRef = useRef<string>("");
+  const voiceHeardRef = useRef(false);
+  const voiceNoAudioTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const speakReplyOnDoneRef = useRef<Record<number, boolean>>({});
   const sttSupported = isSpeechRecognitionSupported();
   const ttsSupported = isSpeechSynthesisSupported();
@@ -3025,6 +3027,7 @@ function App() {
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [messageLogViewer, setMessageLogViewer] = useState<MessageLogViewerState | null>(null);
+  const [messageLogCopied, setMessageLogCopied] = useState(false);
   const [autonomousPanelEnabled, setAutonomousPanelEnabled] = useState<boolean>(() => readAutonomousPanelPrefs().enabled);
   const [autonomousPanelCollapsed, setAutonomousPanelCollapsed] = useState<boolean>(() => readAutonomousPanelPrefs().collapsed);
   const [autonomousTasks, setAutonomousTasks] = useState<AutonomousTaskDraft[]>(() => readAutonomousTasksFromStorage());
@@ -9519,6 +9522,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     voiceRecognizerRef.current?.stop();
   }
 
+  function clearNoAudioTimer() {
+    if (voiceNoAudioTimerRef.current) {
+      clearTimeout(voiceNoAudioTimerRef.current);
+      voiceNoAudioTimerRef.current = null;
+    }
+  }
+
   function startVoiceInput() {
     if (!sttSupported) {
       showRuntimeToast("Voice input is not available in this environment.");
@@ -9527,14 +9537,18 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
     stopSpeaking();
     if (!voiceRecognizerRef.current) voiceRecognizerRef.current = new VoiceRecognizer(10000);
     voiceDraftBaseRef.current = input.trim();
+    voiceHeardRef.current = false;
     const dictationTab = activeTab;
     const started = voiceRecognizerRef.current.start({
       onTranscript: (text) => {
+        voiceHeardRef.current = true;
+        clearNoAudioTimer();
         const base = voiceDraftBaseRef.current;
         setInput(base ? `${base} ${text}` : text);
       },
       onEnd: (finalText) => {
         setMicListening(false);
+        clearNoAudioTimer();
         const spoken = finalText.trim();
         if (!spoken) return;
         const base = voiceDraftBaseRef.current;
@@ -9550,10 +9564,22 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
       },
       onError: (message) => {
         setMicListening(false);
+        clearNoAudioTimer();
         showRuntimeToast(`Voice input error: ${message}`);
       },
     });
     setMicListening(started);
+    // Some desktop webviews (notably Windows WebView2) expose SpeechRecognition but never deliver
+    // audio results. If nothing is heard shortly after starting, tell the user plainly rather than
+    // leaving them talking to a dead mic.
+    clearNoAudioTimer();
+    if (started) {
+      voiceNoAudioTimerRef.current = setTimeout(() => {
+        if (!voiceHeardRef.current) {
+          showRuntimeToast("No speech detected yet. If nothing registers, this desktop webview may not support microphone transcription — the Android companion app uses native on-device speech instead.");
+        }
+      }, 6000);
+    }
   }
 
   function toggleVoiceInput() {
@@ -11257,12 +11283,46 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 12, position: "sticky", top: -16, zIndex: 2, background: "var(--app-panel-bg)", padding: "12px 0", borderBottom: "1px solid var(--app-border)", userSelect: "none" }}>
               <div>
                 <div style={{ fontWeight: 700 }}>{messageLogViewer.title}</div>
                 <div style={{ fontSize: 12, opacity: 0.8 }}>{messageLogViewer.timestamp}</div>
               </div>
-              <button type="button" className="setup-btn" onClick={() => setMessageLogViewer(null)}>Close</button>
+              <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                <button
+                  type="button"
+                  className="setup-btn"
+                  title="Copy the full reasoning log to the clipboard"
+                  onClick={async () => {
+                    const log = messageLogViewer.log;
+                    const text = log
+                      ? [
+                          `${messageLogViewer.title} — ${messageLogViewer.timestamp}`,
+                          `Planner: ${log.plannerPath || "(n/a)"} | ${log.plannerIntent || "(n/a)"} | ${log.plannerStrategy || "(n/a)"}`,
+                          `Route: ${log.routeSummary || "(n/a)"}`,
+                          `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}`,
+                          "",
+                          "Reasoning summaries:",
+                          log.workLog.length ? log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n") : "(empty)",
+                          "",
+                          "Action trace:",
+                          log.actionTrace.length ? log.actionTrace.map((entry) => `${new Date(entry.ts * 1000).toLocaleTimeString()} | ${entry.action} | ${entry.reason} | ${entry.outcome}`).join("\n") : "(empty)",
+                          "",
+                          "Prompt snapshot:",
+                          log.prompt || "(empty)",
+                        ].join("\n")
+                      : `${messageLogViewer.title} — ${messageLogViewer.timestamp}\n(No reasoning log was saved with this older message.)`;
+                    try {
+                      await navigator.clipboard.writeText(text);
+                      setMessageLogCopied(true);
+                      setTimeout(() => setMessageLogCopied(false), 1500);
+                    } catch { /* clipboard unavailable */ }
+                  }}
+                >
+                  <Copy size={13} style={{ verticalAlign: -2, marginRight: 5 }} />{messageLogCopied ? "Copied!" : "Copy"}
+                </button>
+                <button type="button" className="setup-btn" onClick={() => setMessageLogViewer(null)}>Close</button>
+              </div>
             </div>
             {!messageLogViewer.log ? (
               <div style={{ fontSize: 13, opacity: 0.84 }}>No reasoning log was saved with this older message.</div>
@@ -14448,13 +14508,20 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             <button
               type="button"
               className={`mic-btn${micListening ? " listening" : ""}`}
-              aria-label={micListening ? "Stop recording" : "Start voice input"}
+              aria-label={micListening ? "Listening — click to stop" : "Start voice input"}
               title={micListening ? "Listening — click to stop (auto-stops after 10s of silence)" : "Speak your message"}
               disabled={menuLocked || (respondingTab !== null && respondingTab !== activeTab && !isGenerating)}
               onClick={toggleVoiceInput}
             >
-              {micListening ? <MicOff size={18} /> : <Mic size={18} />}
+              {micListening ? (
+                <span className="mic-listening-dots" aria-hidden="true"><span /><span /><span /></span>
+              ) : (
+                <Mic size={18} />
+              )}
             </button>
+          )}
+          {micListening && (
+            <span className="listening-pill" role="status" aria-live="polite">Listening…</span>
           )}
           {isSpeaking && (
             <button

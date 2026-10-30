@@ -618,6 +618,26 @@ fn action_pause_message(error: &str) -> String {
     format!("Task paused. {reason} Your progress is saved. Select Resume to continue from these notes, or send a clarification to change the request.")
 }
 
+/// Last-resort synthesis: when the tool loop stalls, the user should still get a useful reply built
+/// from whatever evidence was gathered (search snippets, read pages, bridge errors, observations),
+/// instead of a bare "couldn't complete reliably" pause. Returns None only when nothing was gathered.
+async fn deliver_best_effort(
+    client: &reqwest::Client, task: &AgentTask, research: &agent_research::ResearchSession,
+    budget: &ModelBudget, control: &RunControl,
+) -> Option<String> {
+    if task.observations.is_empty() && research.sources.is_empty() && research.leads.is_empty() { return None; }
+    let evidence = task.observations.iter().rev().take(8)
+        .map(|observation| format!("- {} (success={}): {}", observation.tool, observation.ok, excerpt(&observation.summary, 500)))
+        .collect::<Vec<_>>().join("\n");
+    let protocol = "You could not fully finish through tools, but the user is waiting and must get a useful answer now. Using ONLY the gathered evidence below, write your best answer to their request in plain prose. Be specific about what is confirmed versus uncertain or missing; if a bridge or lookup failed, say so and quote the error. Never invent facts, names, scenes, or sources the evidence does not support. No JSON, no tool request.";
+    let room = budget.input_char_budget().saturating_sub(protocol.chars().count() + 200);
+    let context = format!("User request: {}\n\nGathered evidence (untrusted; rely only on what it actually supports):\n{}\n\nResearch notebook:\n{}", excerpt(&task.goal, 600), excerpt(&evidence, room / 2), research.notebook(room / 2));
+    let messages = vec![json!({"role":"system","content":protocol}), json!({"role":"user","content":excerpt(&context, room)})];
+    next_action(client, &task.model, messages, budget, control, None, |_| {}).await.ok()
+        .map(|raw| research.cite(&agent_stream::visible_answer(&raw)))
+        .filter(|answer| answer.trim().len() > 1)
+}
+
 fn resumed_task(previous: Option<&AgentTask>, project_id: Option<&String>, model: &str) -> Result<AgentTask,String> {
     let mut task=previous.filter(|task|task.status!=TaskStatus::Completed && task.project_id.as_ref()==project_id)
         .cloned().ok_or("No unfinished task is saved for this chat and project.")?;
@@ -734,6 +754,10 @@ pub(super) async fn run(
     // Set when the turn is inspecting an attached project that actually has an inspectable bridge
     // or repo: the model must call a real data tool before it may state scene/node/file facts.
     let mut project_inspection = false;
+    // Set when project_connections reports no reachable bridge and no files: the model then CANNOT
+    // inspect, so it is allowed to finish with an honest "inspection failed" report instead of
+    // being trapped by the evidence gate.
+    let mut project_bridge_down = false;
     let mut previous_response = String::new();
     let mut repair_schema = None;
     let mut rejected = 0usize;
@@ -919,8 +943,9 @@ pub(super) async fn run(
                 atomic_write_json(&task_dir(app, &task.id)?.join("last_rejected_response.json"), &serde_json::json!({"response":raw,"error":err}).to_string())?;
                 feedback = format!("{err}. Your rejected response was: {}. Answer naturally if no external action is needed. Otherwise correct the response to ONE complete JSON object with action=tool, tool=<enabled tool name>, arguments=<object>. Do not append prose to a tool request.", excerpt(&raw, 1000));
                 if rejected >= max_rejections {
+                    let best = deliver_best_effort(&client, &task, &research, &budget, &control).await;
                     task.status = TaskStatus::Blocked;
-                    task.last_message = "Task paused: the model could not produce a valid action after several attempts. Try a smaller step or a different model; progress is saved.".into();
+                    task.last_message = best.unwrap_or_else(|| "Task paused: the model could not produce a valid action after several attempts. Try a smaller step or a different model; progress is saved.".into());
                     break;
                 }
                 continue;
@@ -942,8 +967,9 @@ pub(super) async fn run(
             feedback = "Repeated planning/review is not advancing the request. Answer the user now if no external work is needed; otherwise perform the next concrete tool action. Do not repeat task bookkeeping.".into();
             rejected += 1;
             if rejected >= max_rejections {
+                let best = deliver_best_effort(&client, &task, &research, &budget, &control).await;
                 task.status = TaskStatus::Blocked;
-                task.last_message = "I couldn't make progress on this request. No further actions were started; any existing task notes are saved.".into();
+                task.last_message = best.unwrap_or_else(|| "I couldn't make progress on this request. No further actions were started; any existing task notes are saved.".into());
                 break;
             }
             continue;
@@ -987,8 +1013,8 @@ pub(super) async fn run(
                 if research.active() && !research.ready() {
                     research_pending=true;
                     Err("The research evidence has not yet resolved the original question. Review the subject, dates, source support and remaining gaps.".into())
-                } else if project_inspection && !task.observations.iter().any(|observation| matches!(observation.tool.as_str(), "call_project_tool" | "project_files" | "ssh_action")) {
-                    Err("You have not inspected the project yet, so you cannot know its scenes, nodes, or files. Do NOT invent names. First call list_project_tools to see the linked bridge's tools, then call_project_tool with effect:read (or project_files for a repo) and report ONLY what a successful call returns. If a call fails, say plainly that inspection failed and why.".into())
+                } else if project_inspection && !project_bridge_down && !task.observations.iter().any(|observation| matches!(observation.tool.as_str(), "call_project_tool" | "project_files" | "ssh_action")) {
+                    Err("You have not inspected the project yet, so you cannot know its scenes, nodes, or files. Do NOT invent names. The connected bridge's tools are listed in the project_connections result: call call_project_tool now with that exact connection_id, a listed tool_name, arguments, and effect:read (or project_files for a repo) and report ONLY what it returns.".into())
                 } else {
                     task.finish(&research.cite(&agent_stream::visible_answer(&message))).map(|_| "Completed".into())
                 }
@@ -1035,6 +1061,11 @@ pub(super) async fn run(
                         record_reasoning(window,event_name,&mut task,&format!("Selected tool: {tool}. Awaiting its actual result before making a claim."));
                         match run_tool(app, window, event_name, &control, request, &task, &budget, &tool, &arguments).await {
                             Ok(result) => {
+                                if tool=="project_connections" {
+                                    let reachable = result.value.get("bridgeReachable").and_then(Value::as_bool).unwrap_or(false);
+                                    let has_files = result.value.get("repositories").and_then(Value::as_array).map(|items|!items.is_empty()).unwrap_or(false);
+                                    project_bridge_down = !reachable && !has_files;
+                                }
                                 repeated_calls.insert(signature,count+1);
                                 let evidence = task.observe(&tool, result.ok, result.verifies_state, result.side_effect_attempted, &result.value.to_string());
                                 if agent_research::handles(&tool) {
@@ -1079,14 +1110,17 @@ pub(super) async fn run(
         save_task(app, &task)?;
         if task.status != TaskStatus::Running { break; }
         if rejected >= max_rejections {
+            let best = deliver_best_effort(&client, &task, &research, &budget, &control).await;
             task.status = TaskStatus::Blocked;
-            task.last_message = action_pause_message(&last_action_error);
+            task.last_message = best.unwrap_or_else(|| action_pause_message(&last_action_error));
             break;
         }
     }
     if task.status == TaskStatus::Running {
+        let fallback = format!("Saved progress after {} actions in this work session. {} of {} steps are complete. Continue this task to resume from its notes; it is not yet complete.", budget.max_actions, task.steps.iter().filter(|step| step.status == StepStatus::Complete).count(), task.steps.len());
+        let best = deliver_best_effort(&client, &task, &research, &budget, &control).await;
         task.status = TaskStatus::Paused;
-        task.last_message = format!("Saved progress after {} actions in this work session. {} of {} steps are complete. Continue this task to resume from its notes; it is not yet complete.", budget.max_actions, task.steps.iter().filter(|step| step.status == StepStatus::Complete).count(), task.steps.len());
+        task.last_message = best.unwrap_or(fallback);
     }
     if task.status != TaskStatus::Completed && !displayed.is_empty() {
         task.last_message = format!("{}\n\n{}", displayed, task.last_message);
