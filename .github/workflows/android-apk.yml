@@ -1,0 +1,54 @@
+name: Android APK (Iris Companion)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - iris-android-client/**
+      - .github/workflows/android-apk.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: iris-android-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      # ubuntu-latest ships a ready Android SDK (ANDROID_HOME set, licenses accepted);
+      # no setup-android step is needed and the deprecated 'tools' package it installs fails.
+      - name: Install JS dependencies
+        run: npm install --no-audit --no-fund
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install
+      - name: Tune Gradle/Kotlin memory for the CI runner
+        working-directory: iris-android-client/android
+        run: |
+          echo "org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx2g" >> gradle.properties
+          echo "org.gradle.workers.max=2" >> gradle.properties
+      - name: Build debug APK (installable, debug-signed)
+        working-directory: iris-android-client/android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Stage APK with a stable name
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "iris-companion-${GITHUB_SHA}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iris-companion-apk
+          path: iris-android-client/iris-companion-*.apk
+          if-no-files-found: error

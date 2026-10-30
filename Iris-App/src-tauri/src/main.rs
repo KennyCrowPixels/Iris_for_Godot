@@ -2,12 +2,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crate::commands::ensure_model;
+mod agent_runtime;
+mod dataweb;
+mod platform_macos;
 mod commands;
 use commands::ensure_coder_lite_model;
 use crate::commands::ensure_ollama_running_once;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|_app| {
             ensure_ollama_running_once();
             Ok(())
@@ -41,6 +45,14 @@ fn main() {
             commands::set_setup_flags,
             commands::download_and_install_ollama,
             commands::check_models_ready,
+            commands::get_cognitive_runtime_state,
+            commands::transition_cognitive_runtime_state,
+            commands::append_cognitive_doc_version,
+            commands::list_cognitive_doc_versions,
+            commands::get_latest_cognitive_doc_version,
+            commands::list_cognitive_doc_nodes,
+            commands::read_cognitive_doc_context_slice,
+            commands::clear_cognitive_doc_versions,
             commands::apply_model_profile,
             commands::pull_and_create_models,
             commands::restart_app,
@@ -63,6 +75,9 @@ fn main() {
             commands::install_repo_dependencies,
             commands::network_lookup,
             commands::network_search,
+            commands::get_server_status,
+            commands::start_local_ollama,
+            commands::test_network_search,
             commands::weather_lookup,
             commands::uv_lookup,
             commands::get_repo_project_store,
@@ -76,6 +91,9 @@ fn main() {
             commands::read_universal_dataweb,
             commands::write_universal_dataweb,
             commands::open_universal_dataweb,
+            commands::dataweb_remember,
+            commands::dataweb_recall,
+            commands::dataweb_stats,
             commands::detect_hardware_profile,
                     commands::list_modelfiles,
                     commands::read_modelfile_params,
@@ -98,11 +116,24 @@ fn main() {
                     commands::connect_mcp_server,
                     commands::mcp_list_tools,
                     commands::mcp_call_tool,
+                    commands::inspect_project_bridge_capabilities,
                     commands::ssh_tool_call,
                     commands::start_godot_log_watcher,
                     commands::stop_godot_log_watcher,
                     commands::submit_turn,
                     commands::resolve_permission,
+                    commands::cancel_agent_turn,
+                    commands::get_agent_task,
+                    commands::record_research_feedback,
+                    commands::clear_research_learning,
+                    commands::get_agent_proficiency,
+                    commands::controller_server::get_controller_status,
+                    commands::controller_server::start_controller_server,
+                    commands::controller_server::stop_controller_server,
+                    commands::controller_server::get_controller_token,
+                    commands::controller_server::controller_frontend_ready,
+                    commands::controller_server::rotate_controller_token,
+                    commands::controller_server::rotate_controller_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

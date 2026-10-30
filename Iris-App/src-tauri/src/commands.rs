@@ -1,4 +1,15 @@
 ﻿use std::process::{Command, Stdio};
+
+fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+  let mut command=Command::new(program);
+  command.stdin(Stdio::null());
+  #[cfg(target_os = "windows")]
+  {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+  }
+  command
+}
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -18,11 +29,67 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, Emitter};
 use std::hash::{Hash, Hasher};
 
+#[path = "agent_executor.rs"]
+mod agent_executor;
+
+#[path = "controller_server.rs"]
+pub mod controller_server;
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct UserTurnPayload {
   pub tab_id: u32,
   pub input_text: String,
   pub images: Vec<String>,
+  #[serde(default, alias = "associatedProjectId", deserialize_with = "deserialize_project_association")]
+  pub associated_project_id: Option<Option<String>>,
+  #[serde(default)]
+  pub network_allowed: Option<bool>,
+  #[serde(default)]
+  pub resume_task: bool,
+}
+
+fn deserialize_project_association<'de, Deserializer: serde::Deserializer<'de>>(
+  deserializer: Deserializer,
+) -> Result<Option<Option<String>>, Deserializer::Error> {
+  Option::<String>::deserialize(deserializer).map(Some)
+}
+
+fn sync_turn_associated_project(
+  app: &tauri::AppHandle,
+  tab_id: u32,
+  associated_project_id: Option<&Option<String>>,
+) -> Result<(), String> {
+  let Some(association) = associated_project_id else { return Ok(()); };
+  let normalized = association.as_ref()
+    .map(|value| value.trim().to_string())
+    .filter(|s| !s.is_empty());
+  let path = tab_file(app, tab_id)?;
+
+  let mut snap = if path.exists() {
+    iris_read_snapshot_file(&path)?
+  } else {
+    Snapshot::default()
+  };
+
+  if snap.tab_id.is_none() {
+    snap.tab_id = Some(tab_id);
+  }
+  if snap.title.trim().is_empty() {
+    snap.title = format!("Tab #{}", tab_id);
+  }
+
+  let current = snap
+    .associated_project_id
+    .as_ref()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+  if current == normalized {
+    return Ok(());
+  }
+
+  snap.associated_project_id = normalized;
+  snap.last_updated = Some(now_ts());
+  iris_write_snapshot_file(&path, &snap)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -94,6 +161,10 @@ pub struct OllamaChatRequest {
   pub keep_alive: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub tools: Option<Vec<serde_json::Value>>,
+  #[serde(skip, default = "default_true")]
+  pub network_allowed: bool,
+  #[serde(skip)]
+  pub read_only: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -119,7 +190,10 @@ pub struct OllamaChatStreamChunk {
 #[allow(dead_code)]
 pub enum IrisEvent {
   Status(String),
+  Reasoning(String),
+  AgentProgress(Value),
   Delta(String),
+  ResetAnswer,
   GodotError(String),
   PermissionRequest {
     req_id: String,
@@ -148,6 +222,160 @@ pub struct ChatMessage {
     pub text: String,
     #[serde(default)]
     pub time: i64, // unix seconds
+  #[serde(default, rename = "thinkingLog", alias = "thinking_log")]
+  pub thinking_log: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveRuntimePhase {
+  Idle,
+  Planning,
+  Executing,
+  Qa,
+  Paused,
+  Completed,
+  Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeState {
+  pub phase: CognitiveRuntimePhase,
+  pub resume_phase: Option<CognitiveRuntimePhase>,
+  pub goal_id: String,
+  pub goal_label: String,
+  pub current_step: String,
+  pub active_model: String,
+  pub last_transition_action: String,
+  pub last_transition_at: i64,
+  pub started_at: i64,
+  pub completed_at: i64,
+  pub failed_at: i64,
+  pub paused_at: i64,
+  pub pause_reason: String,
+  pub failure_reason: String,
+  pub iteration_count: u32,
+}
+
+impl Default for CognitiveRuntimeState {
+  fn default() -> Self {
+    Self {
+      phase: CognitiveRuntimePhase::Idle,
+      resume_phase: None,
+      goal_id: String::new(),
+      goal_label: String::new(),
+      current_step: String::new(),
+      active_model: String::new(),
+      last_transition_action: "init".to_string(),
+      last_transition_at: now_ts(),
+      started_at: 0,
+      completed_at: 0,
+      failed_at: 0,
+      paused_at: 0,
+      pause_reason: String::new(),
+      failure_reason: String::new(),
+      iteration_count: 0,
+    }
+  }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveRuntimeTransitionArgs {
+  pub action: String,
+  #[serde(default)]
+  pub goal_id: Option<String>,
+  #[serde(default)]
+  pub goal_label: Option<String>,
+  #[serde(default)]
+  pub current_step: Option<String>,
+  #[serde(default)]
+  pub active_model: Option<String>,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CognitiveRuntimeAction {
+  StartPlanning,
+  StartExecuting,
+  StartQa,
+  Pause,
+  Resume,
+  Complete,
+  Fail,
+  ResetIdle,
+  UpdateProgress,
+}
+
+impl CognitiveRuntimeAction {
+  fn parse(raw: &str) -> Result<Self, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+      "start_planning" => Ok(Self::StartPlanning),
+      "start_executing" => Ok(Self::StartExecuting),
+      "start_qa" => Ok(Self::StartQa),
+      "pause" => Ok(Self::Pause),
+      "resume" => Ok(Self::Resume),
+      "complete" => Ok(Self::Complete),
+      "fail" => Ok(Self::Fail),
+      "reset_idle" => Ok(Self::ResetIdle),
+      "update_progress" => Ok(Self::UpdateProgress),
+      _ => Err(format!(
+        "Unknown cognitive runtime action '{}'. Expected one of: start_planning, start_executing, start_qa, pause, resume, complete, fail, reset_idle, update_progress",
+        raw
+      )),
+    }
+  }
+
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::StartPlanning => "start_planning",
+      Self::StartExecuting => "start_executing",
+      Self::StartQa => "start_qa",
+      Self::Pause => "pause",
+      Self::Resume => "resume",
+      Self::Complete => "complete",
+      Self::Fail => "fail",
+      Self::ResetIdle => "reset_idle",
+      Self::UpdateProgress => "update_progress",
+    }
+  }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocVersion {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub version: u64,
+  pub ts: i64,
+  pub author: String,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitiveDocNode {
+  pub goal_id: String,
+  pub doc_type: String,
+  pub latest_version: u64,
+  pub latest_ts: i64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendCognitiveDocArgs {
+  pub goal_id: String,
+  pub doc_type: String,
+  #[serde(default)]
+  pub author: Option<String>,
+  pub content: String,
+  #[serde(default)]
+  pub metadata: Option<serde_json::Value>,
 }
 
 
@@ -159,6 +387,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static OLLAMA_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static GODOT_WATCHERS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 static INTEGRITY_MOMENTUM: OnceLock<Mutex<HashMap<u32, IntegrityMomentumState>>> = OnceLock::new();
+static BRIDGE_CAPABILITY_CACHE: OnceLock<Mutex<HashMap<String, BridgeCapabilitySnapshot>>> = OnceLock::new();
+static BRIDGE_MUTATION_APPROVALS: OnceLock<Mutex<HashMap<u32, BridgeMutationApproval>>> = OnceLock::new();
 static INTEGRITY_BAND_NORMAL: AtomicU64 = AtomicU64::new(0);
 static INTEGRITY_BAND_CAUTION: AtomicU64 = AtomicU64::new(0);
 static INTEGRITY_BAND_PROTECTIVE: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +402,8 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const MODEL_TAG: &str = "iris-organizer:latest";
 const INTEGRITY_NORMAL_BAND: f32 = 0.80;
 const INTEGRITY_CAUTION_BAND: f32 = 0.60;
+const COGNITIVE_MAX_ACTIVE_SECS: i64 = 900;
+const COGNITIVE_MAX_ITERATIONS: u32 = 18;
 
 #[tauri::command]
 pub async fn submit_turn(
@@ -180,19 +412,68 @@ pub async fn submit_turn(
     window: tauri::Window,
 ) -> Result<(), String> {
     let event_name = format!("iris_event_{}", payload.tab_id);
+  sync_turn_associated_project(&app, payload.tab_id, payload.associated_project_id.as_ref())?;
+    println!("[Routing] Unified agent executor");
 
-    // MCP project handoff (non-Godot requests on a project tab with an active MCP)
-    if try_external_handoff(&app, &payload, &window, &event_name) {
-      println!("[Routing] MCP Handoff Payload");
+    let goal_id = format!("tab{}_{}", payload.tab_id, now_ts());
+    let _ = transition_cognitive_runtime_state_internal(
+      &app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "start_planning".to_string(),
+        goal_id: Some(goal_id.clone()),
+        goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+        current_step: Some("compile_agent_context".to_string()),
+        active_model: None,
+        reason: None,
+      },
+    );
+    if let Err(reason) = enforce_cognitive_runtime_policy(
+      &app,
+      &window,
+      &event_name,
+      payload.tab_id,
+      &goal_id,
+      "compile_agent_context",
+      None,
+    ) {
+      let _ = window.emit(&event_name, IrisEvent::Error(reason));
+      let _ = window.emit(&event_name, IrisEvent::Done);
       return Ok(());
     }
-
-    // Standard chat path — attach tools only when the user's request actually needs them.
-    println!("[Routing] Standard Chat Payload (intent-gated tools)");
+    let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> planning".to_string()));
 
     match compile_agent_context(&app, &payload).await {
       Ok(context) => {
         let selected_model = resolve_submit_model(&app, &payload);
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "start_executing".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("execute_ollama_chat_stream".to_string()),
+            active_model: Some(selected_model.clone()),
+            reason: None,
+          },
+        );
+        if let Err(reason) = enforce_cognitive_runtime_policy(
+          &app,
+          &window,
+          &event_name,
+          payload.tab_id,
+          &goal_id,
+          "execute_ollama_chat_stream",
+          Some(&selected_model),
+        ) {
+          let _ = window.emit(&event_name, IrisEvent::Error(reason));
+          let _ = window.emit(&event_name, IrisEvent::Done);
+          return Ok(());
+        }
+        let _ = window.emit(&event_name, IrisEvent::Status(format!(
+          "Runtime phase -> executing ({})",
+          selected_model
+        )));
+
         let historical_count = context.messages.len().saturating_sub(1);
         let msg = format!(
           "Rust Context Built: {} historical messages loaded. System Prompt length: {}. Model: {}",
@@ -214,8 +495,7 @@ pub async fn submit_turn(
         // Integrity is prompt-specific; momentum only shapes redirect tone and never hard-locks chat.
         let mut integrity = assess_integrity_for_prompt(&payload.input_text);
         apply_integrity_momentum(payload.tab_id, &mut integrity);
-        let attach_tools_by_intent = request_warrants_tools(&payload.input_text, !payload.images.is_empty());
-        let tool_policy = resolve_turn_tool_policy(attach_tools_by_intent, &integrity);
+        let tool_policy = resolve_turn_tool_policy(true, &integrity);
         record_integrity_metrics(&integrity, &tool_policy);
         let bridge_note = build_ephemeral_bridge_note(&integrity);
 
@@ -228,22 +508,94 @@ pub async fn submit_turn(
           if integrity.tags.is_empty() { "none".to_string() } else { integrity.tags.join(",") }
         )));
 
-        let request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
-        match execute_ollama_chat_stream(&window, &event_name, &request).await {
+        let mut request = build_ollama_chat_request(context, selected_model, tool_policy, bridge_note);
+        request.network_allowed = payload.network_allowed != Some(false);
+        match execute_ollama_chat_stream(&app, payload.tab_id, &window, &event_name, &request, payload.resume_task).await {
           Ok(reply) => {
-            let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply);
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "start_qa".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("persist_turn_snapshot".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: None,
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> qa".to_string()));
+            persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, &reply)?;
+            if reply.trim().is_empty() {
+              let reason = "exit_criteria_failed: model produced empty final response".to_string();
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "fail".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("qa_exit_criteria".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: Some(reason.clone()),
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed (exit criteria)".to_string()));
+              let _ = window.emit(&event_name, IrisEvent::Error(reason));
+            } else if agent_executor::load_task(&app, payload.tab_id)?.is_some_and(|task| task.status != crate::agent_runtime::TaskStatus::Completed) {
+              let _ = transition_cognitive_runtime_state_internal(&app, &CognitiveRuntimeTransitionArgs {
+                action: "pause".into(), goal_id: Some(goal_id.clone()), goal_label: None,
+                current_step: Some("progress_saved".into()), active_model: Some(request.model.clone()), reason: Some(reply),
+              });
+            } else {
+              let _ = transition_cognitive_runtime_state_internal(
+                &app,
+                &CognitiveRuntimeTransitionArgs {
+                  action: "complete".to_string(),
+                  goal_id: Some(goal_id.clone()),
+                  goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                  current_step: Some("done".to_string()),
+                  active_model: Some(request.model.clone()),
+                  reason: None,
+                },
+              );
+              let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> completed".to_string()));
+            }
           }
-          Err(_) => {
+          Err(err) => {
             let _ = persist_rust_turn_snapshot(&app, payload.tab_id, &payload.input_text, "");
+            let _ = transition_cognitive_runtime_state_internal(
+              &app,
+              &CognitiveRuntimeTransitionArgs {
+                action: "fail".to_string(),
+                goal_id: Some(goal_id.clone()),
+                goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+                current_step: Some("execute_ollama_chat_stream".to_string()),
+                active_model: Some(request.model.clone()),
+                reason: Some(err),
+              },
+            );
+            let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
           }
         }
       }
       Err(e) => {
+        let _ = transition_cognitive_runtime_state_internal(
+          &app,
+          &CognitiveRuntimeTransitionArgs {
+            action: "fail".to_string(),
+            goal_id: Some(goal_id.clone()),
+            goal_label: Some(format!("Tab {} turn", payload.tab_id)),
+            current_step: Some("compile_agent_context".to_string()),
+            active_model: None,
+            reason: Some(e.clone()),
+          },
+        );
+        let _ = window.emit(&event_name, IrisEvent::Status("Runtime phase -> failed".to_string()));
         let _ = window.emit(&event_name, IrisEvent::Error(e));
         let _ = window.emit(&event_name, IrisEvent::Done);
       }
     }
 
+    let _ = window.emit(&event_name, IrisEvent::Done);
     Ok(())
 }
 
@@ -262,13 +614,272 @@ fn build_agent_tool_section(flags: &SetupFlags) -> String {
   )
 }
 
+fn build_bridge_awareness_context(
+  app: &tauri::AppHandle,
+  tab_id: u32,
+  messages: &[ChatMessage],
+) -> String {
+  let snapshot_path = match tab_file(app, tab_id) {
+    Ok(p) => p,
+    Err(_) => {
+      return "- Active project linkage is unavailable for this tab.\n- If a request appears project-specific, ask the user to link this tab to a project.".to_string();
+    }
+  };
+
+  let snapshot = match iris_read_snapshot_file(&snapshot_path) {
+    Ok(s) => s,
+    Err(_) => {
+      return "- Active project linkage is unavailable for this tab.\n- If a request appears project-specific, ask the user to link this tab to a project.".to_string();
+    }
+  };
+
+  let Some(project_id) = snapshot.associated_project_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    return "- No project is linked to this tab.\n- Do not assume MCP/SSH context unless the user links a project or asks explicitly.".to_string();
+  };
+
+  let store = read_repo_project_store(app);
+  let Some(project) = store.projects.iter().find(|p| p.enabled && p.id == project_id) else {
+    return "- This tab points to a project id that is not enabled in the project store.\n- Ask the user to relink the tab before project manipulation.".to_string();
+  };
+
+  let enabled_mcps: Vec<&McpConnection> = store
+    .mcps
+    .iter()
+    .filter(|m| m.enabled && project.mcp_ids.iter().any(|id| id == &m.id))
+    .collect();
+  let enabled_sshs: Vec<&SshConnection> = store
+    .sshs
+    .iter()
+    .filter(|s| s.enabled && project.ssh_ids.iter().any(|id| id == &s.id))
+    .collect();
+
+  let recent_bridge = has_recent_bridge_context(messages);
+
+  let cached_caps = bridge_capability_cache()
+    .lock()
+    .ok()
+    .and_then(|cache| cache.get(&project.id).cloned());
+
+  let capability_line = if let Some(snapshot) = cached_caps {
+    let mut tags = HashSet::new();
+    let mut total_tools: usize = 0;
+    for cap in snapshot.bridge_capabilities {
+      total_tools += cap.tool_count;
+      for tag in cap.tags {
+        tags.insert(tag);
+      }
+    }
+    let mut merged_tags: Vec<String> = tags.into_iter().collect();
+    merged_tags.sort();
+    format!(
+      "cached capabilities: {} tools | {}",
+      total_tools,
+      if merged_tags.is_empty() { "no capability tags yet".to_string() } else { merged_tags.join(", ") }
+    )
+  } else {
+    "cached capabilities: unknown (run bridge capability check to populate)".to_string()
+  };
+
+  format!(
+    "- Active project: {}\n- Linked MCP bridges: {}\n- Linked SSH bridges: {}\n- Recent bridge continuity in this chat: {}\n- Bridge capability view: {}\n- For project-scoped asks (scene, node, files, edits), prioritize MCP first when available; if MCP cannot satisfy the request, fall back to SSH or local guidance with explicit reason.",
+    project.name,
+    if enabled_mcps.is_empty() { "none".to_string() } else { enabled_mcps.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join(", ") },
+    if enabled_sshs.is_empty() { "none".to_string() } else { enabled_sshs.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(", ") },
+    if recent_bridge { "yes" } else { "no" },
+    capability_line,
+  )
+}
+
+fn infer_bridge_capability_tags(tools: &[McpToolInfo]) -> Vec<String> {
+  let mut tags: HashSet<String> = HashSet::new();
+  for tool in tools {
+    let input_schema_text = serde_json::to_string(&tool.input_schema).unwrap_or_default().to_lowercase();
+    let text = format!(
+      "{} {} {}",
+      tool.name.to_lowercase(),
+      tool.description.to_lowercase(),
+      input_schema_text
+    );
+
+    if contains_any(&text, &["scene", "scenes", "tree", "node", "list_scene", "list scenes"]) {
+      tags.insert("scene.inspect".to_string());
+    }
+    if contains_any(&text, &["file", "files", "dir", "directory", "path", "workspace", "repo"]) {
+      tags.insert("filesystem.inspect".to_string());
+    }
+    if contains_any(&text, &["create", "add", "new", "instantiate"]) {
+      tags.insert("content.create".to_string());
+    }
+    if contains_any(&text, &["edit", "update", "set", "write", "patch", "modify"]) {
+      tags.insert("content.modify".to_string());
+    }
+    if contains_any(&text, &["delete", "remove"]) {
+      tags.insert("content.delete".to_string());
+    }
+    if contains_any(&text, &["rename", "move"]) {
+      tags.insert("content.rename_move".to_string());
+    }
+    if contains_any(&text, &["run", "execute", "play", "build", "compile", "test"]) {
+      tags.insert("project.execute".to_string());
+    }
+    if contains_any(&text, &["property", "transform", "position", "rotation", "scale"]) {
+      tags.insert("node.property_edit".to_string());
+    }
+  }
+
+  if tags.is_empty() && !tools.is_empty() {
+    tags.insert("generic.callable".to_string());
+  }
+
+  let mut out: Vec<String> = tags.into_iter().collect();
+  out.sort();
+  out
+}
+
+fn compute_project_bridge_capability_snapshot(
+  app: &tauri::AppHandle,
+  project: &ProjectDef,
+  store: &RepoProjectStore,
+) -> BridgeCapabilitySnapshot {
+  let mut bridge_capabilities: Vec<BridgeCapability> = Vec::new();
+
+  let project_mcps: Vec<McpConnection> = store
+    .mcps
+    .iter()
+    .filter(|m| m.enabled && project.mcp_ids.iter().any(|id| id == &m.id))
+    .cloned()
+    .collect();
+
+  for mcp in project_mcps {
+    let mut item = BridgeCapability {
+      mcp_id: mcp.id.clone(),
+      mcp_name: mcp.name.clone(),
+      connected: false,
+      tool_count: 0,
+      tools: Vec::new(),
+      tags: Vec::new(),
+      errors: Vec::new(),
+    };
+
+    let parsed = parse_mcp_target(&mcp.target);
+    let connection_type = Some(mcp.connection_type.clone().unwrap_or(parsed.0));
+    let command = if connection_type.as_deref() == Some("stdio") {
+      mcp.launch_command.clone().or(parsed.1.clone())
+    } else {
+      Some(parsed.1.clone().unwrap_or_else(|| mcp.target.clone()))
+    };
+    let args = Some(mcp.launch_args.clone().unwrap_or(parsed.2));
+
+    match connect_mcp_server_inner(
+      mcp.id.clone(),
+      mcp.target.clone(),
+      connection_type.clone(),
+      command.clone(),
+      args.clone(),
+    ) {
+      Ok(conn) => {
+        item.connected = conn.connected;
+      }
+      Err(err) => {
+        item.errors.push(format!("connect failed: {}", err));
+      }
+    }
+
+    match mcp_list_tools_inner(
+      mcp.id.clone(),
+      mcp.target.clone(),
+      connection_type,
+      command,
+      args,
+    ) {
+      Ok(tools) => {
+        item.tool_count = tools.len();
+        item.tools = tools.iter().map(|t| t.name.clone()).collect();
+        item.tags = infer_bridge_capability_tags(&tools);
+      }
+      Err(err) => {
+        item.errors.push(format!("list tools failed: {}", err));
+      }
+    }
+
+    bridge_capabilities.push(item);
+  }
+
+  let snapshot = BridgeCapabilitySnapshot {
+    project_id: project.id.clone(),
+    project_name: project.name.clone(),
+    generated_at: now_ts(),
+    bridge_capabilities,
+  };
+
+  if let Ok(mut cache) = bridge_capability_cache().lock() {
+    cache.insert(project.id.clone(), snapshot.clone());
+  }
+
+  let _ = app; // Reserved for future app-scoped telemetry hooks.
+  snapshot
+}
+
+fn refresh_tab_project_bridge_capabilities(
+  app: &tauri::AppHandle,
+  tab_id: u32,
+) -> Result<BridgeCapabilitySnapshot, String> {
+  let snapshot_path = tab_file(app, tab_id)?;
+  let snapshot = iris_read_snapshot_file(&snapshot_path)?;
+  let project_id = snapshot
+    .associated_project_id
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .ok_or_else(|| "Active tab is not associated with a project.".to_string())?;
+
+  let store = read_repo_project_store(app);
+  let project = store
+    .projects
+    .iter()
+    .find(|p| p.enabled && p.id == project_id)
+    .ok_or_else(|| "Associated project is missing or disabled.".to_string())?
+    .clone();
+
+  Ok(compute_project_bridge_capability_snapshot(app, &project, &store))
+}
+
+#[tauri::command]
+pub fn inspect_project_bridge_capabilities(
+  app: tauri::AppHandle,
+  tab_id: u32,
+  refresh: Option<bool>,
+) -> Result<BridgeCapabilitySnapshot, String> {
+  if refresh.unwrap_or(true) {
+    return refresh_tab_project_bridge_capabilities(&app, tab_id);
+  }
+
+  let snapshot_path = tab_file(&app, tab_id)?;
+  let snapshot = iris_read_snapshot_file(&snapshot_path)?;
+  let project_id = snapshot
+    .associated_project_id
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .ok_or_else(|| "Active tab is not associated with a project.".to_string())?;
+
+  if let Ok(cache) = bridge_capability_cache().lock() {
+    if let Some(existing) = cache.get(&project_id) {
+      return Ok(existing.clone());
+    }
+  }
+
+  refresh_tab_project_bridge_capabilities(&app, tab_id)
+}
+
 pub async fn compile_agent_context(
   app_handle: &tauri::AppHandle,
   payload: &UserTurnPayload,
 ) -> Result<AgentCompiledContext, String> {
   let flags = read_setup_flags(app_handle);
-  let persona = load_persona_prompt();
+  let core_persona = load_core_persona_prompt().unwrap_or_default();
+  let user_persona = ensure_user_persona_prompt_file(Some(app_handle)).ok().and_then(|path|fs::read_to_string(path).ok()).unwrap_or_default();
+  let persona = format!("{core_persona}\n\n{user_persona}");
   let snapshot = load_tab(app_handle, payload.tab_id)?;
+  let bridge_context = build_bridge_awareness_context(app_handle, payload.tab_id, &snapshot.messages);
 
   let mut messages: Vec<OllamaMessage> = snapshot
     .messages
@@ -303,9 +914,10 @@ pub async fn compile_agent_context(
   };
 
   let system_prompt = format!(
-    "{}\n\nRuntime identity:\n- Your display name is {}.\n- You are a local companion: loyal, practical, and supportive.\n- Keep responses concise, clear, and emotionally grounded.\n- Protect the user and their workspace through constructive alternatives, not hard shutdown language.\n- Never expose raw tool invocation JSON, parameter objects, or internal payloads to the user.\n- For simple arithmetic, provide the plain numeric result and only add explanation if it helps the user.\n- If a screenshot has already been captured for the current request, do not ask whether you should proceed with capture; continue with the existing image unless the user explicitly says it is wrong or insufficient.\n\nStyle directives:\n- Use warm, direct language and concrete next steps.\n- When a request is risky, redirect smoothly to safe, useful options in Iris' wheelhouse.\n- Avoid corporate boilerplate or detached policy-jargon phrasing.\n\n{}",
+    "{}\n\nRuntime identity:\n- Your display name is {}.\n- You are a local companion: loyal, practical, and supportive.\n- Keep responses concise, clear, and emotionally grounded.\n- Protect the user and their workspace through constructive alternatives, not hard shutdown language.\n- Never expose raw tool invocation JSON, parameter objects, or internal payloads to the user.\n- For simple arithmetic, provide the plain numeric result and only add explanation if it helps the user.\n- If a screenshot has already been captured for the current request, do not ask whether you should proceed with capture; continue with the existing image unless the user explicitly says it is wrong or insufficient.\n- Never claim live MCP, Godot, SSH, desktop, or network connection state unless verified by tool output in the current turn; if unverified, say verification is required.\n\nBridge awareness:\n{}\n\nStyle directives:\n- Use warm, direct language and concrete next steps.\n- When a request is risky, redirect smoothly to safe, useful options in Iris' wheelhouse.\n- Avoid corporate boilerplate or detached policy-jargon phrasing.\n\n{}",
     persona,
     assistant_name,
+    bridge_context,
     build_agent_tool_section(&flags)
   );
 
@@ -589,6 +1201,22 @@ fn request_warrants_tools(input_text: &str, has_images: bool) -> bool {
     "bridge",
     "inspect",
     "scan",
+    "project",
+    "workspace",
+    "godot",
+    "scene",
+    "node",
+    "open scene",
+    "list scenes",
+    "project contents",
+    "manipulate",
+    "edit",
+    "modify",
+    "rename",
+    "delete",
+    "create",
+    "add",
+    "remove",
     "refresh repo",
     "pull from remote",
     "fetch updates",
@@ -656,6 +1284,8 @@ fn build_ollama_chat_request(
     stream: true,
     keep_alive: Some("90s".to_string()),
     tools: filter_tools_by_policy(build_default_tools(), &tool_policy),
+    network_allowed: true,
+    read_only: tool_policy == RecommendedToolPolicy::ReadOnly,
   }
 }
 
@@ -723,6 +1353,8 @@ fn drain_ndjson_lines(buffer: &mut String) -> Vec<String> {
 }
 
 async fn execute_ollama_chat_stream_inner(
+  app: &tauri::AppHandle,
+  tab_id: u32,
   window: &tauri::Window,
   event_name: &str,
   request: &OllamaChatRequest,
@@ -855,7 +1487,7 @@ async fn execute_ollama_chat_stream_inner(
   // Execute each tool and append result as a tool role message
   let latest_user_text = latest_user_message(&request.messages).unwrap_or("").to_string();
   for tool_call in &intercepted_tool_calls {
-    let tool_result = execute_tool_call(&tool_call.function.name, &tool_call.function.arguments, &latest_user_text).await;
+    let tool_result = execute_tool_call(app, tab_id, &tool_call.function.name, &tool_call.function.arguments, &latest_user_text).await;
     let normalized_tool_images = normalize_ollama_images(&tool_result.images);
     follow_up_messages.push(OllamaMessage {
       role: "tool".to_string(),
@@ -872,6 +1504,8 @@ async fn execute_ollama_chat_stream_inner(
     stream: true,
     keep_alive: request.keep_alive.clone(),
     tools: None,
+    network_allowed: request.network_allowed,
+    read_only: request.read_only,
   };
 
   let mut synth_resp = client
@@ -928,30 +1562,15 @@ async fn execute_ollama_chat_stream_inner(
 }
 
 async fn execute_ollama_chat_stream(
+  app: &tauri::AppHandle,
+  tab_id: u32,
   window: &tauri::Window,
   event_name: &str,
   request: &OllamaChatRequest,
+  resume_task: bool,
 ) -> Result<String, String> {
-  let result = execute_ollama_chat_stream_inner(window, event_name, request).await;
-
-  if let Err(err) = &result {
-    if request.tools.is_some() {
-      let retry_request = build_plain_text_retry_request(request);
-      let _ = window.emit(event_name, IrisEvent::Status("Tool path failed; retrying in plain language...".to_string()));
-      let retry_result = execute_ollama_chat_stream_inner(window, event_name, &retry_request).await;
-      if retry_result.is_ok() {
-        return retry_result;
-      }
-      let fallback = "I hit an internal reply-formatting issue, but I can still help. Please ask again in plain language and I will answer directly.".to_string();
-      let _ = window.emit(event_name, IrisEvent::Delta(fallback.clone()));
-      let _ = window.emit(event_name, IrisEvent::Done);
-      return Ok(fallback);
-    }
-
-    let _ = window.emit(event_name, IrisEvent::Error(err.clone()));
-  }
-
-  let _ = window.emit(event_name, IrisEvent::Done);
+  let result = agent_executor::run(app, tab_id, window, event_name, request, resume_task).await;
+  if let Err(err) = &result { let _ = window.emit(event_name, IrisEvent::Error(err.clone())); }
   result
 }
 
@@ -971,6 +1590,8 @@ fn build_plain_text_retry_request(request: &OllamaChatRequest) -> OllamaChatRequ
     stream: request.stream,
     keep_alive: request.keep_alive.clone(),
     tools: None,
+    network_allowed: request.network_allowed,
+    read_only: request.read_only,
   }
 }
 
@@ -990,7 +1611,7 @@ fn build_default_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "universal_web_search",
-        "description": "Searches the web for current information, recent news, and factual data not available in training context. Use depth=shallow for quick 1-2 result lookups; depth=deep for broader 3-5 result news queries.",
+        "description": "Search the live web for current facts, releases, prices and news. Returns source links, snippets and available publication dates, not a verified answer. Read promising pages before making precise claims and cite sources.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -1001,10 +1622,13 @@ fn build_default_tools() -> Vec<serde_json::Value> {
             "depth": {
               "type": "string",
               "enum": ["shallow", "deep"],
-              "description": "shallow: 1-2 results via DDG HTML scrape; deep: 3-5 results using RSS fallback for news queries"
-            }
+              "description": "shallow: up to 3 sources; deep: up to 6 sources. Both use fallback providers when necessary."
+            },
+            "provider": { "type": "string", "enum": ["auto", "duckduckgo", "bing", "news", "encyclopedia"], "description": "Choose another provider when results are irrelevant or blocked; encyclopedia is useful for discovering unfamiliar entities, not breaking news." },
+            "recency": { "type": "string", "enum": ["any", "day", "week", "month", "year"], "description": "Optional publication recency filter, not proof of the event date." },
+            "max_results": { "type": "integer", "minimum": 1, "maximum": 10 }
           },
-          "required": ["query", "depth"]
+          "required": ["query"]
         }
       }
     }),
@@ -1012,7 +1636,7 @@ fn build_default_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "get_current_weather",
-        "description": "Returns real-time weather forecast data for a city or region using the Open-Meteo API. Use when the user asks about weather, temperature, or forecast.",
+        "description": "Get timestamped current temperature and conditions for a location, with a separately labeled daily forecast. Never use the forecast high as the current temperature.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -1065,6 +1689,23 @@ fn build_default_tools() -> Vec<serde_json::Value> {
         }
       }
     }),
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "bridge_project_action",
+        "description": "Uses the active tab's linked MCP bridge to inspect or manipulate the linked project when bridge capabilities are available.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "instruction": {
+              "type": "string",
+              "description": "Natural language project instruction, e.g. 'list five scenes' or 'rename Main.tscn to MainMenu.tscn'."
+            }
+          },
+          "required": ["instruction"]
+        }
+      }
+    }),
   ]
 }
 
@@ -1101,85 +1742,108 @@ fn capture_screenshot_for_hint(target_hint: Option<&str>) -> Result<(String, Str
   Ok((base64, "Captured full-screen screenshot".to_string()))
 }
 
-async fn execute_universal_search(query: &str, depth: &str) -> String {
+async fn execute_universal_search(query: &str, depth: &str) -> Value {
+  execute_research_search(query, depth, "auto", "any", if depth == "deep" { 6 } else { 3 }).await
+}
+
+async fn execute_research_search(query: &str, depth: &str, selected_provider: &str, recency: &str, max_results: usize) -> Value {
+  let query = query.trim();
+  if query.is_empty() { return serde_json::json!({"error":"A nonempty search query is required"}); }
   let client = match reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(3))
-    .timeout(Duration::from_secs(8))
+    .connect_timeout(Duration::from_secs(5))
+    .timeout(Duration::from_secs(12))
+    .user_agent("Mozilla/5.0 (compatible; Iris/0.3; local research assistant)")
     .build()
   {
     Ok(c) => c,
-    Err(_) => return "Search HTTP client initialization failed.".to_string(),
+    Err(error) => return serde_json::json!({"error":format!("Search HTTP client initialization failed: {error}")}),
   };
 
-  match depth {
-    "shallow" => {
-      let resp = client
-        .get("https://lite.duckduckgo.com/lite/")
-        .header("User-Agent", "iris-app-network-search/1.0")
-        .query(&[("q", query)])
-        .send()
-        .await;
-      if let Ok(r) = resp {
-        if let Ok(body) = r.text().await {
-          let hits = parse_duckduckgo_lite_hits(&body, 2);
-          if !hits.is_empty() {
-            return hits
-              .iter()
-              .map(|h| format!("{}: {}", h.title, h.snippet))
-              .collect::<Vec<_>>()
-              .join("\n");
-          }
-        }
-      }
-      "No shallow search results found.".to_string()
+  let limit = max_results.clamp(1, if depth == "deep" { 10 } else { 6 });
+  let mut failures = Vec::new();
+  let days = match recency { "day" => 1, "week" => 7, "month" => 30, "year" => 365, _ => 0 };
+  for (provider_id, provider, endpoint) in [
+    ("duckduckgo", "DuckDuckGo", "https://html.duckduckgo.com/html/"),
+    ("news", "Google News", "https://news.google.com/rss/search"),
+    ("bing", "Bing", "https://www.bing.com/search"),
+    ("encyclopedia", "Wikipedia", "https://en.wikipedia.org/w/api.php"),
+  ] {
+    if selected_provider != "auto" && selected_provider != provider_id { continue; }
+    let search_query=if provider_id=="news" && days>0 {format!("{query} when:{days}d")} else {query.to_string()};
+    let mut parameters=vec![("q",search_query)];
+    if provider_id=="duckduckgo" && days>0 { parameters.push(("df",match recency {"day"=>"d","week"=>"w","month"=>"m",_=>"y"}.into())); }
+    if provider_id=="bing" {
+      parameters.push(("format","rss".into()));
+      if days>0 { parameters.push(("filters",format!("ex1:\"ez{days}\""))); }
     }
-    _ => {
-      // deep: try DDG JSON then RSS fallback
-      let ddg_resp = client
-        .get("https://api.duckduckgo.com/")
-        .header("User-Agent", "iris-app-network-search/1.0")
-        .query(&[("q", query), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
-        .send()
-        .await;
-      let mut hits: Vec<NetworkHit> = Vec::new();
-      if let Ok(r) = ddg_resp {
-        if let Ok(json) = r.json::<Value>().await {
-          let abstract_text = json.get("AbstractText").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-          let abstract_url = json.get("AbstractURL").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-          if !abstract_text.is_empty() {
-            hits.push(NetworkHit { title: "Result".to_string(), url: abstract_url, snippet: abstract_text, score: 1.0 });
-          }
-          if let Some(related) = json.get("RelatedTopics") {
-            add_related_topics_hits(related, &mut hits);
-          }
+    if provider_id=="news" { parameters.extend([("hl","en-US".into()),("gl","US".into()),("ceid","US:en".into())]); }
+    if provider_id=="encyclopedia" {
+      parameters=vec![("action","query".into()),("list","search".into()),("srsearch",query.into()),("srlimit",limit.to_string()),("format","json".into()),("utf8","1".into())];
+    }
+    let response = client.get(endpoint).query(&parameters).send().await;
+    let body = match response {
+      Ok(response) => read_bounded_network_text(response, 2_000_000).await,
+      Err(error) => Err(error.to_string()),
+    };
+    match body {
+      Ok(body) => {
+        let mut hits = if provider_id == "duckduckgo" { parse_duckduckgo_lite_hits(&body, limit) }
+          else if provider_id=="encyclopedia" { parse_encyclopedia_hits(&body,limit) } else { parse_news_rss_hits(&body, limit) };
+        let mut seen = HashSet::new();
+        let terms=search_query_terms(query);
+        hits.retain(|hit| seen.insert(hit.url.clone()) && search_hit_relevant(hit,&terms));
+        if !hits.is_empty() {
+          return serde_json::json!({"query":query,"provider":provider,"requestedRecency":recency,"hits":hits,"retrievedAt":now_ts(),"completeInventory":false,"warnings":failures,
+            "evidenceKind":"search_snippets","nextStep":"Read a relevant source page to verify dates, release status and exact claims. Publication date is not the event date. Cite the source URL; report uncertainty when sources disagree."});
         }
+        failures.push(format!("{provider}: no query-relevant results or provider challenge"));
       }
-      if hits.is_empty() {
-        let rss_resp = client
-          .get("https://news.google.com/rss/search")
-          .header("User-Agent", "iris-app-network-search/1.0")
-          .query(&[("q", query), ("hl", "en-US"), ("gl", "US"), ("ceid", "US:en")])
-          .send()
-          .await;
-        if let Ok(r) = rss_resp {
-          if let Ok(body) = r.text().await {
-            hits = parse_news_rss_hits(&body, 5);
-          }
-        }
-      }
-      if hits.is_empty() {
-        return "No deep search results found.".to_string();
-      }
-      hits.iter()
-        .take(5)
-        .map(|h| format!("{}: {}", h.title, h.snippet))
-        .collect::<Vec<_>>()
-        .join("\n")
+      Err(error) => failures.push(format!("{provider}: {}", crate::agent_runtime::excerpt(&error, 200))),
     }
   }
+  serde_json::json!({"error":"Search providers returned no usable sources. This is not evidence that the requested information does not exist. Try a more specific query or read a known source URL; do not invent an answer.","query":query,"attempts":failures})
 }
 
-async fn execute_tool_call(name: &str, args: &serde_json::Value, latest_user_text: &str) -> ToolExecutionResult {
+async fn read_bounded_network_text(response: reqwest::Response, limit: usize) -> Result<String, String> {
+  let mut response = response.error_for_status().map_err(|error| error.to_string())?;
+  let mut bytes = Vec::new();
+  while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    if bytes.len() + chunk.len() > limit { return Err("Network response exceeds the text size limit".into()); }
+    bytes.extend_from_slice(&chunk);
+  }
+  Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn search_query_terms(query: &str) -> HashSet<String> {
+  keyword_set(query).into_iter().filter(|term|!matches!(term.as_str(),"the"|"and"|"for"|"with"|"from"|"that"|"this"|"what"|"when"|"where"|"which"|"who"|"how"|"about"|"please"|"latest"|"current"|"recent"|"search"|"look"|"find"|"information"|"news")).collect()
+}
+
+fn search_hit_relevant(hit: &NetworkHit, terms: &HashSet<String>) -> bool {
+  if terms.is_empty() { return true; }
+  let text=format!("{} {} {}",hit.title,hit.snippet,hit.url).to_lowercase();
+  let words=keyword_set(&text);
+  let matched=terms.iter().filter(|term|words.contains(*term)).count();
+  matched>0 && matched as f32 / terms.len() as f32 >= 0.25
+}
+
+fn parse_encyclopedia_hits(body: &str, limit: usize) -> Vec<NetworkHit> {
+  let Ok(value)=serde_json::from_str::<Value>(body) else {return Vec::new();};
+  value.pointer("/query/search").and_then(Value::as_array).into_iter().flatten().take(limit).filter_map(|entry| {
+    let title=entry["title"].as_str()?;
+    let mut url=reqwest::Url::parse("https://en.wikipedia.org/wiki/").ok()?;
+    url.path_segments_mut().ok()?.pop_if_empty().push(&title.replace(' ',"_"));
+    let snippet=Html::parse_fragment(entry["snippet"].as_str().unwrap_or(title)).root_element().text().collect::<Vec<_>>().join(" ");
+    Some(NetworkHit{title:title.into(),url:url.into(),snippet,score:0.0,published_at:None})
+  }).collect()
+}
+
+async fn execute_tool_call(
+  app: &tauri::AppHandle,
+  tab_id: u32,
+  name: &str,
+  args: &serde_json::Value,
+  latest_user_text: &str,
+) -> ToolExecutionResult {
   println!("[ToolCall] Dispatching tool: {}", name);
   match name {
     "universal_web_search" => {
@@ -1188,7 +1852,7 @@ async fn execute_tool_call(name: &str, args: &serde_json::Value, latest_user_tex
       if query.is_empty() {
         return ToolExecutionResult { content: "No query provided to universal_web_search.".to_string(), images: Vec::new() };
       }
-      ToolExecutionResult { content: execute_universal_search(&query, depth).await, images: Vec::new() }
+      ToolExecutionResult { content: execute_universal_search(&query, depth).await.to_string(), images: Vec::new() }
     }
     "get_current_weather" => {
       let location = args.get("location").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1244,6 +1908,15 @@ async fn execute_tool_call(name: &str, args: &serde_json::Value, latest_user_tex
         Err(e) => ToolExecutionResult { content: format!("Screenshot capture failed: {}", e), images: Vec::new() },
       }
     }
+    "bridge_project_action" => {
+      let instruction = args
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| latest_user_text.to_string());
+      execute_bridge_project_action(app, tab_id, &instruction)
+    }
     _ => ToolExecutionResult { content: format!("Unknown tool invocation: {}", name), images: Vec::new() },
   }
 }
@@ -1268,6 +1941,212 @@ fn format_number_result(value: f64) -> String {
       out.pop();
     }
     out
+  }
+}
+
+fn execute_bridge_project_action(app: &tauri::AppHandle, tab_id: u32, instruction: &str) -> ToolExecutionResult {
+  let mut effective_instruction = instruction.trim().to_string();
+  let now = now_ts();
+  let mut approved_execution = false;
+
+  if let Some(token) = parse_bridge_approval_token(&effective_instruction) {
+    let mut approvals = match bridge_mutation_approvals().lock() {
+      Ok(g) => g,
+      Err(_) => {
+        return ToolExecutionResult {
+          content: "Bridge approval state is temporarily unavailable; retry your request.".to_string(),
+          images: Vec::new(),
+        };
+      }
+    };
+
+    if let Some(pending) = approvals.get(&tab_id).cloned() {
+      if pending.request_id == token {
+        if now - pending.created_at > 15 * 60 {
+          approvals.remove(&tab_id);
+          return ToolExecutionResult {
+            content: format!(
+              "Bridge approval token '{}' expired for project '{}'. Please resend the original action request.",
+              token,
+              pending.project_name
+            ),
+            images: Vec::new(),
+          };
+        }
+        effective_instruction = pending.instruction.clone();
+        approved_execution = true;
+        approvals.remove(&tab_id);
+      } else {
+        return ToolExecutionResult {
+          content: format!(
+            "Bridge approval token '{}' does not match the pending request for project '{}'. Please use the latest token shown by Iris.",
+            token,
+            pending.project_name
+          ),
+          images: Vec::new(),
+        };
+      }
+    } else {
+      return ToolExecutionResult {
+        content: "No pending bridge mutation request exists for this tab. Ask for the action first, then approve with the token Iris provides.".to_string(),
+        images: Vec::new(),
+      };
+    }
+  }
+
+  let intent = infer_prompt_intent(&effective_instruction).to_string();
+  if is_mutating_bridge_intent(&intent) && !approved_execution {
+    if let Ok(mut approvals) = bridge_mutation_approvals().lock() {
+      let request_id = make_bridge_request_id(tab_id, &effective_instruction);
+      approvals.insert(tab_id, BridgeMutationApproval {
+        request_id: request_id.clone(),
+        instruction: effective_instruction.clone(),
+        created_at: now,
+        project_name: format!("tab {}", tab_id),
+      });
+      return ToolExecutionResult {
+        content: format!(
+          "Bridge mutation preflight detected ({intent}).\nPending action: {instr}\n\nTo execute, reply exactly:\napprove bridge action {rid}\n\nThis confirmation token expires in 15 minutes.",
+          intent = intent,
+          instr = effective_instruction,
+          rid = request_id,
+        ),
+        images: Vec::new(),
+      };
+    }
+  }
+
+  let snapshot_path = match tab_file(app, tab_id) {
+    Ok(p) => p,
+    Err(err) => {
+      return ToolExecutionResult {
+        content: format!("Bridge action unavailable: could not resolve tab snapshot path ({}).", err),
+        images: Vec::new(),
+      };
+    }
+  };
+
+  let snapshot = match iris_read_snapshot_file(&snapshot_path) {
+    Ok(s) => s,
+    Err(err) => {
+      return ToolExecutionResult {
+        content: format!("Bridge action unavailable: could not read tab snapshot ({}).", err),
+        images: Vec::new(),
+      };
+    }
+  };
+
+  let project_id = snapshot
+    .associated_project_id
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+  let Some(project_id) = project_id else {
+    return ToolExecutionResult {
+      content: "Bridge action unavailable: this chat tab is not linked to a project. Link a project first.".to_string(),
+      images: Vec::new(),
+    };
+  };
+
+  let store = read_repo_project_store(app);
+  let Some(project) = store.projects.iter().find(|p| p.enabled && p.id == project_id).cloned() else {
+    return ToolExecutionResult {
+      content: "Bridge action unavailable: linked project is missing or disabled.".to_string(),
+      images: Vec::new(),
+    };
+  };
+
+  let Some(mcp) = store
+    .mcps
+    .iter()
+    .find(|m| m.enabled && project.mcp_ids.iter().any(|id| id == &m.id))
+    .cloned()
+  else {
+    return ToolExecutionResult {
+      content: format!(
+        "Bridge action unavailable: project '{}' has no enabled MCP bridge assigned.",
+        project.name
+      ),
+      images: Vec::new(),
+    };
+  };
+
+  if let Err(err) = connect_mcp_server_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ) {
+    return ToolExecutionResult {
+      content: format!("Bridge action failed: MCP connect failed for '{}': {}", mcp.name, err),
+      images: Vec::new(),
+    };
+  }
+
+  let tools = match mcp_list_tools_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ) {
+    Ok(t) => t,
+    Err(err) => {
+      return ToolExecutionResult {
+        content: format!("Bridge action failed: MCP tool listing failed for '{}': {}", mcp.name, err),
+        images: Vec::new(),
+      };
+    }
+  };
+
+  let mut candidates: Vec<(i32, McpToolInfo)> = tools
+    .iter()
+    .map(|tool| (score_mcp_tool_for_prompt(tool, &effective_instruction), tool.clone()))
+    .filter(|(score, _)| *score > 0)
+    .collect();
+  candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+  for (_score, tool) in candidates.into_iter().take(10) {
+    let args_list = build_schema_aware_arg_candidates(&tool, &effective_instruction, &project.name);
+    for args in args_list {
+      let response = mcp_call_tool(
+        mcp.id.clone(),
+        mcp.target.clone(),
+        mcp.connection_type.clone(),
+        mcp.launch_command.clone(),
+        mcp.launch_args.clone(),
+        tool.name.clone(),
+        args,
+      );
+
+      let Ok(value) = response else {
+        continue;
+      };
+      if mcp_response_has_error(&value) {
+        continue;
+      }
+      if let Some(text) = extract_mcp_response_text(&value) {
+        let _ = refresh_tab_project_bridge_capabilities(app, tab_id);
+        return ToolExecutionResult {
+          content: format!(
+            "Bridge action completed via {} / {}.\n\n{}",
+            mcp.name,
+            tool.name,
+            text
+          ),
+          images: Vec::new(),
+        };
+      }
+    }
+  }
+
+  ToolExecutionResult {
+    content: format!(
+      "Bridge action could not find a compatible MCP tool execution path for '{}'. Available tools: {}",
+      project.name,
+      tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", ")
+    ),
+    images: Vec::new(),
   }
 }
 
@@ -1340,6 +2219,36 @@ fn derive_fallback_tool_call(request: &OllamaChatRequest, model_text: &str) -> O
     || model_lower.contains("accuweather");
 
   if !realtime_disclaimer {
+    let capability_disclaimer = model_lower.contains("don't have access")
+      || model_lower.contains("do not have access")
+      || model_lower.contains("cannot access")
+      || model_lower.contains("can't access")
+      || model_lower.contains("i'm an ai")
+      || model_lower.contains("i am an ai")
+      || model_lower.contains("do not have direct access")
+      || model_lower.contains("don't have that capability")
+      || model_lower.contains("cannot directly");
+
+    let bridge_intent = is_bridge_contextual_request(user_text);
+    let bridge_tool_available = request.tools
+      .as_ref()
+      .map(|tools| tools.iter().any(|tool| {
+        tool.pointer("/function/name")
+          .and_then(|v| v.as_str())
+          .map(|name| name == "bridge_project_action")
+          .unwrap_or(false)
+      }))
+      .unwrap_or(false);
+
+    if capability_disclaimer && bridge_intent && bridge_tool_available {
+      return Some(OllamaToolCall {
+        function: OllamaToolCallFunction {
+          name: "bridge_project_action".to_string(),
+          arguments: serde_json::json!({ "instruction": user_text }),
+        },
+      });
+    }
+
     return None;
   }
 
@@ -1394,6 +2303,7 @@ fn persist_rust_turn_snapshot(
       role: "user".to_string(),
       text: user_text.to_string(),
       time: ts,
+      thinking_log: None,
     });
   }
   if !assistant_text.trim().is_empty() {
@@ -1401,6 +2311,7 @@ fn persist_rust_turn_snapshot(
       role: "llm".to_string(),
       text: assistant_text.to_string(),
       time: ts,
+      thinking_log: agent_executor::message_reasoning_log(app,tab_id,assistant_text),
     });
   }
   if snap.title.trim().is_empty() {
@@ -1422,6 +2333,466 @@ fn is_godot_primary_request(input: &str) -> bool {
     "godot", "gdscript", "scene", "node", "shader", "tauri", "typescript", "rust", "repo", "build", "debug", "project",
   ];
   keywords.iter().any(|k| normalized.contains(k))
+}
+
+fn is_bridge_contextual_request(input: &str) -> bool {
+  let normalized = input.to_lowercase();
+  let explicit_bridge = contains_any(&normalized, &[
+    "mcp",
+    "bridge",
+    "bridged",
+    "connected to godot",
+    "use the mcp",
+    "use mcp",
+  ]);
+  let domain = contains_any(&normalized, &[
+    "godot",
+    "scene",
+    "project",
+    "node",
+    "gdscript",
+    "workspace",
+    "repo",
+  ]);
+  let action = contains_any(&normalized, &[
+    "list",
+    "show",
+    "inspect",
+    "count",
+    "how many",
+    "number of",
+    "find",
+    "what",
+    "which",
+    "where",
+    "open",
+    "create",
+    "design",
+    "build",
+    "draft",
+    "generate",
+    "attempt",
+    "edit",
+    "modify",
+    "update",
+    "rename",
+    "move",
+    "delete",
+    "remove",
+    "manipulate",
+    "run",
+    "execute",
+    "fix",
+  ]);
+
+  explicit_bridge || (domain && action)
+}
+
+fn is_scene_count_request(input: &str) -> bool {
+  let lower = input.to_lowercase();
+  let asks_count = contains_any(&lower, &["how many", "count", "number of", "total"]);
+  let asks_scene = contains_any(&lower, &["scene", "scenes", ".tscn"]);
+  asks_count && asks_scene
+}
+
+fn extract_scene_paths_from_text(text: &str) -> Vec<String> {
+  let mut seen: HashSet<String> = HashSet::new();
+  let mut out: Vec<String> = Vec::new();
+  if let Ok(re_scene) = Regex::new(r"(?i)(res://[^\s`]+\.tscn|[A-Za-z0-9_./\\-]+\.tscn)") {
+    for cap in re_scene.captures_iter(text) {
+      if let Some(m) = cap.get(1) {
+        let cleaned = m.as_str().trim().trim_matches(|c: char| c == ',' || c == ';' || c == ')');
+        if cleaned.is_empty() {
+          continue;
+        }
+        let key = cleaned.to_lowercase();
+        if seen.insert(key) {
+          out.push(cleaned.to_string());
+        }
+      }
+    }
+  }
+  out
+}
+
+fn is_bridge_follow_up_request(input: &str) -> bool {
+  let normalized = input.trim().to_lowercase();
+  if normalized.is_empty() {
+    return false;
+  }
+
+  // Protect normal chat topics from accidental bridge continuity capture.
+  if contains_any(&normalized, &[
+    "weather",
+    "temperature",
+    "forecast",
+    "joke",
+    "funny",
+    "time",
+    "date",
+    "story",
+    "poem",
+    "translate",
+  ]) {
+    return false;
+  }
+
+  if is_bridge_contextual_request(&normalized) {
+    return true;
+  }
+
+  contains_any(&normalized, &[
+    "yes",
+    "yes please",
+    "do that",
+    "do it",
+    "run that",
+    "use that",
+    "again",
+    "retry",
+    "continue",
+    "go ahead",
+    "list all",
+    "same project",
+    "in this project",
+  ])
+}
+
+fn has_recent_bridge_context(messages: &[ChatMessage]) -> bool {
+  messages.iter().rev().take(8).any(|m| {
+    let lower = m.text.to_lowercase();
+    contains_any(&lower, &[
+      "bridge verified",
+      "tool used:",
+      "mcp",
+      "godot project",
+      "scene",
+      "connected",
+    ])
+  })
+}
+
+fn extract_mcp_response_text(value: &serde_json::Value) -> Option<String> {
+  if let Some(s) = value.as_str() {
+    let trimmed = s.trim();
+    if !trimmed.is_empty() {
+      return Some(trimmed.to_string());
+    }
+  }
+
+  for key in ["text", "content", "result", "message", "output"] {
+    if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
+      let trimmed = s.trim();
+      if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+      }
+    }
+  }
+
+  if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+    let mut pieces: Vec<String> = Vec::new();
+    for item in arr {
+      if let Some(s) = item.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+          pieces.push(trimmed.to_string());
+        }
+        continue;
+      }
+      if let Some(s) = item.get("text").and_then(|v| v.as_str()) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+          pieces.push(trimmed.to_string());
+        }
+      }
+    }
+    if !pieces.is_empty() {
+      return Some(pieces.join("\n"));
+    }
+  }
+
+  let compact = value.to_string();
+  if compact != "null" && compact != "{}" && compact != "[]" {
+    return Some(compact);
+  }
+  None
+}
+
+fn mcp_response_has_error(value: &serde_json::Value) -> bool {
+  if value.get("error").is_some_and(|error| !error.is_null()) {
+    return true;
+  }
+  if value.get("isError").and_then(Value::as_bool) == Some(true)
+    || value.get("ok").and_then(Value::as_bool) == Some(false)
+    || value.get("success").and_then(Value::as_bool) == Some(false) {
+    return true;
+  }
+  value.get("content").and_then(Value::as_array).is_some_and(|items| items.iter().any(|item| {
+    item.get("text").and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok())
+      .is_some_and(|parsed| parsed.is_object() && mcp_response_has_error(&parsed))
+  }))
+}
+
+fn infer_search_query_hint(user_input: &str, scene_hint: &str) -> String {
+  if !scene_hint.trim().is_empty() {
+    return scene_hint.trim().to_string();
+  }
+
+  let lower = user_input.to_lowercase();
+  if contains_any(&lower, &["scene", "scenes", ".tscn", "godot"]) {
+    return "*.tscn".to_string();
+  }
+  if contains_any(&lower, &["gdscript", "script", ".gd"]) {
+    return ".gd".to_string();
+  }
+  if contains_any(&lower, &["shader", ".gdshader"]) {
+    return ".gdshader".to_string();
+  }
+
+  user_input.chars().take(120).collect::<String>()
+}
+
+fn extract_scene_hint(input: &str) -> Option<String> {
+  if let Ok(re_scene) = Regex::new(r"([A-Za-z0-9_./\\-]+\.tscn)") {
+    if let Some(cap) = re_scene.captures(input) {
+      if let Some(m) = cap.get(1) {
+        let v = m.as_str().trim();
+        if !v.is_empty() {
+          return Some(v.to_string());
+        }
+      }
+    }
+  }
+  if let Ok(re_quoted) = Regex::new(r#"["']([^"']+)["']"#) {
+    if let Some(cap) = re_quoted.captures(input) {
+      if let Some(m) = cap.get(1) {
+        let v = m.as_str().trim();
+        if !v.is_empty() {
+          return Some(v.to_string());
+        }
+      }
+    }
+  }
+  None
+}
+
+fn extract_node_hint(input: &str) -> Option<String> {
+  if let Ok(re_node_path) = Regex::new(r"(/root/[A-Za-z0-9_./-]+)") {
+    if let Some(cap) = re_node_path.captures(input) {
+      if let Some(m) = cap.get(1) {
+        let v = m.as_str().trim();
+        if !v.is_empty() {
+          return Some(v.to_string());
+        }
+      }
+    }
+  }
+  None
+}
+
+fn infer_prompt_intent(input: &str) -> &'static str {
+  let t = input.to_lowercase();
+  if is_scene_count_request(&t) {
+    return "inspect";
+  }
+  if contains_any(&t, &["create", "add", "new", "instantiate"]) {
+    return "create";
+  }
+  if contains_any(&t, &["design", "build", "draft", "generate", "compose"]) {
+    return "create";
+  }
+  if contains_any(&t, &["edit", "update", "set", "write", "patch", "modify"]) {
+    return "modify";
+  }
+  if contains_any(&t, &["delete", "remove"]) {
+    return "delete";
+  }
+  if contains_any(&t, &["rename", "move"]) {
+    return "rename_move";
+  }
+  if contains_any(&t, &["run", "execute", "play", "build", "compile", "test"]) {
+    return "execute";
+  }
+  if contains_any(&t, &["list", "show", "inspect", "what", "which", "open"]) {
+    return "inspect";
+  }
+  "generic"
+}
+
+fn is_mutating_bridge_intent(intent: &str) -> bool {
+  matches!(intent, "create" | "modify" | "delete" | "rename_move")
+}
+
+fn parse_bridge_approval_token(input: &str) -> Option<String> {
+  let lower = input.to_lowercase();
+  if !(lower.contains("approve") || lower.contains("confirm")) {
+    return None;
+  }
+
+  if let Ok(re) = Regex::new(r"(?i)\b(?:approve|confirm)\s+(?:bridge\s+action\s+)?([a-z0-9_-]{6,})\b") {
+    if let Some(cap) = re.captures(input) {
+      if let Some(m) = cap.get(1) {
+        return Some(m.as_str().to_string());
+      }
+    }
+  }
+  None
+}
+
+fn make_bridge_request_id(tab_id: u32, instruction: &str) -> String {
+  let mut hasher = DefaultHasher::new();
+  tab_id.hash(&mut hasher);
+  now_ts().hash(&mut hasher);
+  instruction.hash(&mut hasher);
+  format!("b{}", hasher.finish() % 100_000_000)
+}
+
+fn score_mcp_tool_for_prompt(tool: &McpToolInfo, input: &str) -> i32 {
+  let lower = format!(
+    "{} {} {}",
+    tool.name.to_lowercase(),
+    tool.description.to_lowercase(),
+    serde_json::to_string(&tool.input_schema).unwrap_or_default().to_lowercase()
+  );
+  let intent = infer_prompt_intent(input);
+  let is_scene_count = is_scene_count_request(input);
+  let mut score = 0;
+
+  if contains_any(&lower, &["project", "workspace"]) { score += 3; }
+  if contains_any(&lower, &["scene", "node", "tree"]) { score += 3; }
+  if contains_any(&lower, &["list", "inspect", "info", "status", "query"]) { score += 2; }
+
+  match intent {
+    "create" => {
+      if contains_any(&lower, &["create", "add", "new", "instantiate"]) { score += 6; }
+    }
+    "modify" => {
+      if contains_any(&lower, &["edit", "update", "set", "write", "patch", "modify"]) { score += 6; }
+    }
+    "delete" => {
+      if contains_any(&lower, &["delete", "remove"]) { score += 6; }
+    }
+    "rename_move" => {
+      if contains_any(&lower, &["rename", "move"]) { score += 6; }
+    }
+    "execute" => {
+      if contains_any(&lower, &["run", "execute", "play", "build", "compile", "test"]) { score += 6; }
+    }
+    "inspect" => {
+      if contains_any(&lower, &["list", "show", "inspect", "query", "read", "status", "info"]) { score += 6; }
+    }
+    _ => {}
+  }
+
+  if is_scene_count {
+    if contains_any(&lower, &["scene", "list", "count", "inventory"]) {
+      score += 6;
+    }
+    if contains_any(&lower, &["search_files", "find files"]) {
+      score += 1;
+    }
+  }
+
+  if intent == "create" && contains_any(&input.to_lowercase(), &["scene", "house", "node", "godot"]) {
+    if contains_any(&lower, &["create", "add", "node", "scene", "edit", "write", "patch", "modify"]) {
+      score += 7;
+    }
+    if contains_any(&lower, &["search_files", "find files", "grep"]) {
+      score -= 2;
+    }
+  }
+
+  score
+}
+
+fn build_schema_aware_arg_candidates(
+  tool: &McpToolInfo,
+  user_input: &str,
+  project_name: &str,
+) -> Vec<Value> {
+  let mut candidates: Vec<Value> = Vec::new();
+  let scene_hint = extract_scene_hint(user_input).unwrap_or_else(|| "".to_string());
+  let node_hint = extract_node_hint(user_input).unwrap_or_else(|| "".to_string());
+  let search_query_hint = infer_search_query_hint(user_input, &scene_hint);
+  let scene_count_request = is_scene_count_request(user_input);
+
+  let mut base = serde_json::Map::new();
+  base.insert("instruction".to_string(), Value::String(user_input.to_string()));
+  base.insert("query".to_string(), Value::String(user_input.to_string()));
+  base.insert("input".to_string(), Value::String(user_input.to_string()));
+  base.insert("text".to_string(), Value::String(user_input.to_string()));
+  base.insert("prompt".to_string(), Value::String(user_input.to_string()));
+  base.insert("request".to_string(), Value::String(user_input.to_string()));
+  base.insert("project".to_string(), Value::String(project_name.to_string()));
+  base.insert("project_name".to_string(), Value::String(project_name.to_string()));
+  base.insert("path".to_string(), Value::String(".".to_string()));
+  base.insert("root".to_string(), Value::String(".".to_string()));
+  base.insert("search_query".to_string(), Value::String(search_query_hint.clone()));
+  base.insert("pattern".to_string(), Value::String(search_query_hint.clone()));
+  base.insert("glob".to_string(), Value::String(search_query_hint.clone()));
+  base.insert("regex".to_string(), Value::String(search_query_hint.clone()));
+  base.insert("file_pattern".to_string(), Value::String(search_query_hint.clone()));
+  if scene_count_request {
+    base.insert("count_only".to_string(), Value::Bool(true));
+    base.insert("include_hidden".to_string(), Value::Bool(false));
+    base.insert("limit".to_string(), Value::Number(serde_json::Number::from(300)));
+  }
+  if !scene_hint.is_empty() {
+    base.insert("scene".to_string(), Value::String(scene_hint.clone()));
+    base.insert("scene_path".to_string(), Value::String(scene_hint.clone()));
+    base.insert("target_scene".to_string(), Value::String(scene_hint.clone()));
+  }
+  if !node_hint.is_empty() {
+    base.insert("node".to_string(), Value::String(node_hint.clone()));
+    base.insert("node_path".to_string(), Value::String(node_hint.clone()));
+    base.insert("target_node".to_string(), Value::String(node_hint.clone()));
+  }
+
+  candidates.push(Value::Object(base.clone()));
+
+  if let Some(props) = tool.input_schema.get("properties").and_then(|v| v.as_object()) {
+    let mut minimal = serde_json::Map::new();
+    for key in props.keys() {
+      let lower = key.to_lowercase();
+      let value = if contains_any(&lower, &["instruction", "query", "input", "text", "prompt", "request"]) {
+        Some(Value::String(user_input.to_string()))
+      } else if contains_any(&lower, &["search_query", "pattern", "glob", "regex", "file_pattern"]) {
+        Some(Value::String(search_query_hint.clone()))
+      } else if contains_any(&lower, &["project", "project_name"]) {
+        Some(Value::String(project_name.to_string()))
+      } else if contains_any(&lower, &["path", "root", "directory", "folder"]) {
+        Some(Value::String(".".to_string()))
+      } else if contains_any(&lower, &["scene"]) {
+        if !scene_hint.is_empty() { Some(Value::String(scene_hint.clone())) } else { None }
+      } else if contains_any(&lower, &["node"]) {
+        if !node_hint.is_empty() { Some(Value::String(node_hint.clone())) } else { None }
+      } else {
+        None
+      };
+      if let Some(v) = value {
+        minimal.insert(key.clone(), v);
+      }
+    }
+    if !minimal.is_empty() {
+      if scene_count_request {
+        minimal.insert("count_only".to_string(), Value::Bool(true));
+        minimal.insert("limit".to_string(), Value::Number(serde_json::Number::from(300)));
+      }
+      candidates.push(Value::Object(minimal));
+    }
+  }
+
+  candidates.push(serde_json::json!({ "search_query": search_query_hint }));
+  if scene_count_request {
+    candidates.push(serde_json::json!({ "query": "*.tscn", "count_only": true, "limit": 300 }));
+    candidates.push(serde_json::json!({ "pattern": "*.tscn", "count_only": true, "limit": 300 }));
+  }
+  candidates.push(serde_json::json!({ "query": user_input }));
+  candidates.push(serde_json::json!({ "instruction": user_input }));
+  candidates.push(serde_json::json!({ "path": ".", "project": project_name }));
+  candidates.push(serde_json::json!({}));
+
+  candidates
 }
 
 fn try_external_handoff(
@@ -1532,21 +2903,223 @@ fn try_external_handoff(
   true
 }
 
-fn resolve_submit_model(app: &tauri::AppHandle, payload: &UserTurnPayload) -> String {
-  let flags = read_setup_flags(app);
-  let profile = ModelProfile::parse(&flags.model_profile);
-  let model_config = read_model_config(app);
-
-  if !payload.images.is_empty() {
-    if !model_config.vision_enabled {
-      return "iris-organizer:latest".to_string();
-    }
-    return match profile {
-      ModelProfile::Low | ModelProfile::Minimal => "moondream2:latest".to_string(),
-      _ => "iris-vision:latest".to_string(),
-    };
+fn try_bridge_inventory_handoff(
+  app: &tauri::AppHandle,
+  payload: &UserTurnPayload,
+  window: &tauri::Window,
+  event_name: &str,
+) -> bool {
+  if parse_bridge_approval_token(&payload.input_text).is_some() {
+    return false;
   }
 
+  let prompt_intent = infer_prompt_intent(&payload.input_text);
+  if is_mutating_bridge_intent(prompt_intent) || prompt_intent == "execute" {
+    return false;
+  }
+
+  let snapshot_path = match tab_file(app, payload.tab_id) {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+  let snapshot = match iris_read_snapshot_file(&snapshot_path) {
+    Ok(s) => s,
+    Err(_) => return false,
+  };
+  let request_wants_bridge = is_bridge_contextual_request(&payload.input_text);
+  let bridge_continuity = has_recent_bridge_context(&snapshot.messages);
+  let follow_up_bridge = bridge_continuity && is_bridge_follow_up_request(&payload.input_text);
+  if !request_wants_bridge && !follow_up_bridge {
+    return false;
+  }
+
+  let flags = read_setup_flags(app);
+  if !flags.mcp_enabled {
+    if request_wants_bridge {
+      let _ = window.emit(event_name, IrisEvent::Delta(
+        "MCP is currently disabled in Settings -> Bridges. Enable MCP and retry this request.".to_string()
+      ));
+      let _ = window.emit(event_name, IrisEvent::Done);
+      return true;
+    }
+    return false;
+  }
+
+  let Some(project_id) = snapshot.associated_project_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let _ = window.emit(event_name, IrisEvent::Delta(
+      "I can check MCP bridge state, but this chat tab is not linked to a project. Link the tab to a project in Settings -> Projects first.".to_string()
+    ));
+    let _ = window.emit(event_name, IrisEvent::Done);
+    return true;
+  };
+
+  let store = read_repo_project_store(app);
+  let Some(project) = store.projects.iter().find(|p| p.enabled && p.id == project_id) else {
+    let _ = window.emit(event_name, IrisEvent::Delta(
+      "This tab references a project id that is not enabled in the current project store. Re-link the tab and try again.".to_string()
+    ));
+    let _ = window.emit(event_name, IrisEvent::Done);
+    return true;
+  };
+
+  let Some(mcp) = store
+    .mcps
+    .iter()
+    .find(|m| m.enabled && project.mcp_ids.iter().any(|id| id == &m.id))
+    .cloned()
+  else {
+    let _ = window.emit(event_name, IrisEvent::Delta(format!(
+      "Project '{}' has no enabled MCP bridge assigned. Assign and enable an MCP bridge, then retry.",
+      project.name
+    )));
+    let _ = window.emit(event_name, IrisEvent::Done);
+    return true;
+  };
+
+  let _ = window.emit(event_name, IrisEvent::Status(format!(
+    "Bridge request detected. Verifying MCP connection for '{}' via {}...",
+    project.name,
+    mcp.name
+  )));
+
+  if let Err(err) = connect_mcp_server_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ) {
+    let _ = window.emit(event_name, IrisEvent::Delta(format!(
+      "MCP bridge verification failed for '{}': {}",
+      mcp.name,
+      err
+    )));
+    let _ = window.emit(event_name, IrisEvent::Done);
+    return true;
+  }
+
+  let tools = match mcp_list_tools_inner(
+    mcp.id.clone(),
+    mcp.target.clone(),
+    mcp.connection_type.clone(),
+    mcp.launch_command.clone(),
+    mcp.launch_args.clone(),
+  ) {
+    Ok(t) => t,
+    Err(err) => {
+      let _ = window.emit(event_name, IrisEvent::Delta(format!(
+        "MCP bridge connected, but tool enumeration failed for '{}': {}",
+        mcp.name,
+        err
+      )));
+      let _ = window.emit(event_name, IrisEvent::Done);
+      return true;
+    }
+  };
+
+  let mut scored_tools: Vec<(i32, McpToolInfo)> = tools
+    .iter()
+    .map(|tool| {
+      (score_mcp_tool_for_prompt(tool, &payload.input_text), tool.clone())
+    })
+    .collect();
+
+  scored_tools.sort_by(|a, b| b.0.cmp(&a.0));
+  let candidates: Vec<McpToolInfo> = scored_tools
+    .into_iter()
+    .filter(|(score, _)| *score > 0)
+    .map(|(_, tool)| tool)
+    .take(8)
+    .collect();
+
+  if candidates.is_empty() {
+    let available = tools
+      .iter()
+      .map(|t| t.name.clone())
+      .collect::<Vec<_>>()
+      .join(", ");
+    let _ = window.emit(event_name, IrisEvent::Delta(format!(
+      "Bridge '{}' is connected for project '{}', but no inventory-style MCP tool was detected. Available tools: {}",
+      mcp.name,
+      project.name,
+      if available.is_empty() { "(none)" } else { &available }
+    )));
+    let _ = window.emit(event_name, IrisEvent::Done);
+    return true;
+  }
+
+  for tool in candidates {
+    let arg_candidates = build_schema_aware_arg_candidates(&tool, &payload.input_text, &project.name);
+    for args in &arg_candidates {
+      let response = mcp_call_tool(
+        mcp.id.clone(),
+        mcp.target.clone(),
+        mcp.connection_type.clone(),
+        mcp.launch_command.clone(),
+        mcp.launch_args.clone(),
+        tool.name.clone(),
+        args.clone(),
+      );
+      let Ok(value) = response else {
+        continue;
+      };
+      if mcp_response_has_error(&value) {
+        continue;
+      }
+      if let Some(text) = extract_mcp_response_text(&value) {
+        let scene_count_request = is_scene_count_request(&payload.input_text);
+        let normalized_body = if scene_count_request {
+          let scene_paths = extract_scene_paths_from_text(&text);
+          if scene_paths.is_empty() {
+            text
+          } else {
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(format!("Detected {} scene file(s) in project '{}'.", scene_paths.len(), project.name));
+            lines.push(String::new());
+            lines.push("Scene paths:".to_string());
+            for scene in scene_paths.iter().take(40) {
+              lines.push(format!("- {}", scene));
+            }
+            if scene_paths.len() > 40 {
+              lines.push(format!("- ...and {} more", scene_paths.len() - 40));
+            }
+            lines.join("\n")
+          }
+        } else {
+          text
+        };
+        let reply = format!(
+          "Bridge verified for project '{}' via {}.\nTool used: {}\n\n{}",
+          project.name,
+          mcp.name,
+          tool.name,
+          normalized_body
+        );
+        let _ = refresh_tab_project_bridge_capabilities(app, payload.tab_id);
+        let _ = window.emit(event_name, IrisEvent::Delta(reply));
+        let _ = window.emit(event_name, IrisEvent::Done);
+        return true;
+      }
+    }
+  }
+
+  let available = tools
+    .iter()
+    .map(|t| t.name.clone())
+    .collect::<Vec<_>>()
+    .join(", ");
+  let _ = window.emit(event_name, IrisEvent::Delta(format!(
+    "Bridge '{}' is connected for project '{}', but none of the available tools returned usable project state for this request. Available tools: {}",
+    mcp.name,
+    project.name,
+    if available.is_empty() { "(none)" } else { &available }
+  )));
+  let _ = window.emit(event_name, IrisEvent::Done);
+  true
+}
+
+fn resolve_submit_model(app: &tauri::AppHandle, payload: &UserTurnPayload) -> String {
+  let _ = (app, payload);
   "iris-organizer:latest".to_string()
 }
 
@@ -1743,10 +3316,27 @@ pub fn stop_godot_log_watcher(tab_id: u32) -> Result<bool, String> {
 pub async fn resolve_permission(
     payload: ResolvePermissionPayload,
 ) -> Result<(), String> {
-    // TEMPORARY STUB: Will interact with tokio::oneshot channels later
-    println!("Permission resolved for {}: {}", payload.req_id, payload.approved);
-    Ok(())
+  agent_executor::resolve(payload)
 }
+
+#[tauri::command]
+pub fn cancel_agent_turn(tab_id: u32) -> bool { agent_executor::cancel(tab_id) }
+
+#[tauri::command]
+pub fn get_agent_task(app: tauri::AppHandle, tab_id: u32) -> Result<Option<crate::agent_runtime::AgentTask>, String> {
+  agent_executor::load_task(&app, tab_id)
+}
+
+#[tauri::command]
+pub fn get_agent_proficiency(app: tauri::AppHandle) -> Value { agent_executor::skill_report(&app) }
+
+#[tauri::command]
+pub fn record_research_feedback(app: tauri::AppHandle, task_id: String, helpful: bool, note: Option<String>) -> Result<(), String> {
+  agent_executor::research_feedback(&app,&task_id,helpful,note.as_deref().unwrap_or(""))
+}
+
+#[tauri::command]
+pub fn clear_research_learning(app: tauri::AppHandle) -> Result<(), String> { agent_executor::clear_research_history(&app) }
 
 /// Which stdio framing protocol the MCP server speaks.
 /// NDJSON = one JSON object per line (MCP Python SDK 1.x / official spec)
@@ -1818,6 +3408,8 @@ pub struct McpToolInfo {
   pub description: String,
   #[serde(default)]
   pub input_schema: Value,
+  #[serde(default)]
+  pub annotations: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -1827,6 +3419,43 @@ pub struct McpConnectResult {
   pub pid: Option<u32>,
   /// Which stdio framing protocol was auto-detected ("ndjson" or "lsp"), or None for HTTP.
   pub protocol: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeCapability {
+  pub mcp_id: String,
+  pub mcp_name: String,
+  pub connected: bool,
+  pub tool_count: usize,
+  pub tools: Vec<String>,
+  pub tags: Vec<String>,
+  pub errors: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeCapabilitySnapshot {
+  pub project_id: String,
+  pub project_name: String,
+  pub generated_at: i64,
+  pub bridge_capabilities: Vec<BridgeCapability>,
+}
+
+#[derive(Clone, Debug)]
+struct BridgeMutationApproval {
+  request_id: String,
+  instruction: String,
+  created_at: i64,
+  project_name: String,
+}
+
+fn bridge_capability_cache() -> &'static Mutex<HashMap<String, BridgeCapabilitySnapshot>> {
+  BRIDGE_CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bridge_mutation_approvals() -> &'static Mutex<HashMap<u32, BridgeMutationApproval>> {
+  BRIDGE_MUTATION_APPROVALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn parse_mcp_target(raw: &str) -> (String, Option<String>, Vec<String>) {
@@ -1896,7 +3525,7 @@ fn resolve_executable(command: &str) -> Option<String> {
   }
 
   if cfg!(target_os = "windows") {
-    if let Ok(out) = Command::new("where").arg(c).output() {
+    if let Ok(out) = background_command("where").arg(c).output() {
       if out.status.success() {
         let txt = String::from_utf8_lossy(&out.stdout);
         if let Some(first) = txt.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
@@ -2042,7 +3671,7 @@ fn try_probe_protocol(
 ) -> Result<ProbeSuccess, String> {
   let resolved = resolve_executable(command).ok_or_else(|| format!("Command '{}' not found", command))?;
 
-  let mut child = Command::new(&resolved)
+  let mut child = background_command(&resolved)
     .args(args)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
@@ -2194,6 +3823,11 @@ fn mcp_http_request(target_url: &str, method: &str, params: Value) -> Result<Val
 }
 
 fn resolve_ollama_executable() -> String {
+  if cfg!(target_os = "macos") {
+    if let Some(path) = crate::platform_macos::ollama_candidates(dirs::home_dir()).into_iter().find(|path|path.exists()) {
+      return path.to_string_lossy().to_string();
+    }
+  }
   if cfg!(target_os = "windows") {
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
       let p = std::path::Path::new(&local)
@@ -2348,6 +3982,16 @@ pub struct SetupFlags {
   #[serde(default = "default_color_mode")]
   #[serde(rename = "colorMode")]
   pub color_mode: String,
+  #[serde(default, rename = "permissionMode")]
+  pub permission_mode: String,
+  #[serde(default, rename = "alwaysAllowLowRisk")]
+  pub always_allow_low_risk: bool,
+  #[serde(default, rename = "allowIterationWithoutPrompt")]
+  pub allow_iteration_without_prompt: bool,
+  #[serde(default, rename = "testingConfidenceThreshold")]
+  pub testing_confidence_threshold: f64,
+  #[serde(default, rename = "agentProficienciesJson")]
+  pub agent_proficiencies_json: String,
 }
 
 fn default_color_mode() -> String { "dark".to_string() }
@@ -2358,7 +4002,7 @@ impl Default for SetupFlags {
       ollama_verified: false,
       models_verified: false,
       interpret_v2_enabled: true,
-      model_profile: "Medium".to_string(),
+      model_profile: if cfg!(all(target_os = "macos", target_arch = "aarch64")) { "MacBalanced" } else { "Medium" }.to_string(),
       assistant_name: "Iris".to_string(),
       theme_color: "#232323".to_string(),
       theme_preset: "Black".to_string(),
@@ -2372,6 +4016,11 @@ impl Default for SetupFlags {
       desktop_tools_enabled: false,
       universal_dataweb_enabled: true,
       color_mode: "dark".to_string(),
+      permission_mode: "balanced".into(),
+      always_allow_low_risk: true,
+      allow_iteration_without_prompt: false,
+      testing_confidence_threshold: 90.0,
+      agent_proficiencies_json: String::new(),
     }
   }
 }
@@ -2412,6 +4061,16 @@ pub struct SetupFlagsArgs {
   pub universal_dataweb_enabled: Option<bool>,
   #[serde(default, alias = "colorMode")]
   pub color_mode: Option<String>,
+  #[serde(default, alias = "permissionMode")]
+  pub permission_mode: Option<String>,
+  #[serde(default, alias = "alwaysAllowLowRisk")]
+  pub always_allow_low_risk: Option<bool>,
+  #[serde(default, alias = "allowIterationWithoutPrompt")]
+  pub allow_iteration_without_prompt: Option<bool>,
+  #[serde(default, alias = "testingConfidenceThreshold")]
+  pub testing_confidence_threshold: Option<f64>,
+  #[serde(default, alias = "agentProficienciesJson")]
+  pub agent_proficiencies_json: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -2507,7 +4166,72 @@ pub struct InterpretPlanV2 {
   pub route_summary: String,
   pub status_hint: String,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub selected_thinking_profile: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub profile_selection_reason: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_resume_hint: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub planner_phase_checkpoints: Option<Vec<PlannerPhaseCheckpoint>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub routine_plan: Option<RoutinePlan>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerPhaseCheckpoint {
+  pub phase: String,
+  pub label: String,
+  pub summary: String,
+  pub doc_type: String,
+  pub doc_version: u64,
+  pub ts: i64,
+}
+
+fn auto_select_thinking_profile(
+  primary_intent: &str,
+  pressure: f32,
+  needs_vision: bool,
+  should_use_coder: bool,
+  token_budget: Option<usize>,
+) -> (String, String) {
+  let budget = token_budget.unwrap_or(1200);
+
+  if pressure >= 0.72 || (should_use_coder && (primary_intent == "code_edit_followup" || primary_intent == "dev_task")) || budget >= 3200 {
+    return (
+      "Meticulous".to_string(),
+      format!(
+        "auto_selected: high complexity (pressure={:.2}, coder={}, budget={})",
+        pressure,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  if pressure >= 0.45 || should_use_coder || needs_vision || budget >= 1800 {
+    return (
+      "Advanced".to_string(),
+      format!(
+        "auto_selected: medium complexity (pressure={:.2}, vision={}, coder={}, budget={})",
+        pressure,
+        needs_vision,
+        should_use_coder,
+        budget
+      ),
+    );
+  }
+
+  (
+    "Fast".to_string(),
+    format!(
+      "auto_selected: lightweight path (pressure={:.2}, budget={})",
+      pressure,
+      budget
+    ),
+  )
 }
 
 
@@ -2532,6 +4256,534 @@ fn tab_file(app: &tauri::AppHandle, tab_id: u32) -> Result<PathBuf, String> {
 fn setup_flags_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   let dir = memory_dir(app)?;
   Ok(dir.join("setup_flags.json"))
+}
+
+fn cognitive_runtime_state_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  Ok(dir.join("cognitive_runtime_state.json"))
+}
+
+fn cognitive_docs_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = memory_dir(app)?;
+  let root = dir.join("cognitive_docs");
+  fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+  Ok(root)
+}
+
+fn sanitize_cognitive_doc_component(raw: &str, fallback: &str) -> String {
+  let mut out = String::with_capacity(raw.len());
+  for ch in raw.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+      out.push(ch);
+    }
+  }
+  let trimmed = out.trim_matches('_').trim_matches('-').to_string();
+  if trimmed.is_empty() {
+    fallback.to_string()
+  } else {
+    trimmed
+  }
+}
+
+fn goal_doc_dir(app: &tauri::AppHandle, goal_id: &str) -> Result<PathBuf, String> {
+  let root = cognitive_docs_root(app)?;
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let dir = root.join(format!("goal_{}", safe_goal));
+  fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+  Ok(dir)
+}
+
+fn cognitive_doc_versions_file(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Result<PathBuf, String> {
+  let dir = goal_doc_dir(app, goal_id)?;
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  Ok(dir.join(format!("{}.jsonl", safe_type)))
+}
+
+fn load_cognitive_doc_versions(app: &tauri::AppHandle, goal_id: &str, doc_type: &str) -> Vec<CognitiveDocVersion> {
+  let path = match cognitive_doc_versions_file(app, goal_id, doc_type) {
+    Ok(p) => p,
+    Err(_) => return Vec::new(),
+  };
+  if !path.exists() {
+    return Vec::new();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return Vec::new(),
+  };
+
+  raw
+    .lines()
+    .filter_map(|line| serde_json::from_str::<CognitiveDocVersion>(line).ok())
+    .collect()
+}
+
+fn append_cognitive_doc_version_internal(
+  app: &tauri::AppHandle,
+  goal_id: &str,
+  doc_type: &str,
+  author: &str,
+  content: &str,
+  metadata: serde_json::Value,
+) -> Result<CognitiveDocVersion, String> {
+  let safe_goal = sanitize_cognitive_doc_component(goal_id, "global");
+  let safe_type = sanitize_cognitive_doc_component(doc_type, "phase_logs");
+  let path = cognitive_doc_versions_file(app, &safe_goal, &safe_type)?;
+
+  let existing = load_cognitive_doc_versions(app, &safe_goal, &safe_type);
+  let next_version = existing.last().map(|v| v.version + 1).unwrap_or(1);
+
+  let version = CognitiveDocVersion {
+    goal_id: safe_goal,
+    doc_type: safe_type,
+    version: next_version,
+    ts: now_ts(),
+    author: author.to_string(),
+    content: content.to_string(),
+    metadata,
+  };
+
+  let json_line = serde_json::to_string(&version).map_err(|e| e.to_string())?;
+  let mut f = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&path)
+    .map_err(|e| format!("Failed opening {}: {}", path.display(), e))?;
+  f.write_all(format!("{}\n", json_line).as_bytes())
+    .map_err(|e| format!("Failed writing {}: {}", path.display(), e))?;
+  f.sync_all().ok();
+  Ok(version)
+}
+
+fn read_cognitive_runtime_state(app: &tauri::AppHandle) -> CognitiveRuntimeState {
+  let path = match cognitive_runtime_state_file(app) {
+    Ok(p) => p,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  if !path.exists() {
+    return CognitiveRuntimeState::default();
+  }
+  let raw = match fs::read_to_string(&path) {
+    Ok(s) => s,
+    Err(_) => return CognitiveRuntimeState::default(),
+  };
+  serde_json::from_str::<CognitiveRuntimeState>(&raw).unwrap_or_default()
+}
+
+fn write_cognitive_runtime_state(app: &tauri::AppHandle, state: &CognitiveRuntimeState) -> Result<(), String> {
+  let path = cognitive_runtime_state_file(app)?;
+  let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+  atomic_write_json(&path, &json)
+}
+
+fn transition_phase(current: CognitiveRuntimePhase, action: CognitiveRuntimeAction) -> Result<CognitiveRuntimePhase, String> {
+  use CognitiveRuntimeAction::*;
+  use CognitiveRuntimePhase::*;
+
+  match (current, action) {
+    (Idle, StartPlanning) => Ok(Planning),
+    (Completed | Failed | Paused, StartPlanning) => Ok(Planning),
+    (Idle, ResetIdle) => Ok(Idle),
+
+    (Planning, StartExecuting) => Ok(Executing),
+    (Planning, Pause) => Ok(Paused),
+    (Planning, Fail) => Ok(Failed),
+    (Planning, ResetIdle) => Ok(Idle),
+    (Planning, UpdateProgress) => Ok(Planning),
+
+    (Executing, StartQa) => Ok(Qa),
+    (Executing, Pause) => Ok(Paused),
+    (Executing, Fail) => Ok(Failed),
+    (Executing, ResetIdle) => Ok(Idle),
+    (Executing, UpdateProgress) => Ok(Executing),
+
+    (Qa, StartExecuting) => Ok(Executing),
+    (Qa, Pause) => Ok(Paused),
+    (Qa, Complete) => Ok(Completed),
+    (Qa, Fail) => Ok(Failed),
+    (Qa, ResetIdle) => Ok(Idle),
+    (Qa, UpdateProgress) => Ok(Qa),
+
+    (Paused, Resume) => Ok(Paused),
+    (Paused, Fail) => Ok(Failed),
+    (Paused, ResetIdle) => Ok(Idle),
+    (Paused, UpdateProgress) => Ok(Paused),
+
+    (Completed, ResetIdle) => Ok(Idle),
+    (Failed, ResetIdle) => Ok(Idle),
+
+    (phase, attempted) => Err(format!(
+      "Invalid cognitive runtime transition: phase={:?}, action={}",
+      phase,
+      attempted.as_str()
+    )),
+  }
+}
+
+fn apply_cognitive_runtime_transition(
+  mut state: CognitiveRuntimeState,
+  args: &CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let action = CognitiveRuntimeAction::parse(&args.action)?;
+  let now = now_ts();
+  let previous_phase = state.phase.clone();
+  let next_phase = transition_phase(previous_phase.clone(), action)?;
+
+  if let Some(goal_id) = &args.goal_id {
+    state.goal_id = goal_id.trim().to_string();
+  }
+  if let Some(goal_label) = &args.goal_label {
+    state.goal_label = goal_label.trim().to_string();
+  }
+  if let Some(step) = &args.current_step {
+    state.current_step = step.trim().to_string();
+  }
+  if let Some(model) = &args.active_model {
+    state.active_model = model.trim().to_string();
+  }
+
+  match action {
+    CognitiveRuntimeAction::StartPlanning => {
+      state.phase = next_phase;
+      state.resume_phase = None;
+      state.started_at = now;
+      state.completed_at = 0;
+      state.failed_at = 0;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+      state.failure_reason.clear();
+      state.iteration_count = 0;
+      if state.goal_id.is_empty() {
+        state.goal_id = format!("goal_{}", now);
+      }
+      if state.goal_label.is_empty() {
+        state.goal_label = "Autonomous Goal".to_string();
+      }
+    }
+    CognitiveRuntimeAction::StartExecuting | CognitiveRuntimeAction::StartQa => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+      if matches!(action, CognitiveRuntimeAction::StartExecuting) {
+        state.iteration_count = state.iteration_count.saturating_add(1);
+      }
+    }
+    CognitiveRuntimeAction::Pause => {
+      state.resume_phase = Some(previous_phase);
+      state.phase = next_phase;
+      state.paused_at = now;
+      state.pause_reason = args.reason.clone().unwrap_or_else(|| "paused".to_string());
+    }
+    CognitiveRuntimeAction::Resume => {
+      let resume_target = state
+        .resume_phase
+        .clone()
+        .ok_or_else(|| "Cannot resume cognitive runtime: no saved resume phase".to_string())?;
+      if resume_target != CognitiveRuntimePhase::Planning && resume_target != CognitiveRuntimePhase::Executing && resume_target != CognitiveRuntimePhase::Qa {
+        return Err(format!(
+          "Cannot resume cognitive runtime: unsupported resume phase {:?}",
+          resume_target
+        ));
+      }
+      state.phase = resume_target;
+      state.resume_phase = None;
+      state.paused_at = 0;
+      state.pause_reason.clear();
+    }
+    CognitiveRuntimeAction::Complete => {
+      state.phase = next_phase;
+      state.completed_at = now;
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::Fail => {
+      state.phase = next_phase;
+      state.failed_at = now;
+      state.failure_reason = args.reason.clone().unwrap_or_else(|| "failed".to_string());
+      state.resume_phase = None;
+    }
+    CognitiveRuntimeAction::ResetIdle => {
+      state = CognitiveRuntimeState::default();
+      state.last_transition_at = now;
+    }
+    CognitiveRuntimeAction::UpdateProgress => {
+      state.phase = next_phase;
+      if state.started_at == 0 {
+        state.started_at = now;
+      }
+    }
+  }
+
+  state.last_transition_action = action.as_str().to_string();
+  state.last_transition_at = now;
+  Ok(state)
+}
+
+#[tauri::command]
+pub fn get_cognitive_runtime_state(app: tauri::AppHandle) -> Result<CognitiveRuntimeState, String> {
+  Ok(read_cognitive_runtime_state(&app))
+}
+
+#[tauri::command]
+pub fn append_cognitive_doc_version(
+  app: tauri::AppHandle,
+  args: AppendCognitiveDocArgs,
+) -> Result<CognitiveDocVersion, String> {
+  append_cognitive_doc_version_internal(
+    &app,
+    &args.goal_id,
+    &args.doc_type,
+    args.author.as_deref().unwrap_or("user"),
+    &args.content,
+    args.metadata.unwrap_or_else(|| serde_json::json!({})),
+  )
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+  limit: Option<usize>,
+) -> Result<Vec<CognitiveDocVersion>, String> {
+  let mut versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  if let Some(cap) = limit {
+    if versions.len() > cap {
+      let keep_from = versions.len().saturating_sub(cap);
+      versions = versions.split_off(keep_from);
+    }
+  }
+  Ok(versions)
+}
+
+#[tauri::command]
+pub fn get_latest_cognitive_doc_version(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: String,
+) -> Result<Option<CognitiveDocVersion>, String> {
+  let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+  Ok(versions.last().cloned())
+}
+
+#[tauri::command]
+pub fn list_cognitive_doc_nodes(
+  app: tauri::AppHandle,
+  goal_id: String,
+) -> Result<Vec<CognitiveDocNode>, String> {
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  let mut out: Vec<CognitiveDocNode> = Vec::new();
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      let doc_type = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("phase_logs")
+        .to_string();
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &doc_type);
+      if let Some(last) = versions.last() {
+        out.push(CognitiveDocNode {
+          goal_id: last.goal_id.clone(),
+          doc_type: last.doc_type.clone(),
+          latest_version: last.version,
+          latest_ts: last.ts,
+        });
+      }
+    }
+  }
+  out.sort_by(|a, b| b.latest_ts.cmp(&a.latest_ts));
+  Ok(out)
+}
+
+#[tauri::command]
+pub fn read_cognitive_doc_context_slice(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+  max_chars: Option<usize>,
+) -> Result<String, String> {
+  let cap = max_chars.unwrap_or(3000).max(240).min(20_000);
+  let mut lines: Vec<String> = Vec::new();
+
+  if let Some(kind) = doc_type {
+    let versions = load_cognitive_doc_versions(&app, &goal_id, &kind);
+    for v in versions.iter().rev().take(8) {
+      lines.push(format!(
+        "[{} v{} @{} by {}] {}",
+        v.doc_type,
+        v.version,
+        v.ts,
+        v.author,
+        v.content
+      ));
+    }
+  } else {
+    let nodes = list_cognitive_doc_nodes(app.clone(), goal_id.clone())?;
+    for node in nodes.into_iter().take(6) {
+      let versions = load_cognitive_doc_versions(&app, &goal_id, &node.doc_type);
+      if let Some(v) = versions.last() {
+        lines.push(format!(
+          "[{} v{} @{} by {}] {}",
+          v.doc_type,
+          v.version,
+          v.ts,
+          v.author,
+          v.content
+        ));
+      }
+    }
+  }
+
+  if lines.is_empty() {
+    return Ok(String::new());
+  }
+
+  let joined = lines.join("\n");
+  let sliced: String = joined.chars().take(cap).collect();
+  Ok(sliced)
+}
+
+#[tauri::command]
+pub fn clear_cognitive_doc_versions(
+  app: tauri::AppHandle,
+  goal_id: String,
+  doc_type: Option<String>,
+) -> Result<usize, String> {
+  let mut cleared = 0usize;
+  if let Some(kind) = doc_type {
+    let target = cognitive_doc_versions_file(&app, &goal_id, &kind)?;
+    if target.exists() {
+      fs::remove_file(&target)
+        .map_err(|e| format!("Failed removing {}: {}", target.display(), e))?;
+      cleared = 1;
+    }
+    return Ok(cleared);
+  }
+
+  let dir = goal_doc_dir(&app, &goal_id)?;
+  if let Ok(rd) = read_dir(&dir) {
+    for entry in rd.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+      if ext != "jsonl" {
+        continue;
+      }
+      fs::remove_file(&path)
+        .map_err(|e| format!("Failed removing {}: {}", path.display(), e))?;
+      cleared = cleared.saturating_add(1);
+    }
+  }
+
+  Ok(cleared)
+}
+
+#[tauri::command]
+pub fn transition_cognitive_runtime_state(
+  app: tauri::AppHandle,
+  args: CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  transition_cognitive_runtime_state_internal(&app, &args)
+}
+
+fn transition_cognitive_runtime_state_internal(
+  app: &tauri::AppHandle,
+  args: &CognitiveRuntimeTransitionArgs,
+) -> Result<CognitiveRuntimeState, String> {
+  let current = read_cognitive_runtime_state(&app);
+  let next = apply_cognitive_runtime_transition(current, &args)?;
+  write_cognitive_runtime_state(&app, &next)?;
+  let event_meta = serde_json::json!({
+    "phase": format!("{:?}", &next.phase).to_lowercase(),
+    "action": &next.last_transition_action,
+    "currentStep": &next.current_step,
+    "activeModel": &next.active_model,
+    "iterationCount": next.iteration_count,
+    "failedAt": next.failed_at,
+    "completedAt": next.completed_at,
+  });
+  let _ = append_cognitive_doc_version_internal(
+    app,
+    if next.goal_id.trim().is_empty() { "global" } else { &next.goal_id },
+    "phase_logs",
+    "runtime",
+    &format!(
+      "phase={} action={} step={} model={} iterations={}",
+      format!("{:?}", &next.phase).to_lowercase(),
+      &next.last_transition_action,
+      &next.current_step,
+      &next.active_model,
+      next.iteration_count
+    ),
+    event_meta,
+  );
+  let _ = app.emit("cognitive_runtime_state", &next);
+  Ok(next)
+}
+
+fn evaluate_cognitive_runtime_policy(state: &CognitiveRuntimeState) -> Result<(), String> {
+  let now = now_ts();
+  if state.phase == CognitiveRuntimePhase::Planning
+    || state.phase == CognitiveRuntimePhase::Executing
+    || state.phase == CognitiveRuntimePhase::Qa
+  {
+    if state.started_at > 0 {
+      let active_secs = now.saturating_sub(state.started_at);
+      if active_secs > COGNITIVE_MAX_ACTIVE_SECS {
+        return Err(format!(
+          "anti_loop_guard: active runtime exceeded time budget ({}s > {}s)",
+          active_secs,
+          COGNITIVE_MAX_ACTIVE_SECS
+        ));
+      }
+    }
+    if state.iteration_count > COGNITIVE_MAX_ITERATIONS {
+      return Err(format!(
+        "anti_loop_guard: iteration budget exceeded ({} > {})",
+        state.iteration_count,
+        COGNITIVE_MAX_ITERATIONS
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn enforce_cognitive_runtime_policy(
+  app: &tauri::AppHandle,
+  window: &tauri::Window,
+  event_name: &str,
+  tab_id: u32,
+  goal_id: &str,
+  step: &str,
+  active_model: Option<&str>,
+) -> Result<(), String> {
+  let state = read_cognitive_runtime_state(app);
+  if let Err(reason) = evaluate_cognitive_runtime_policy(&state) {
+    let _ = transition_cognitive_runtime_state_internal(
+      app,
+      &CognitiveRuntimeTransitionArgs {
+        action: "fail".to_string(),
+        goal_id: Some(goal_id.to_string()),
+        goal_label: Some(format!("Tab {} turn", tab_id)),
+        current_step: Some(step.to_string()),
+        active_model: active_model.map(|s| s.to_string()),
+        reason: Some(reason.clone()),
+      },
+    );
+    let _ = window.emit(&event_name, IrisEvent::Status(format!("Runtime phase -> failed ({})", reason)));
+    return Err(reason);
+  }
+  Ok(())
 }
 
 fn read_setup_flags(app: &tauri::AppHandle) -> SetupFlags {
@@ -3102,17 +5354,29 @@ fn load_persona_prompt() -> String {
 }
 
 fn locate_core_prompts_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
+  if let Some(app)=app {
+    let destination=app.path().app_data_dir().map_err(|err|err.to_string())?.join("core_prompts");
+    fs::create_dir_all(&destination).map_err(|err|err.to_string())?;
+    let target=destination.join("UserPersonaPrompt.txt");
+    if !target.exists() {
+      let source=locate_core_prompts_dir(None).ok().map(|dir|dir.join("UserPersonaPrompt.txt"))
+        .or_else(||app.path().resource_dir().ok().map(|dir|dir.join("core_prompts").join("UserPersonaPrompt.txt")));
+      if let Some(source)=source.filter(|path|path.is_file()) {fs::copy(source,&target).map_err(|err|err.to_string())?;}
+      else {fs::write(&target,"").map_err(|err|err.to_string())?;}
+    }
+    return Ok(destination);
+  }
   let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
   let mut candidates: Vec<PathBuf> = vec![
     cwd.join("core_prompts"),
-    cwd.join("..\\core_prompts"),
-    cwd.join("..\\..\\core_prompts"),
+    cwd.join("..").join("core_prompts"),
+    cwd.join("..").join("..").join("core_prompts"),
   ];
 
   if let Ok(exe) = std::env::current_exe() {
     if let Some(exe_dir) = exe.parent() {
       candidates.push(exe_dir.join("core_prompts"));
-      candidates.push(exe_dir.join("..\\..\\..\\core_prompts"));
+      candidates.push(exe_dir.join("..").join("..").join("..").join("core_prompts"));
     }
   }
 
@@ -3322,6 +5586,12 @@ pub struct ProjectDef {
   pub enabled: bool,
   pub description: String,
   #[serde(default)]
+  pub godot_version_cached: String,
+  #[serde(default)]
+  pub last_bridge_sync_at: i64,
+  #[serde(default)]
+  pub last_full_project_pull_at: i64,
+  #[serde(default)]
   pub manipulation_root_path: String,
   #[serde(default = "default_true_flag")]
   pub dataweb_enabled: bool,
@@ -3344,6 +5614,8 @@ pub struct RepoProjectStore {
   #[serde(default)]
   pub sshs: Vec<SshConnection>,
   pub projects: Vec<ProjectDef>,
+  #[serde(default)]
+  pub tools: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -3776,11 +6048,14 @@ def norm_rel(raw):
 def abspath(rel):
     n = norm_rel(rel)
     if not root:
-        return n
-    base = root.rstrip('/')
-    if n == '.':
-        return base
-    return f"{{base}}/{{n}}"
+    fail("Set a remote root on this SSH connection before file operations")
+  base = pathlib.Path(root).resolve()
+  target = (base / n).resolve()
+  try:
+    target.relative_to(base)
+  except ValueError:
+    fail("Path or symlink escapes remote root")
+  return str(target)
 
 def ensure_parent(path):
     p = pathlib.Path(path)
@@ -3813,7 +6088,8 @@ elif action == "read":
     max_chars = int(args.get("maxChars", args.get("max_chars", 20000)) or 20000)
     max_chars = min(max(max_chars, 256), 300000)
     data = p.read_text(encoding='utf-8', errors='ignore')
-    print(json.dumps({{"ok": True, "content": data[:max_chars]}}))
+    offset = max(0, int(args.get("offset", 0)))
+    print(json.dumps({{"ok": True, "content": data[offset:offset+max_chars], "offset": offset, "totalChars": len(data), "complete": offset+max_chars >= len(data)}}))
 elif action == "write":
     target = abspath(args.get("path", ""))
     content = str(args.get("content", ""))
@@ -3860,11 +6136,11 @@ elif action == "exec":
     cmd = str(args.get("command", "")).strip()
     if not cmd:
         fail("exec requires 'command'")
-    out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True)
-    print(json.dumps({{"ok": True, "output": out}}))
+    completed = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=abspath("."), timeout=60)
+    print(json.dumps({{"ok": completed.returncode == 0, "exitCode": completed.returncode, "output": completed.stdout, "stderr": completed.stderr}}))
 else:
     fail(f"Unsupported SSH action: {{action}}")
-"#, payload = shell_single_quote(&payload_json));
+"#, payload = serde_json::to_string(&payload_json).map_err(|err|err.to_string())?);
 
   let (stdout, _) = ssh_run_script_over_ssh(conn, interpreter, &["-".to_string()], &script)?;
   parse_json_from_stdout(&stdout)
@@ -3875,11 +6151,10 @@ fn ps_single_quote(s: &str) -> String {
 }
 
 fn ssh_remote_powershell_with(conn: &SshConnection, payload: Value, shell: &str) -> Result<Value, String> {
+  use base64::Engine;
   let payload_json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
   let script = format!(r#"$ErrorActionPreference = 'Stop'
-$payload = ConvertFrom-Json @'
-{payload}
-'@
+$payload = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')))
 $action = ([string]$payload.action).ToLowerInvariant()
 $rootRaw = if ($null -eq $payload.remote_root) {{ '' }} else {{ [string]$payload.remote_root }}
 $root = $rootRaw.Trim().Replace('\\','/')
@@ -3902,10 +6177,22 @@ function NormRel([string]$raw) {{
 
 function AbsPath([string]$rel) {{
   $n = NormRel $rel
-  if ([string]::IsNullOrWhiteSpace($root)) {{ return $n }}
-  $base = $root.TrimEnd('/')
-  if ($n -eq '.') {{ return $base }}
-  return "$base/$n"
+  if ([string]::IsNullOrWhiteSpace($root)) {{ Fail 'Set a remote root on this SSH connection before file operations' }}
+  if ($n.Contains(':')) {{ Fail 'Absolute paths are not permitted' }}
+  $base = [IO.Path]::GetFullPath($root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $target = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $n))
+  $prefix = $base + [IO.Path]::DirectorySeparatorChar
+  if ($target -ne $base -and -not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {{ Fail 'Path escapes remote root' }}
+  $ancestor = $target
+  while ($ancestor) {{
+    if (Test-Path -LiteralPath $ancestor) {{
+      $item = Get-Item -LiteralPath $ancestor -Force
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {{ Fail 'Remote symlink/junction traversal is not permitted' }}
+    }}
+    if ($ancestor -eq $base) {{ break }}
+    $ancestor = Split-Path -Parent $ancestor
+  }}
+  return $target
 }}
 
 if ($action -eq 'list') {{
@@ -3935,8 +6222,11 @@ if ($action -eq 'read') {{
   if ($maxChars -lt 256) {{ $maxChars = 256 }}
   if ($maxChars -gt 300000) {{ $maxChars = 300000 }}
   $content = Get-Content -LiteralPath $target -Raw -Encoding UTF8
-  if ($content.Length -gt $maxChars) {{ $content = $content.Substring(0, $maxChars) }}
-  @{{ ok = $true; content = $content }} | ConvertTo-Json -Compress -Depth 8
+  $totalChars = $content.Length
+  $offset = if ($null -ne $argsObj.offset) {{ [Math]::Max(0, [int]$argsObj.offset) }} else {{ 0 }}
+  $offset = [Math]::Min($offset, $totalChars)
+  $content = $content.Substring($offset, [Math]::Min($maxChars, $totalChars - $offset))
+  @{{ ok = $true; content = $content; offset = $offset; totalChars = $totalChars; complete = ($offset + $maxChars -ge $totalChars) }} | ConvertTo-Json -Compress -Depth 8
   exit 0
 }}
 
@@ -3994,8 +6284,10 @@ if ($action -eq 'exec') {{
   $command = [string]$argsObj.command
   if ([string]::IsNullOrWhiteSpace($command)) {{ Fail "exec requires 'command'" }}
   try {{
+    Set-Location -LiteralPath (AbsPath '.')
+    $global:LASTEXITCODE = 0
     $execOut = (Invoke-Expression $command 2>&1 | Out-String)
-    @{{ ok = $true; output = $execOut }} | ConvertTo-Json -Compress -Depth 8
+    @{{ ok = ($LASTEXITCODE -eq 0); exitCode = $LASTEXITCODE; output = $execOut }} | ConvertTo-Json -Compress -Depth 8
     exit 0
   }} catch {{
     Fail $_.Exception.Message
@@ -4003,7 +6295,7 @@ if ($action -eq 'exec') {{
 }}
 
 Fail "Unsupported SSH action: $action"
-"#, payload = ps_single_quote(&payload_json));
+"#, payload = base64::engine::general_purpose::STANDARD.encode(payload_json.as_bytes()));
 
   let remote_args = vec!["-NoProfile".to_string(), "-NonInteractive".to_string(), "-Command".to_string(), "-".to_string()];
   let (stdout, _) = ssh_run_script_over_ssh(conn, shell, &remote_args, &script)?;
@@ -4020,6 +6312,8 @@ pub fn ssh_tool_call(connection: SshConnection, action: String, arguments: Value
   let mut backend_errors: Vec<String> = Vec::new();
 
   for interp in ["python3", "python"] {
+    let probe = ssh_run_script_over_ssh(&connection,interp,&["-".into()],"print('iris-runtime-probe')\n");
+    if !probe.is_ok_and(|(stdout,_)|stdout.trim()=="iris-runtime-probe") {continue;}
     match ssh_remote_python_with(&connection, payload.clone(), interp) {
       Ok(mut v) => {
         if let Some(obj) = v.as_object_mut() {
@@ -4027,11 +6321,13 @@ pub fn ssh_tool_call(connection: SshConnection, action: String, arguments: Value
         }
         return Ok(v);
       }
-      Err(e) => backend_errors.push(format!("{}: {}", interp, e)),
+      Err(error) => return Err(format!("SSH {interp} action failed; outcome may be uncertain, no alternate-runtime retry was attempted: {error}")),
     }
   }
 
   for shell in ["pwsh", "powershell"] {
+    let probe=ssh_run_script_over_ssh(&connection,shell,&["-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),"-".into()],"Write-Output 'iris-runtime-probe'\n");
+    if !probe.is_ok_and(|(stdout,_)|stdout.trim()=="iris-runtime-probe") {backend_errors.push(format!("{shell} unavailable"));continue;}
     match ssh_remote_powershell_with(&connection, payload.clone(), shell) {
       Ok(mut v) => {
         if let Some(obj) = v.as_object_mut() {
@@ -4039,7 +6335,7 @@ pub fn ssh_tool_call(connection: SshConnection, action: String, arguments: Value
         }
         return Ok(v);
       }
-      Err(e) => backend_errors.push(format!("{}: {}", shell, e)),
+      Err(error) => return Err(format!("SSH {shell} action failed; outcome may be uncertain, no alternate-runtime retry was attempted: {error}")),
     }
   }
 
@@ -4119,7 +6415,9 @@ pub fn read_project_dataweb(app: tauri::AppHandle, project_id: String) -> Result
 pub fn write_project_dataweb(app: tauri::AppHandle, project_id: String, content: String) -> Result<(), String> {
   let path = project_dataweb_file(&app, &project_id)?;
   ensure_text_file(&path)?;
-  fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+  fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+  ingest_flat_into_web(&app, &format!("project_{}", project_id), &content);
+  Ok(())
 }
 
 #[tauri::command]
@@ -4140,7 +6438,9 @@ pub fn read_universal_dataweb(app: tauri::AppHandle) -> Result<String, String> {
 pub fn write_universal_dataweb(app: tauri::AppHandle, content: String) -> Result<(), String> {
   let path = universal_dataweb_file(&app)?;
   ensure_text_file(&path)?;
-  fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+  fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+  ingest_flat_into_web(&app, "universal", &content);
+  Ok(())
 }
 
 #[tauri::command]
@@ -4148,6 +6448,100 @@ pub fn open_universal_dataweb(app: tauri::AppHandle) -> Result<(), String> {
   let path = universal_dataweb_file(&app)?;
   ensure_text_file(&path)?;
   open_file_portal(&path)
+}
+
+// ---- Dataweb v2: brain-like 2D associative memory (crate::dataweb) ----
+
+fn dataweb_web_file(app: &tauri::AppHandle, scope: &str) -> Result<PathBuf, String> {
+  Ok(dataweb_dir(app)?.join(format!("web_{}.json", sanitize_dataweb_key(scope))))
+}
+
+fn load_dataweb(app: &tauri::AppHandle, scope: &str) -> Result<crate::dataweb::DataWeb, String> {
+  let path = dataweb_web_file(app, scope)?;
+  if !path.exists() {
+    return Ok(crate::dataweb::DataWeb::default());
+  }
+  let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+  Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+fn save_dataweb(app: &tauri::AppHandle, scope: &str, web: &crate::dataweb::DataWeb) -> Result<(), String> {
+  let path = dataweb_web_file(app, scope)?;
+  atomic_write_json(&path, &serde_json::to_string(web).map_err(|e| e.to_string())?)
+}
+
+/// Ingest each meaningful line/paragraph of flat dataweb text into the associative web so the
+/// human-editable notes feed recall. Near-duplicates reinforce rather than duplicate.
+fn ingest_flat_into_web(app: &tauri::AppHandle, scope: &str, text: &str) {
+  let entries: Vec<&str> = text
+    .split(|c| c == '\n')
+    .map(str::trim)
+    .filter(|line| line.chars().filter(|c| c.is_alphanumeric()).count() >= 6)
+    .collect();
+  if entries.is_empty() {
+    return;
+  }
+  if let Ok(mut web) = load_dataweb(app, scope) {
+    let now = now_ts();
+    for entry in entries.into_iter().take(500) {
+      web.remember(entry, now);
+    }
+    let _ = save_dataweb(app, scope, &web);
+  }
+}
+
+#[tauri::command]
+pub fn dataweb_remember(app: tauri::AppHandle, scope: String, content: String) -> Result<u64, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  let mut web = load_dataweb(&app, &scope)?;
+  let id = web.remember(&content, now_ts());
+  save_dataweb(&app, &scope, &web)?;
+  Ok(id)
+}
+
+#[tauri::command]
+pub fn dataweb_recall(app: tauri::AppHandle, scope: String, query: String, limit: Option<usize>) -> Result<Value, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  let mut web = load_dataweb(&app, &scope)?;
+  let nodes = web.recall(&query, limit.unwrap_or(8).min(40), now_ts(), true);
+  save_dataweb(&app, &scope, &web)?;
+  Ok(serde_json::json!({
+    "query": query,
+    "results": nodes.iter().map(|node| serde_json::json!({
+      "id": node.id, "content": node.content, "hits": node.hits,
+      "coords": [node.x, node.y], "links": node.neighbors.len(),
+    })).collect::<Vec<_>>(),
+    "digest": web.recall_digest(&query, 1800, now_ts()),
+  }))
+}
+
+#[tauri::command]
+pub fn dataweb_stats(app: tauri::AppHandle, scope: String) -> Result<Value, String> {
+  let scope = if scope.trim().is_empty() { "universal".to_string() } else { scope };
+  Ok(load_dataweb(&app, &scope)?.stats())
+}
+
+/// Associative recall across the universal web and (if any) the active project's web, returned as a
+/// compact digest for injecting relevant long-term memory into an agent turn. Read-only and bounded,
+/// so it stays cheap no matter how much is stored; empty when nothing relevant exists.
+pub(crate) fn recall_memory_digest(app: &tauri::AppHandle, project_id: Option<&str>, query: &str, max_chars: usize) -> String {
+  let mut scopes: Vec<String> = vec!["universal".to_string()];
+  if let Some(id) = project_id {
+    scopes.push(format!("project_{}", id));
+  }
+  let mut out = String::new();
+  for scope in scopes {
+    if let Ok(web) = load_dataweb(app, &scope) {
+      let digest = web.recall_digest(query, max_chars / 2, now_ts());
+      if !digest.is_empty() {
+        if !out.is_empty() {
+          out.push('\n');
+        }
+        out.push_str(&digest);
+      }
+    }
+  }
+  out.chars().take(max_chars).collect()
 }
 
 fn read_repo_project_store(app: &tauri::AppHandle) -> RepoProjectStore {
@@ -4177,7 +6571,7 @@ fn is_text_like_file(path: &std::path::Path) -> bool {
     ext.as_str(),
     "txt" | "md" | "rst" | "csv" | "json" | "toml" | "yaml" | "yml" | "xml" | "ini" | "log" |
     "ts" | "tsx" | "js" | "jsx" | "py" | "gd" | "cs" | "rs" | "java" | "cpp" | "c" | "h" |
-    "html" | "css" | "scss" | "sql" | "sh" | "bat" | "ps1"
+    "html" | "css" | "scss" | "sql" | "sh" | "bat" | "ps1" | "tscn" | "tres" | "godot" | "gdshader" | "svg"
   )
 }
 
@@ -4667,6 +7061,8 @@ pub struct NetworkHit {
   pub title: String,
   pub url: String,
   pub snippet: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub published_at: Option<String>,
   pub score: f32,
 }
 
@@ -4684,8 +7080,12 @@ pub struct WeatherLookupResponse {
   pub location: String,
   pub city: String,
   pub region: String,
-  pub temperature_f: f64,
+  pub temperature_f: Option<f64>,
   pub weather_conditions: String,
+  pub observed_at: Option<String>,
+  pub timezone: String,
+  pub forecast: WeatherDayForecast,
+  pub retrieved_at: i64,
   pub day_label: String,
   pub summary: String,
   pub source_url: String,
@@ -4693,11 +7093,12 @@ pub struct WeatherLookupResponse {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-struct SanitizedWeatherPayload {
-  city: String,
-  region: String,
-  temperature_f: f64,
-  weather_conditions: String,
+pub struct WeatherDayForecast {
+  pub date: String,
+  pub high_f: f64,
+  pub low_f: f64,
+  pub weather_conditions: String,
+  pub precipitation_probability_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -4752,6 +7153,23 @@ fn weather_code_label(code: i64) -> &'static str {
   }
 }
 
+fn us_state_from_abbrev(token: &str) -> Option<&'static str> {
+  Some(match token.to_ascii_lowercase().as_str() {
+    "al" => "alabama", "ak" => "alaska", "az" => "arizona", "ar" => "arkansas", "ca" => "california",
+    "co" => "colorado", "ct" => "connecticut", "de" => "delaware", "fl" => "florida", "ga" => "georgia",
+    "hi" => "hawaii", "id" => "idaho", "il" => "illinois", "in" => "indiana", "ia" => "iowa",
+    "ks" => "kansas", "ky" => "kentucky", "la" => "louisiana", "me" => "maine", "md" => "maryland",
+    "ma" => "massachusetts", "mi" => "michigan", "mn" => "minnesota", "ms" => "mississippi", "mo" => "missouri",
+    "mt" => "montana", "ne" => "nebraska", "nv" => "nevada", "nh" => "new hampshire", "nj" => "new jersey",
+    "nm" => "new mexico", "ny" => "new york", "nc" => "north carolina", "nd" => "north dakota", "oh" => "ohio",
+    "ok" => "oklahoma", "or" => "oregon", "pa" => "pennsylvania", "ri" => "rhode island", "sc" => "south carolina",
+    "sd" => "south dakota", "tn" => "tennessee", "tx" => "texas", "ut" => "utah", "vt" => "vermont",
+    "va" => "virginia", "wa" => "washington", "wv" => "west virginia", "wi" => "wisconsin", "wy" => "wyoming",
+    "dc" => "district of columbia",
+    _ => return None,
+  })
+}
+
 fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
   let raw_lower = raw_location.trim().to_lowercase();
   let query_tokens = keyword_set(&raw_lower)
@@ -4774,6 +7192,16 @@ fn score_geocode_result(result: &Value, raw_location: &str) -> f64 {
   }
   if !admin1.is_empty() && raw_lower.contains(&admin1) {
     score += 1.2;
+  }
+  // A US state abbreviation in the query (e.g. "Durham, NC") should strongly match its full admin1
+  // name ("North Carolina"); this prevents drifting to a same-named city in another state/country.
+  if !admin1.is_empty() {
+    let abbrev_match = raw_lower.split(|c: char| !c.is_ascii_alphanumeric())
+      .any(|token| us_state_from_abbrev(token).is_some_and(|full| full == admin1));
+    if abbrev_match {
+      score += 3.0;
+      if country == "united states" { score += 0.8; }
+    }
   }
   if !postcode.is_empty() && raw_lower.contains(&postcode) {
     score += 4.0;
@@ -4932,6 +7360,7 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
     .query(&[
       ("latitude", geo.lat.to_string()),
       ("longitude", geo.lon.to_string()),
+      ("current", "temperature_2m,weather_code".to_string()),
       ("daily", "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max".to_string()),
       ("timezone", "auto".to_string()),
       ("forecast_days", "4".to_string()),
@@ -4939,11 +7368,17 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
     ])
     .send()
     .await
+    .and_then(reqwest::Response::error_for_status)
     .map_err(|e| format!("Weather forecast failed: {}", e))?;
 
+  let source_url = forecast_resp.url().to_string();
   let forecast_json: Value = forecast_resp.json().await.map_err(|e| format!("Invalid forecast response: {}", e))?;
+  parse_weather_response(&geo, &forecast_json, day_offset.unwrap_or(0), &source_url)
+}
+
+fn parse_weather_response(geo: &WeatherGeoTarget, forecast_json: &Value, day_offset: u8, source_url: &str) -> Result<WeatherLookupResponse, String> {
   let daily = forecast_json.get("daily").ok_or_else(|| "Forecast data missing".to_string())?;
-  let index = usize::from(day_offset.unwrap_or(0).min(3));
+  let index = usize::from(day_offset.min(3));
 
   let times = daily.get("time").and_then(|v| v.as_array()).ok_or_else(|| "Forecast days missing".to_string())?;
   let maxes = daily.get("temperature_2m_max").and_then(|v| v.as_array()).ok_or_else(|| "Max temperatures missing".to_string())?;
@@ -4955,41 +7390,102 @@ pub async fn weather_lookup(location: String, day_offset: Option<u8>) -> Result<
     return Err("Requested forecast day is unavailable".to_string());
   }
 
-  let date = times[index].as_str().unwrap_or("");
-  let max_temp = maxes[index].as_f64().unwrap_or(0.0);
-  let min_temp = mins[index].as_f64().unwrap_or(0.0);
-  let precip_prob = precip[index].as_i64().unwrap_or(0);
+  let date = times[index].as_str().ok_or("Forecast date is missing")?;
+  let max_temp = maxes[index].as_f64().ok_or("Forecast high is unavailable")?;
+  let min_temp = mins[index].as_f64().ok_or("Forecast low is unavailable")?;
+  let precip_prob = precip[index].as_f64();
   let code = codes[index].as_i64().unwrap_or(-1);
   let day_label = if index == 0 { "today" } else if index == 1 { "tomorrow" } else { date };
-  let sanitized = SanitizedWeatherPayload {
-    city: geo.city.clone(),
-    region: geo.region.clone(),
-    temperature_f: max_temp,
-    weather_conditions: weather_code_label(code).to_string(),
+  let timezone = forecast_json["timezone"].as_str().unwrap_or("UTC").to_string();
+  let (temperature_f, observed_at, conditions) = if index == 0 {
+    let current = &forecast_json["current"];
+    let temperature = current["temperature_2m"].as_f64().ok_or("Current temperature is unavailable; the daily high is not a current reading")?;
+    let time = current["time"].as_str().filter(|time| !time.is_empty()).ok_or("Current observation time is missing")?;
+    let current_code = current["weather_code"].as_i64().ok_or("Current conditions are unavailable")?;
+    (Some(temperature), Some(time.to_string()), weather_code_label(current_code).to_string())
+  } else {
+    (None, None, weather_code_label(code).to_string())
   };
   let location_label = [geo.city.as_str(), geo.region.as_str(), geo.country.as_str()]
     .into_iter()
     .filter(|s| !s.trim().is_empty())
     .collect::<Vec<_>>()
     .join(", ");
-  let summary = format!(
-    "{} with a high around {:.0} F, a low around {:.0} F, and about a {}% chance of precipitation.",
-    sanitized.weather_conditions,
-    max_temp,
-    min_temp,
-    precip_prob
-  );
+  let summary = match temperature_f {
+    Some(temperature) => {
+      let local_time = observed_at.as_deref().and_then(|stamp| stamp.split('T').nth(1)).unwrap_or("");
+      let place = if location_label.trim().is_empty() { "this location".to_string() } else { location_label.clone() };
+      format!("Current weather in {place}: {temperature:.1} F, {conditions}, as of {local_time} local time.")
+    }
+    None => format!("Forecast for {date}: {conditions}, high {max_temp:.1} F, low {min_temp:.1} F."),
+  };
 
   Ok(WeatherLookupResponse {
     location: location_label,
-    city: sanitized.city,
-    region: sanitized.region,
-    temperature_f: sanitized.temperature_f,
-    weather_conditions: sanitized.weather_conditions,
+    city: geo.city.clone(),
+    region: geo.region.clone(),
+    temperature_f,
+    weather_conditions: conditions,
+    observed_at,
+    timezone,
+    forecast: WeatherDayForecast { date: date.to_string(), high_f: max_temp, low_f: min_temp, weather_conditions: weather_code_label(code).to_string(), precipitation_probability_percent: precip_prob },
+    retrieved_at: now_ts(),
     day_label: day_label.to_string(),
     summary,
-    source_url: "https://open-meteo.com/".to_string(),
+    source_url: source_url.to_string(),
   })
+}
+
+#[cfg(test)]
+mod weather_tests {
+  use super::*;
+
+  fn fixture() -> (WeatherGeoTarget, Value) {
+    (WeatherGeoTarget { lat: 35.99, lon: -78.9, city: "Durham".into(), region: "North Carolina".into(), country: "United States".into() }, serde_json::json!({
+      "timezone":"America/New_York", "current":{"time":"2026-10-27T04:00","temperature_2m":44.0,"weather_code":45},
+      "daily":{"time":["2026-10-27","2026-10-28"],"temperature_2m_max":[74.0,70.0],"temperature_2m_min":[40.0,42.0],"weather_code":[3,1],"precipitation_probability_max":[1,null]}
+    }))
+  }
+
+  #[test]
+  fn current_temperature_is_not_the_daily_high() {
+    let (geo, data) = fixture();
+    let result = parse_weather_response(&geo, &data, 0, "https://api.open-meteo.com/v1/forecast").unwrap();
+    assert_eq!(result.temperature_f, Some(44.0));
+    assert_eq!(result.forecast.high_f, 74.0);
+    assert_eq!(result.weather_conditions, "foggy");
+    assert_eq!(result.observed_at.as_deref(), Some("2026-10-27T04:00"));
+    assert!(result.summary.contains("44.0 F"));
+    assert!(!result.summary.contains("74.0"));
+  }
+
+  #[test]
+  fn missing_current_data_never_falls_back_to_forecast() {
+    let (geo, mut data) = fixture();
+    data["current"]["temperature_2m"] = Value::Null;
+    assert!(parse_weather_response(&geo, &data, 0, "source").is_err());
+  }
+
+  #[test]
+  fn future_forecast_does_not_claim_a_current_reading() {
+    let (geo, data) = fixture();
+    let result = parse_weather_response(&geo, &data, 1, "source").unwrap();
+    assert_eq!(result.temperature_f, None);
+    assert_eq!(result.observed_at, None);
+    assert_eq!(result.forecast.high_f, 70.0);
+    assert_eq!(result.forecast.precipitation_probability_percent, None);
+  }
+
+  #[test]
+  fn state_abbreviation_disambiguates_same_named_cities() {
+    let durham_nc = serde_json::json!({"name":"Durham","admin1":"North Carolina","country":"United States","feature_code":"PPLA2","population":283506});
+    let durham_uk = serde_json::json!({"name":"Durham","admin1":"England","country":"United Kingdom","feature_code":"PPLA2","population":48069});
+    let durham_ny = serde_json::json!({"name":"Durham","admin1":"New York","country":"United States","feature_code":"PPL","population":2700});
+    assert!(score_geocode_result(&durham_nc, "Durham, NC") > score_geocode_result(&durham_uk, "Durham, NC"));
+    assert!(score_geocode_result(&durham_nc, "Durham, NC") > score_geocode_result(&durham_ny, "Durham, NC"));
+    // Abbreviation expansion is state-specific: NY must not win a "NC" query.
+    assert!(score_geocode_result(&durham_ny, "Durham, NY") > score_geocode_result(&durham_nc, "Durham, NY"));
+  }
 }
 
 #[tauri::command]
@@ -5094,6 +7590,7 @@ fn add_related_topics_hits(value: &Value, out: &mut Vec<NetworkHit>) {
           title,
           url: url.to_string(),
           snippet: text.trim().to_string(),
+          published_at: None,
           score: 0.0,
         });
       }
@@ -5113,30 +7610,41 @@ fn is_news_query(query: &str) -> bool {
 fn parse_duckduckgo_lite_hits(html: &str, max_results: usize) -> Vec<NetworkHit> {
   let mut out = Vec::new();
   let doc = Html::parse_document(html);
-  let selector = match Selector::parse("a") {
+  let selector = match Selector::parse("a.result-link, a.result__a") {
     Ok(s) => s,
     Err(_) => return out,
   };
+  let snippet_selector = Selector::parse(".result-snippet, .result__snippet").unwrap();
+  let base = reqwest::Url::parse("https://duckduckgo.com/").unwrap();
 
   for anchor in doc.select(&selector) {
     if out.len() >= max_results {
       break;
     }
     let text = anchor.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-    let href = anchor.value().attr("href").unwrap_or("").trim().to_string();
+    let href = anchor.value().attr("href").unwrap_or("").trim();
     if text.is_empty() || href.is_empty() {
       continue;
     }
-    if !href.starts_with("http") {
-      continue;
-    }
-    if href.contains("duckduckgo.com") {
-      continue;
-    }
+    let Ok(link) = base.join(href) else { continue; };
+    let destination = link.query_pairs().find(|(key, _)| key == "uddg").map(|(_, value)| value.into_owned()).unwrap_or_else(|| link.to_string());
+    let Ok(url) = reqwest::Url::parse(&destination) else { continue; };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com")) { continue; }
+    let container = anchor.ancestors().filter_map(scraper::ElementRef::wrap)
+      .find(|node| node.value().name() == "tr" || node.value().classes().any(|class| class == "result"));
+    let snippet = container.and_then(|node| {
+      node.select(&snippet_selector).next().map(|snippet| snippet.text().collect::<Vec<_>>().join(" ")).or_else(|| {
+        if node.value().name() != "tr" { return None; }
+        node.next_siblings().filter_map(scraper::ElementRef::wrap).take(2)
+          .take_while(|row| row.select(&selector).next().is_none())
+          .find_map(|row| row.select(&snippet_selector).next().map(|snippet| snippet.text().collect::<Vec<_>>().join(" ")))
+      })
+    }).unwrap_or_else(|| text.clone());
     out.push(NetworkHit {
-      title: text.clone(),
-      url: href,
-      snippet: text,
+      title: crate::agent_runtime::excerpt(&text, 200),
+      url: url.to_string(),
+      snippet: crate::agent_runtime::excerpt(&snippet.split_whitespace().collect::<Vec<_>>().join(" "), 900),
+      published_at: None,
       score: 0.0,
     });
   }
@@ -5146,53 +7654,75 @@ fn parse_duckduckgo_lite_hits(html: &str, max_results: usize) -> Vec<NetworkHit>
 
 fn parse_news_rss_hits(xml: &str, max_results: usize) -> Vec<NetworkHit> {
   let mut out = Vec::new();
-  let item_re = match Regex::new(r"(?is)<item>(.*?)</item>") {
-    Ok(r) => r,
-    Err(_) => return out,
-  };
-  let title_re = match Regex::new(r"(?is)<title>(.*?)</title>") {
-    Ok(r) => r,
-    Err(_) => return out,
-  };
-  let link_re = match Regex::new(r"(?is)<link>(.*?)</link>") {
-    Ok(r) => r,
-    Err(_) => return out,
-  };
-  let desc_re = match Regex::new(r"(?is)<description>(.*?)</description>") {
-    Ok(r) => r,
-    Err(_) => return out,
-  };
-
-  for cap in item_re.captures_iter(xml) {
-    if out.len() >= max_results {
-      break;
-    }
-    let block = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-    let title = title_re
-      .captures(block)
-      .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
-      .unwrap_or_default();
-    let link = link_re
-      .captures(block)
-      .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
-      .unwrap_or_default();
-    let desc = desc_re
-      .captures(block)
-      .and_then(|c| c.get(1).map(|m| m.as_str().replace("<![CDATA[", "").replace("]]>", "")))
-      .unwrap_or_default();
-
-    if title.is_empty() || link.is_empty() {
-      continue;
-    }
+  let Ok(document) = roxmltree::Document::parse(xml) else { return out; };
+  for item in document.descendants().filter(|node| node.has_tag_name("item")) {
+    if out.len() >= max_results { break; }
+    let field = |name| item.children().find(|node| node.has_tag_name(name)).and_then(|node| node.text()).unwrap_or("").trim().to_string();
+    let title = field("title");
+    let Ok(link) = reqwest::Url::parse(&field("link")) else { continue; };
+    if title.is_empty() || !matches!(link.scheme(), "http" | "https") { continue; }
+    let description = Html::parse_fragment(&field("description")).root_element().text().collect::<Vec<_>>().join(" ");
+    let snippet = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let published = field("pubDate");
     out.push(NetworkHit {
-      title: title.clone(),
-      url: link,
-      snippet: title,
-      score: if desc.is_empty() { 0.0 } else { 0.25 },
+      snippet: crate::agent_runtime::excerpt(if snippet.is_empty() { &title } else { &snippet }, 900),
+      title: crate::agent_runtime::excerpt(&title, 200),
+      url: link.to_string(),
+      published_at: if published.is_empty() { None } else { Some(published) },
+      score: 0.0,
     });
   }
 
   out
+}
+
+#[cfg(test)]
+mod network_search_tests {
+  use super::*;
+
+  #[test]
+  fn unrelated_provider_payloads_are_not_accepted_as_useful_results() {
+    let terms=search_query_terms("latest information about Example Quest game");
+    let irrelevant=NetworkHit{title:"Unrelated catalogue".into(),url:"https://unrelated.test/catalog".into(),snippet:"Products unrelated to the requested title".into(),..Default::default()};
+    assert!(!search_hit_relevant(&irrelevant,&terms));
+    let relevant=NetworkHit{title:"Example Quest on PC".into(),url:"https://publisher.test/game".into(),snippet:"The publisher's release notes.".into(),..Default::default()};
+    assert!(search_hit_relevant(&relevant,&terms));
+  }
+
+  #[test]
+  fn encyclopedia_discovery_preserves_titles_and_source_urls() {
+    let hits=parse_encyclopedia_hits(r#"{"query":{"search":[{"title":"Example Quest","snippet":"A <span>video game</span> release."}]}}"#,3);
+    assert_eq!(hits[0].url,"https://en.wikipedia.org/wiki/Example_Quest");
+    assert!(hits[0].snippet.contains("video game"));
+  }
+
+  #[test]
+  fn duckduckgo_preserves_snippets_and_unwraps_redirects() {
+    let hits = parse_duckduckgo_lite_hits(r#"<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnew-series">A new series</a><a class="result__snippet">The official release is scheduled for next year.</a></div>"#, 3);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].url, "https://example.com/new-series");
+    assert!(hits[0].snippet.contains("scheduled for next year"));
+    assert!(parse_duckduckgo_lite_hits("<a href='https://example.com/challenge'>Verify</a>", 3).is_empty());
+  }
+
+  #[test]
+  fn lite_results_keep_their_own_snippet() {
+    let hits = parse_duckduckgo_lite_hits("<table><tr><td><a class='result-link' href='https://example.com/one'>One</a></td></tr><tr><td class='result-snippet'>First evidence</td></tr><tr><td><a class='result-link' href='https://example.com/two'>Two</a></td></tr><tr><td class='result-snippet'>Second evidence</td></tr></table>", 3);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].snippet, "First evidence");
+    assert_eq!(hits[1].snippet, "Second evidence");
+  }
+
+  #[test]
+  fn rss_preserves_evidence_dates_and_xml_entities() {
+    let hits = parse_news_rss_hits("<rss><channel><item><title>A &amp; B</title><link>https://example.com/?a=1&amp;b=2</link><description><![CDATA[<p>A release <b>announcement</b>, not a premiere.</p>]]></description><pubDate>Tue, 27 Oct 2026 10:00:00 GMT</pubDate></item></channel></rss>", 3);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "A & B");
+    assert!(hits[0].snippet.contains("announcement"));
+    assert_eq!(hits[0].url, "https://example.com/?a=1&b=2");
+    assert!(hits[0].published_at.as_ref().unwrap().contains("2026"));
+    assert!(parse_news_rss_hits("<rss>truncated", 3).is_empty());
+  }
 }
 
 #[tauri::command]
@@ -5233,6 +7763,7 @@ pub async fn network_search(query: String, project_context: Option<String>) -> R
       title: if !heading.is_empty() { heading.to_string() } else { "Result".to_string() },
       url: abstract_url.to_string(),
       snippet: abstract_text.to_string(),
+      published_at: None,
       score: 0.0,
     });
   }
@@ -5394,7 +7925,7 @@ pub fn update_tab_memory(app: tauri::AppHandle, args: UpdateTabMemoryArgs) -> Re
     mem.micro_summary = args.micro_summary;
     mem.dialogue_bullets = args.dialogue_bullets;
     let ts = now_ts();
-    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts });
+    mem.messages.push(ChatMessage { role: "llm".into(), text: args.new_message, time: ts, thinking_log: None });
     let mut arts = args.artifacts;
     for a in arts.iter_mut() { a.ts = ts; }
     mem.artifacts.extend(arts);
@@ -5426,6 +7957,23 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   if !flags.interpret_v2_enabled {
     return Err("interpret_v2 is disabled by setup flags".to_string());
   }
+
+  let runtime_before = read_cognitive_runtime_state(&app);
+  let planning_action = match runtime_before.phase {
+    CognitiveRuntimePhase::Idle | CognitiveRuntimePhase::Completed | CognitiveRuntimePhase::Failed => "start_planning",
+    _ => "update_progress",
+  };
+  let _ = transition_cognitive_runtime_state_internal(
+    &app,
+    &CognitiveRuntimeTransitionArgs {
+      action: planning_action.to_string(),
+      goal_id: Some(format!("tab{}_{}", args.tab_id, now_ts())),
+      goal_label: Some(format!("Tab {} planning", args.tab_id)),
+      current_step: Some("interpret_turn_v2".to_string()),
+      active_model: Some("iris-organizer:latest".to_string()),
+      reason: None,
+    },
+  );
 
   let mem = load_tab(&app, args.tab_id)?;
   let compiled = compile_context_from_mem(&mem, args.token_budget.unwrap_or(1200));
@@ -5520,11 +8068,33 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     .map(|v| v.trim())
     .filter(|v| !v.is_empty())
     .unwrap_or(flags.assistant_name.as_str());
-  let model_profile = args.model_profile.as_deref()
+  let explicit_model_profile = args.model_profile.as_deref()
     .map(|v| v.trim())
-    .filter(|v| !v.is_empty())
-    .unwrap_or(flags.model_profile.as_str());
-  let model_profile_lc = model_profile.to_ascii_lowercase();
+    .filter(|v| !v.is_empty());
+  let configured_model_profile = if let Some(explicit) = explicit_model_profile {
+    explicit.to_string()
+  } else {
+    flags.model_profile.clone()
+  };
+  let has_explicit_profile = explicit_model_profile.is_some();
+  let (auto_profile, auto_profile_reason) = auto_select_thinking_profile(
+    &primary_intent,
+    pressure,
+    needs_vision,
+    should_use_coder,
+    args.token_budget,
+  );
+  let selected_thinking_profile = if has_explicit_profile {
+    configured_model_profile
+  } else {
+    auto_profile
+  };
+  let profile_selection_reason = if has_explicit_profile {
+    "specified_via_request_or_settings".to_string()
+  } else {
+    auto_profile_reason
+  };
+  let model_profile_lc = selected_thinking_profile.to_ascii_lowercase();
   let constrained_profile = model_profile_lc == "low" || model_profile_lc == "minimal";
   let network_enabled = args.network_enabled.unwrap_or(flags.network_enabled);
   let mut repos_enabled = args.repos_enabled.unwrap_or(flags.repos_enabled);
@@ -5544,10 +8114,17 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   let universal_dataweb = args.universal_dataweb.as_deref().unwrap_or("").trim();
   let allow_long_term_dataweb = explicitly_requests_long_term_memory(&args.user_text)
     || transcript_insufficient_for_long_term(&compiled.recent_transcript, &args.user_text);
+  let runtime_state_for_docs = read_cognitive_runtime_state(&app);
+  let runtime_goal_for_docs = if runtime_state_for_docs.goal_id.trim().is_empty() {
+    format!("tab{}_planning", args.tab_id)
+  } else {
+    runtime_state_for_docs.goal_id
+  };
+  let include_cognitive_slice = allow_long_term_dataweb || pressure >= 0.58;
   let system_state_block = format!(
     "System state:\n- Assistant name: {}\n- Model profile: {}\n- Network: {}\n- Repos context: {}\n- MCP context: {}\n- Desktop tools: {}\n- Selected project: {}",
     assistant_name,
-    model_profile,
+    selected_thinking_profile,
     if network_enabled { "ON" } else { "OFF" },
     if repos_enabled { "ON" } else { "OFF" },
     if mcp_enabled { "ON" } else { "OFF" },
@@ -5563,6 +8140,21 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
   }
   if allow_long_term_dataweb && !universal_dataweb.is_empty() {
     injected_context_parts.push(format!("Universal dataweb memory:\n{}", universal_dataweb));
+  }
+  if include_cognitive_slice {
+    if let Ok(slice) = read_cognitive_doc_context_slice(
+      app.clone(),
+      runtime_goal_for_docs.clone(),
+      None,
+      Some(2400),
+    ) {
+      if !slice.trim().is_empty() {
+        injected_context_parts.push(format!(
+          "Cognitive doc slice (append-only history):\n{}",
+          slice
+        ));
+      }
+    }
   }
   let injected_context_block = if injected_context_parts.is_empty() {
     "Injected external context:\n(none)".to_string()
@@ -5691,7 +8283,13 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       active_art,
       args.user_text,
       godot_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   } else {
     let gk_hint = if primary_intent == "general_knowledge" {
@@ -5722,9 +8320,115 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
       clarify_hint,
       followup_hint,
       alcohol_age_hint,
-      bridge_note
+      if has_explicit_profile {
+        bridge_note.clone()
+      } else if bridge_note.trim().is_empty() {
+        format!("Thinking profile auto-selection: {}", profile_selection_reason)
+      } else {
+        format!("{}\nThinking profile auto-selection: {}", bridge_note, profile_selection_reason)
+      }
     )
   };
+
+  let goal_for_docs = runtime_goal_for_docs.clone();
+  let planning_summary = format!(
+    "primary_intent={} secondary_intent={} strategy={} model={} status_hint={} route={}",
+    primary_intent,
+    secondary_intent,
+    strategy,
+    model,
+    status_hint,
+    route_summary
+  );
+  let planning_meta = serde_json::json!({
+    "tabId": args.tab_id,
+    "primaryIntent": &primary_intent,
+    "secondaryIntent": &secondary_intent,
+    "strategy": &strategy,
+    "model": &model,
+    "statusHint": &status_hint,
+    "routedModels": &routed_models,
+    "pressureScore": pressure,
+    "resolverUsed": &resolver_used,
+    "selectedThinkingProfile": &selected_thinking_profile,
+    "profileSelectionReason": &profile_selection_reason,
+  });
+
+  let existing_plan_versions = load_cognitive_doc_versions(&app, &goal_for_docs, "planning_logs");
+  let planner_resume_hint = existing_plan_versions
+    .last()
+    .map(|v| format!("resume_from_planning_logs_v{}", v.version));
+
+  let phase_1_summary = format!(
+    "goal_discovery: primary_intent={} secondary_intent={} pressure={:.2} context_tokens~{}",
+    primary_intent,
+    secondary_intent,
+    pressure,
+    compiled.recent_transcript.chars().count() / 4
+  );
+  let phase_2_summary = format!(
+    "constraints_exit_criteria: strategy={} deterministic_resolver={} use_coder={}",
+    strategy,
+    resolver_used,
+    should_use_coder
+  );
+  let phase_3_summary = format!(
+    "master_plan: model={} routed_models={} status_hint={}",
+    model,
+    routed_models.join(" -> "),
+    status_hint
+  );
+  let phase_4_summary = format!(
+    "execution_ready: prompt_chars={} routine_plan={} bridge_note_present={}",
+    prompt.chars().count(),
+    if routine_plan.is_some() { "yes" } else { "no" },
+    if bridge_note.trim().is_empty() { "no" } else { "yes" }
+  );
+
+  let mut planner_phase_checkpoints: Vec<PlannerPhaseCheckpoint> = Vec::new();
+  let phase_entries = vec![
+    ("phase_1", "Goal + Resource Discovery", "phase1_logs", phase_1_summary),
+    ("phase_2", "Exit Criteria + Constraints", "phase2_logs", phase_2_summary),
+    ("phase_3", "Master Plan + Skeleton", "phase3_logs", phase_3_summary),
+    ("phase_4", "Execution Readiness", "phase4_logs", phase_4_summary),
+  ];
+
+  for (phase, label, doc_type, summary) in phase_entries {
+    let meta = serde_json::json!({
+      "phase": phase,
+      "label": label,
+      "tabId": args.tab_id,
+      "statusHint": &status_hint,
+      "routeSummary": &route_summary,
+      "suggestedGodotVersion": &suggested_godot_version,
+    });
+    if let Ok(v) = append_cognitive_doc_version_internal(
+      &app,
+      &goal_for_docs,
+      doc_type,
+      "planner",
+      &summary,
+      meta,
+    ) {
+      planner_phase_checkpoints.push(PlannerPhaseCheckpoint {
+        phase: phase.to_string(),
+        label: label.to_string(),
+        summary,
+        doc_type: doc_type.to_string(),
+        doc_version: v.version,
+        ts: v.ts,
+      });
+    }
+  }
+
+  let _ = append_cognitive_doc_version_internal(
+    &app,
+    &goal_for_docs,
+    "planning_logs",
+    "planner",
+    &planning_summary,
+    planning_meta,
+  );
 
   Ok(InterpretPlanV2 {
     primary_intent,
@@ -5745,6 +8449,11 @@ pub fn interpret_turn_v2(app: tauri::AppHandle, args: InterpretTurnArgs) -> Resu
     routed_models,
     route_summary,
     status_hint,
+    selected_thinking_profile: Some(selected_thinking_profile),
+    profile_selection_reason: Some(profile_selection_reason),
+    planner_phase: Some("phase_4_execution_ready".to_string()),
+    planner_resume_hint,
+    planner_phase_checkpoints: if planner_phase_checkpoints.is_empty() { None } else { Some(planner_phase_checkpoints) },
     routine_plan,
   })
 }
@@ -5866,26 +8575,65 @@ pub async fn ensure_coder_lite_model() -> Result<String, String> {
     }
 }
 
+async fn local_server_json(client: &reqwest::Client, path: &str) -> Result<Value, String> {
+  client.get(format!("{OLLAMA_BASE}{path}")).send().await.map_err(|error| error.to_string())?
+    .error_for_status().map_err(|error| error.to_string())?.json().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_server_status() -> Result<Value, String> {
+  let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(4)).build().map_err(|error|error.to_string())?;
+  let started = std::time::Instant::now();
+  let version = match local_server_json(&client, "/api/version").await {
+    Ok(version) => version,
+    Err(error) => return Ok(serde_json::json!({"endpoint":OLLAMA_BASE,"online":false,"error":error,"loadedModels":[],"installedModels":[]})),
+  };
+  let latency = started.elapsed().as_millis() as u64;
+  let (loaded, installed) = tokio::join!(local_server_json(&client, "/api/ps"), local_server_json(&client, "/api/tags"));
+  let mut warnings = Vec::new();
+  let loaded = loaded.unwrap_or_else(|error| { warnings.push(format!("Loaded models: {error}")); Value::Null });
+  let installed = installed.unwrap_or_else(|error| { warnings.push(format!("Installed models: {error}")); Value::Null });
+  Ok(serde_json::json!({"endpoint":OLLAMA_BASE,"online":true,"version":version["version"],"latencyMs":latency,
+    "loadedModels":loaded["models"].as_array().cloned().unwrap_or_default(),
+    "installedModels":installed["models"].as_array().cloned().unwrap_or_default().iter().filter_map(|model|model["name"].as_str()).collect::<Vec<_>>(),
+    "warnings":warnings}))
+}
+
+#[tauri::command]
+pub async fn start_local_ollama() -> Result<Value, String> {
+  let status = get_server_status().await?;
+  if status["online"] == true { return Ok(status); }
+  background_command(resolve_ollama_executable()).arg("serve")
+    .env("OLLAMA_HOST", "127.0.0.1:11434").env("OLLAMA_NUM_PARALLEL", "1").env("OLLAMA_MAX_LOADED_MODELS", "1")
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    .map_err(|error| format!("Could not start Ollama: {error}. Check that Ollama is installed."))?;
+  for _ in 0..15 {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let status = get_server_status().await?;
+    if status["online"] == true { return Ok(status); }
+  }
+  Err("Ollama did not become ready. Check its installation and whether another service owns port 11434.".into())
+}
+
+#[tauri::command]
+pub async fn test_network_search(app: tauri::AppHandle, query: String) -> Result<Value, String> {
+  if !read_setup_flags(&app).network_enabled { return Err("Network access is disabled in Settings.".into()); }
+  if query.trim().is_empty() { return Err("Enter a search query.".into()); }
+  Ok(execute_universal_search(&query, "shallow").await)
+}
+
 pub fn ensure_ollama_running_once() {
     if OLLAMA_START_ATTEMPTED.swap(true, Ordering::SeqCst) { return; }
     thread::spawn(|| {
-        #[cfg(target_os = "windows")]
-        let check = Command::new("tasklist")
-            .arg("/FI").arg("IMAGENAME eq ollama.exe")
-            .output();
-        #[cfg(not(target_os = "windows"))]
-        let check = Command::new("pgrep").arg("ollama").output();
-
-        if let Ok(output) = check {
-            let already = if cfg!(target_os = "windows") {
-                String::from_utf8_lossy(&output.stdout).contains("ollama.exe")
-            } else {
-                !output.stdout.is_empty()
-            };
+        if let Ok(client) = Client::builder().timeout(Duration::from_secs(2)).build() {
+          let already = client.get(format!("{OLLAMA_BASE}/api/version")).send().is_ok_and(|response|response.status().is_success());
             if !already {
               let ollama_bin = resolve_ollama_executable();
-              let _ = Command::new(ollama_bin)
+              let _ = background_command(ollama_bin)
                     .arg("serve")
+                  .env("OLLAMA_HOST", "127.0.0.1:11434")
+                  .env("OLLAMA_NUM_PARALLEL", "1")
+                  .env("OLLAMA_MAX_LOADED_MODELS", "1")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -6163,13 +8911,13 @@ fn normalize_messages(msgs: &[ChatMessage]) -> (Vec<ChatMessage>, bool) {
   for m in msgs.iter() {
     let role_l = m.role.to_lowercase();
     if is_standard_role(&role_l) {
-      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: role_l, text: m.text.clone(), time: now_ts(), thinking_log: None });
     } else if let Some((u, a)) = split_legacy_block(&m.text) {
-      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts() }); }
-      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts() }); }
+      if !u.is_empty() { out.push(ChatMessage { role: "user".into(), text: u, time: now_ts(), thinking_log: None }); }
+      if !a.is_empty() { out.push(ChatMessage { role: "llm".into(), text: a, time: now_ts(), thinking_log: None }); }
       changed = true;
     } else {
-      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts() });
+      out.push(ChatMessage { role: "llm".into(), text: m.text.clone(), time: now_ts(), thinking_log: None });
       if role_l != "llm" { changed = true; }
     }
   }
@@ -6243,8 +8991,8 @@ pub fn debug_memory_dir(app: tauri::AppHandle) -> String {
 }
 
 // APPEND: new iris_* helpers, debug_list_open_tab_files, and seed_open_tabs_from_dev_dir
-use std::fs::{read, write, read_dir, create_dir_all, remove_file, copy};
-use serde_json::{from_slice, to_vec_pretty};
+use std::fs::{read, read_dir, create_dir_all, remove_file, copy};
+use serde_json::from_slice;
 
 fn iris_open_tabs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   let mut p = memory_dir(app)?;
@@ -6402,8 +9150,8 @@ fn iris_read_snapshot_file(path: &std::path::Path) -> Result<Snapshot, String> {
 }
 
 fn iris_write_snapshot_file(path: &std::path::Path, snap: &Snapshot) -> Result<(), String> {
-  let bytes = to_vec_pretty(snap).map_err(|e| e.to_string())?;
-  let result = write(path, bytes).map_err(|e| e.to_string());
+  let json = serde_json::to_string_pretty(snap).map_err(|e| e.to_string())?;
+  let result = atomic_write_json(&path.to_path_buf(), &json);
   if result.is_ok() {
     eprintln!("[iris_write_snapshot_file] Successfully wrote {} bytes to: {}", snap.messages.len(), path.display());
   }
@@ -6461,6 +9209,9 @@ const MODEL_FILES: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy)]
 enum ModelProfile {
+  MacBalanced,
+  MacLarge13B,
+  MacQuality14B,
   Ultra,
   High,
   MediumHigh,
@@ -6472,6 +9223,9 @@ enum ModelProfile {
 impl ModelProfile {
   fn as_str(&self) -> &'static str {
     match self {
+      Self::MacBalanced => "MacBalanced",
+      Self::MacLarge13B => "MacLarge13B",
+      Self::MacQuality14B => "MacQuality14B",
       Self::Ultra => "Ultra",
       Self::High => "High",
       Self::MediumHigh => "MediumHigh",
@@ -6483,6 +9237,9 @@ impl ModelProfile {
 
   fn parse(s: &str) -> Self {
     match s.trim().to_ascii_lowercase().as_str() {
+      "macbalanced" | "mac-7b" => Self::MacBalanced,
+      "maclarge13b" | "mac-13b" => Self::MacLarge13B,
+      "macquality14b" | "mac-14b" => Self::MacQuality14B,
       "ultra" => Self::Ultra,
       "high" => Self::High,
       "mediumhigh" | "medium-high" | "medium_high" => Self::MediumHigh,
@@ -6495,6 +9252,14 @@ impl ModelProfile {
 
 fn default_base_model_for(custom_name: &str, profile: ModelProfile) -> &'static str {
   match (custom_name, profile) {
+    ("iris-organizer:latest", ModelProfile::MacBalanced) => "qwen2.5:7b-instruct-q4_K_M",
+    ("iris-coder:latest", ModelProfile::MacBalanced) => "qwen2.5-coder:7b-instruct-q4_K_M",
+    ("iris-organizer:latest", ModelProfile::MacLarge13B) => "llama2:13b-chat-q4_K_M",
+    ("iris-coder:latest", ModelProfile::MacLarge13B) => "codellama:13b-instruct-q4_K_M",
+    ("iris-organizer:latest", ModelProfile::MacQuality14B) => "qwen2.5:14b-instruct-q4_K_M",
+    ("iris-coder:latest", ModelProfile::MacQuality14B) => "qwen2.5-coder:14b-instruct-q4_K_M",
+    ("iris-summarizer:latest", ModelProfile::MacBalanced | ModelProfile::MacLarge13B | ModelProfile::MacQuality14B) => "qwen2.5:1.5b-instruct-q4_K_M",
+    ("iris-vision:latest", ModelProfile::MacBalanced | ModelProfile::MacLarge13B | ModelProfile::MacQuality14B) => "llava:7b",
     ("iris-organizer:latest", ModelProfile::Ultra) => "qwen2.5:14b-instruct",
     ("iris-organizer:latest", ModelProfile::High) => "qwen2.5:7b-instruct",
     ("iris-organizer:latest", ModelProfile::MediumHigh) => "qwen2.5:7b-instruct",
@@ -6588,17 +9353,36 @@ fn pull_candidates(base: &str) -> Vec<String> {
 }
 
 fn locate_modelfiles_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
+  if let Some(app) = app {
+    let directory = app.path().app_data_dir().map_err(|err|err.to_string())?.join("model_files");
+    fs::create_dir_all(&directory).map_err(|err|err.to_string())?;
+    let profile = ModelProfile::parse(&read_setup_flags(app).model_profile);
+    for (name,filename) in MODEL_FILES {
+      let target = directory.join(filename);
+      if !target.exists() {
+        let bundled = app.path().resource_dir().ok().map(|resource|resource.join("model_files").join(filename));
+        let local = std::env::current_dir().ok().and_then(|cwd| [cwd.join("model_files").join(filename),cwd.join("..").join("model_files").join(filename)].into_iter().find(|path|path.is_file()));
+        let source = local.or(bundled.filter(|path|path.is_file()));
+        if cfg!(target_os = "macos") || source.is_none() {
+          fs::write(&target,build_modelfile(name,default_base_model_for(name,profile),profile)).map_err(|err|err.to_string())?;
+        } else if let Some(source) = source {
+          fs::copy(source,&target).map_err(|err|err.to_string())?;
+        }
+      }
+    }
+    return Ok(directory);
+  }
   let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
   let mut candidates: Vec<PathBuf> = vec![
     cwd.join("model_files"),
-    cwd.join("..\\model_files"),
-    cwd.join("..\\..\\model_files"),
+    cwd.join("..").join("model_files"),
+    cwd.join("..").join("..").join("model_files"),
   ];
 
   if let Ok(exe) = std::env::current_exe() {
     if let Some(exe_dir) = exe.parent() {
       candidates.push(exe_dir.join("model_files"));
-      candidates.push(exe_dir.join("..\\..\\..\\model_files"));
+      candidates.push(exe_dir.join("..").join("..").join("..").join("model_files"));
     }
   }
 
@@ -6651,7 +9435,7 @@ fn make_temp_modelfile_with_from(src: &std::path::Path, from_model: &str) -> Res
 
 #[tauri::command]
 pub fn check_ollama_installed() -> bool {
-  let via_path = Command::new(resolve_ollama_executable())
+  let via_path = background_command(resolve_ollama_executable())
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -6663,6 +9447,13 @@ pub fn check_ollama_installed() -> bool {
 
 #[tauri::command]
 pub async fn download_and_install_ollama(app: tauri::AppHandle) -> Result<(), String> {
+  if cfg!(target_os = "macos") {
+    Command::new("/usr/bin/open").arg("https://ollama.com/download/mac").spawn().map_err(|err|err.to_string())?;
+    return Ok(());
+  }
+  if !cfg!(target_os = "windows") {
+    return Err("Install Ollama using the official instructions for your operating system at https://ollama.com/download".into());
+  }
   let client = reqwest::Client::builder()
     .timeout(Duration::from_secs(600))
     .build()
@@ -6740,6 +9531,10 @@ pub struct ApplyModelProfileResult {
 
 fn profile_params(profile: ModelProfile, role: &str) -> (usize, usize, usize, f32, f32, usize, f32, usize) {
   match (profile, role) {
+    (ModelProfile::MacBalanced, "organizer" | "coder") => (8192, 32, 2048, 0.18, 0.9, 40, 1.05, 128),
+    (ModelProfile::MacLarge13B | ModelProfile::MacQuality14B, "organizer" | "coder") => (4096, 32, 1024, 0.15, 0.9, 40, 1.05, 128),
+    (ModelProfile::MacBalanced | ModelProfile::MacLarge13B | ModelProfile::MacQuality14B, "summarizer") => (2048, 16, 384, 0.1, 0.9, 40, 1.05, 128),
+    (ModelProfile::MacBalanced | ModelProfile::MacLarge13B | ModelProfile::MacQuality14B, "vision") => (4096, 32, 768, 0.15, 0.9, 40, 1.05, 128),
     (ModelProfile::Ultra, "organizer") => (16384, 64, 1536, 0.22, 0.92, 48, 1.06, 192),
     (ModelProfile::Ultra, "coder") => (12288, 64, 1200, 0.18, 0.90, 48, 1.06, 192),
     (ModelProfile::Ultra, "summarizer") => (4096, 32, 240, 0.08, 0.60, 24, 1.10, 128),
@@ -6851,7 +9646,7 @@ pub struct HardwareProfile {
 /// Returns (gb, gpu_name, note).
 fn probe_vram() -> (f64, String, String) {
   // Attempt 1: nvidia-smi
-  if let Ok(out) = Command::new("nvidia-smi")
+  if let Ok(out) = background_command("nvidia-smi")
     .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
     .output()
   {
@@ -6873,7 +9668,7 @@ fn probe_vram() -> (f64, String, String) {
   // Attempt 2: PowerShell Win32_VideoController (Windows only)
   #[cfg(target_os = "windows")]
   {
-    if let Ok(out) = Command::new("powershell")
+    if let Ok(out) = background_command("powershell")
       .args(["-NoProfile", "-Command",
         "Get-CimInstance Win32_VideoController | Select-Object -First 1 Name,AdapterRAM | ConvertTo-Json -Compress"])
       .output()
@@ -6904,6 +9699,14 @@ pub fn detect_hardware_profile() -> Result<HardwareProfile, String> {
   let ram_bytes = sys.total_memory(); // bytes
   let ram_gb = ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
   let cpu_cores = sys.cpus().len();
+
+  if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    return Ok(HardwareProfile {
+      vram_gb: 0.0, ram_gb, cpu_cores, gpu_name: "Apple Silicon (Metal, unified memory)".into(),
+      detected_profile: if ram_gb>=15.0 {"MacBalanced"}else{"Low"}.into(),
+      detection_note: format!("{ram_gb:.1} GB unified memory shared with macOS. Use 7B Q4 by default; 13B/14B Q4 needs a 4K context, one resident model and room for other apps."),
+    });
+  }
 
   let (vram_gb, gpu_name, probe_source) = probe_vram();
   let (detected_profile, detection_note) = if vram_gb == 0.0 {
@@ -7817,6 +10620,10 @@ pub struct WindowInfo {
 
 #[tauri::command]
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+  if cfg!(target_os = "macos") {
+    return serde_json::from_value(crate::platform_macos::windows()?).map_err(|err|err.to_string());
+  }
+  if !cfg!(target_os = "windows") {return Err("Window inspection is not implemented for this platform".into());}
   let script = "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object Id,ProcessName,MainWindowTitle | ConvertTo-Json -Compress";
   let output = Command::new("powershell")
     .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -7868,6 +10675,8 @@ pub fn get_system_stats() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub fn take_screenshot() -> Result<String, String> {
+  if cfg!(target_os = "macos") {return crate::platform_macos::screenshot(None);}
+  if !cfg!(target_os = "windows") {return Err("Screen capture is not implemented for this platform".into());}
   let script = r#"
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 try {
@@ -7899,6 +10708,8 @@ try {
 
 #[tauri::command]
 pub fn take_window_screenshot(window_id: u32) -> Result<String, String> {
+  if cfg!(target_os = "macos") {return crate::platform_macos::screenshot(Some(window_id));}
+  if !cfg!(target_os = "windows") {return Err("Window capture is not implemented for this platform".into());}
   let script = format!(r#"
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 Add-Type @"
@@ -7977,6 +10788,8 @@ fn resolve_desktop_launch_target(target: &str) -> String {
 
 #[tauri::command]
 pub fn launch_desktop_item(target: String, args: Option<Vec<String>>) -> Result<String, String> {
+  if cfg!(target_os = "macos") {return crate::platform_macos::launch(&target,&args.unwrap_or_default());}
+  if !cfg!(target_os = "windows") {return Err("Desktop launch is not implemented for this platform".into());}
   let trimmed = target.trim();
   if trimmed.is_empty() {
     return Err("Desktop launch target is required".to_string());
@@ -8033,6 +10846,9 @@ pub struct GpuInfo {
 
 #[tauri::command]
 pub fn check_gpu_available() -> Result<GpuInfo, String> {
+  if cfg!(all(target_os = "macos",target_arch = "aarch64")) {
+    return Ok(GpuInfo {available:true,name:Some("Apple Silicon Metal".into())});
+  }
   // Try nvidia-smi first
   let nvidia = std::process::Command::new("nvidia-smi")
     .args(["--query-gpu=name", "--format=csv,noheader"])
@@ -8062,6 +10878,8 @@ pub fn check_gpu_available() -> Result<GpuInfo, String> {
 
 #[tauri::command]
 pub fn focus_window_by_title(query: String) -> Result<String, String> {
+  if cfg!(target_os = "macos") {return crate::platform_macos::focus(&query);}
+  if !cfg!(target_os = "windows") {return Err("Window focus is not implemented for this platform".into());}
   let trimmed = query.trim();
   if trimmed.is_empty() {
     return Err("Window title or process name is required".to_string());
@@ -8128,7 +10946,7 @@ pub fn launch_mcp_server(mcp_id: Option<String>, command: String, args: Vec<Stri
     }
   }
   let resolved = resolve_executable(&command).ok_or_else(|| "Missing command".to_string())?;
-  let child = Command::new(&resolved)
+  let child = background_command(&resolved)
     .args(&args)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -8250,23 +11068,30 @@ fn mcp_list_tools_inner(
     ctype = "stdio".to_string();
   }
 
+  let mut cursor: Option<String> = None;
+  let mut seen_cursors = HashSet::new();
+  let mut tools_arr = Vec::new();
+  loop {
+  let params = cursor.as_ref().map(|cursor| serde_json::json!({"cursor":cursor})).unwrap_or_else(|| serde_json::json!({}));
   let raw_tools = if ctype == "url" {
-    let target_url = command.or(parsed_cmd).unwrap_or_else(|| target.trim().to_string());
-    mcp_http_request(&target_url, "tools/list", serde_json::json!({}))?
+    let target_url = command.clone().or(parsed_cmd.clone()).unwrap_or_else(|| target.trim().to_string());
+    mcp_http_request(&target_url, "tools/list", params)?
   } else {
-    let cmd = command.or(parsed_cmd).ok_or_else(|| "MCP command is required for stdio connections".to_string())?;
-    let argv = args.unwrap_or(parsed_args);
+    let cmd = command.clone().or(parsed_cmd.clone()).ok_or_else(|| "MCP command is required for stdio connections".to_string())?;
+    let argv = args.clone().unwrap_or_else(|| parsed_args.clone());
     let _ = ensure_stdio_initialized(&mcp_id, &cmd, &argv)?;
     let mut sessions = mcp_sessions().lock().map_err(|_| "MCP session lock poisoned".to_string())?;
     let session = sessions.get_mut(&mcp_id).ok_or_else(|| "MCP session missing".to_string())?;
-    mcp_stdio_request(session, "tools/list", serde_json::json!({}))?
+    mcp_stdio_request(session, "tools/list", params)?
   };
-
-  let tools_arr = raw_tools
-    .get("tools")
-    .and_then(|v| v.as_array())
-    .cloned()
-    .unwrap_or_default();
+  let page = raw_tools.get("tools").and_then(Value::as_array).ok_or("MCP tools/list returned no tools array")?;
+  tools_arr.extend(page.iter().cloned());
+  cursor = raw_tools.get("nextCursor").and_then(Value::as_str).filter(|cursor| !cursor.is_empty()).map(str::to_string);
+  let Some(next) = cursor.as_ref() else { break; };
+  if !seen_cursors.insert(next.clone()) || seen_cursors.len() >= 64 {
+    return Err("MCP tool discovery returned a repeated cursor or exceeded 64 pages; inventory is incomplete".into());
+  }
+  }
 
   let tools = tools_arr
     .into_iter()
@@ -8282,6 +11107,7 @@ fn mcp_list_tools_inner(
         .cloned()
         .or_else(|| t.get("input_schema").cloned())
         .unwrap_or(Value::Null),
+      annotations: t.get("annotations").cloned().unwrap_or(Value::Null),
     })
     .filter(|t| !t.name.is_empty())
     .collect();
@@ -8354,6 +11180,18 @@ pub fn mcp_call_tool(
 #[tauri::command]
 pub fn set_setup_flags(app: tauri::AppHandle, args: SetupFlagsArgs) -> Result<SetupFlags, String> {
   let mut flags = read_setup_flags(&app);
+  if let Some(mode)=args.permission_mode {
+    if !matches!(mode.as_str(),"balanced"|"always_ask"|"testing") {return Err("Invalid permission mode".into());}
+    flags.permission_mode=mode;
+  }
+  if let Some(value)=args.always_allow_low_risk {flags.always_allow_low_risk=value;}
+  if let Some(value)=args.allow_iteration_without_prompt {flags.allow_iteration_without_prompt=value;}
+  if let Some(value)=args.testing_confidence_threshold {flags.testing_confidence_threshold=value.clamp(0.0,100.0);}
+  if let Some(value)=args.agent_proficiencies_json {
+    let parsed:Value=serde_json::from_str(&value).map_err(|error|error.to_string())?;
+    if !parsed.is_array() {return Err("Proficiencies must be a JSON array".into());}
+    flags.agent_proficiencies_json=parsed.to_string();
+  }
   if let Some(v) = args.ollama_verified {
     flags.ollama_verified = v;
   }
