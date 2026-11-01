@@ -280,7 +280,16 @@ pub(super) async fn execute(
                 match mcp_list_tools(item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone()).await {
                     Ok(catalog) => {
                         any_reachable = true;
-                        let tools = catalog.iter().take(40).map(|entry|serde_json::json!({"tool_name":entry.name,"description":excerpt(&entry.description,140)})).collect::<Vec<_>>();
+                        // Include each tool's required-argument names and a compact arg-type hint so
+                        // the model can form a valid call_project_tool for ANY subtask (not just reads)
+                        // without a separate schema round-trip it tends to malform.
+                        let tools = catalog.iter().take(40).map(|entry| {
+                            let required = entry.input_schema.get("required").and_then(Value::as_array).cloned().unwrap_or_default();
+                            let args_hint = entry.input_schema.get("properties").and_then(Value::as_object)
+                                .map(|props| props.iter().map(|(key, value)| format!("{}:{}", key, value.get("type").and_then(Value::as_str).unwrap_or("any"))).collect::<Vec<_>>().join(", "))
+                                .unwrap_or_default();
+                            serde_json::json!({"tool_name":entry.name,"description":excerpt(&entry.description,140),"requiredArgs":required,"args":excerpt(&args_hint,220)})
+                        }).collect::<Vec<_>>();
                         let mut entry = serde_json::json!({"id":item.id,"name":item.name,"status":"connected","toolCount":catalog.len(),"tools":tools});
                         // Auto-run the single most relevant no-argument read tool so the model gets
                         // the real project data up front instead of having to orchestrate the call.
@@ -305,7 +314,7 @@ pub(super) async fn execute(
             let guidance = if auto_inspected {
                 "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from that inspection result; do not call another tool to re-read the same thing. Never invent scene, node, or file names beyond what the inspection shows."
             } else if any_reachable {
-                "Each connected mcps entry already lists its tools. To read data (scene list, current scene, node names), call call_project_tool NOW with connection_id set to that EXACT id, tool_name set to one of its listed tool_name values, arguments set to the tool's inputs (often {}), and effect:\"read\". You do NOT need list_project_tools. Report ONLY what the call returns; never invent scene, node, or file names."
+                "Each connected mcps entry lists its tools, and each tool shows its requiredArgs and arg types. For the current subtask, choose the single most relevant tool and call call_project_tool with connection_id set to the bridge id (or omit connection_id when only one bridge is linked), tool_name set to that tool, arguments built from its requiredArgs/args (use {} when it needs none), and effect:\"read\" to inspect or \"write\" to change the project. You do NOT need list_project_tools; everything needed is here. Work one tool call at a time, read back the result, then pick the next tool. Report ONLY what calls return; never invent scene, node, or file names."
             } else if can_bridge {
                 "The linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user the bridge is unreachable and quote the error; for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and that the launch command (e.g. uv) is installed. Do NOT invent scene, node, or file names."
             } else if can_files {
