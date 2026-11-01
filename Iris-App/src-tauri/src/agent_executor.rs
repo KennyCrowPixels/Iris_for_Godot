@@ -780,6 +780,7 @@ pub(super) async fn run(
     let mut research_next = None;
     let lessons = research_method_notes(app);
     let mut repeated_calls: HashMap<String, usize> = HashMap::new();
+    let mut schema_failures: HashMap<String, usize> = HashMap::new();
     task.reasoning_log.clear();
     record_reasoning(window,event_name,&mut task,if resume_task {"Resuming the saved objective and evidence; unfinished acceptance criteria remain enforced."} else {"Assessing the current request independently of earlier unfinished work."});
     save_task(app, &task)?;
@@ -794,6 +795,9 @@ pub(super) async fn run(
                 need.route.as_str()
             } {
                 "web" if tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search")) => {
+                    // A web-research turn uses only web/utility tools; dropping the project and bridge
+                    // tools stops a weak model from thrashing on call_project_tool during research.
+                    tools.retain(|tool| !matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("project_connections")|Some("list_project_tools")|Some("call_project_tool")|Some("project_files")|Some("ssh_action")|Some("clone_repository")));
                     research.set_subject(&need.input);
                     research_next=need.lookup.filter(|action|matches!(action,AgentAction::Tool{tool,..} if agent_research::handles(tool)));
                     if research_next.is_none() {repair_schema=Some(network_action_schema(&tools));}
@@ -809,7 +813,7 @@ pub(super) async fn run(
                     // A project-inspection turn must use the project's OWN tools, not the web. Dropping
                     // the web tools stops a confused small model from web-searching "what is an MCP bridge".
                     tools.retain(|tool| !matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("universal_web_search") | Some("read_web_page")));
-                    feedback="Inspect the linked project with its OWN tools. project_connections (being called now) lists each connected bridge and the tools it offers; then call call_project_tool with that exact connection_id and one listed tool_name to read scenes/nodes. The MCP bridge and these project tools are your built-in way to see this project; never web-search to learn what an 'MCP bridge' is or whether it is enabled.".into();
+                    feedback="Inspect the linked project with its OWN tools. project_connections (being called now) reports what is connected and in what priority: prefer direct file access with project_files (list or read the real .tscn scene files and .gd scripts) whenever a project folder is available; use call_project_tool on an MCP bridge only for live-editor state a file read cannot give. Follow the guidance it returns, report only what the tools actually return, never invent names, and never web-search to learn what an 'MCP bridge' is.".into();
                     research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})});
                 }
                 "act" => {
@@ -1104,7 +1108,18 @@ pub(super) async fn run(
                                 let _ = window.emit(event_name, IrisEvent::ToolResult { tool_name: tool.clone(), status: if result.ok { "ok" } else { "error" }.into() });
                                 Ok(format!("Evidence #{evidence}; success={}. {}", result.ok, tool_feedback(&tool, &result.value, budget.observation_chars)))
                             }
-                            Err(err) => Err(err),
+                            Err(err) => {
+                                // After a tool's arguments fail validation twice in a task, disable it so a
+                                // weak model cannot keep re-issuing the same malformed call for minutes.
+                                if err.contains("failed schema validation") {
+                                    let fails = schema_failures.entry(tool.clone()).or_insert(0);
+                                    *fails += 1;
+                                    if *fails >= 2 {
+                                        tools.retain(|schema| schema.pointer("/function/name").and_then(Value::as_str) != Some(tool.as_str()));
+                                        Err(format!("'{tool}' has failed argument validation twice and is now disabled for this task. Do NOT call it again. Use a different enabled tool, or answer the user with what you already have."))
+                                    } else { Err(err) }
+                                } else { Err(err) }
+                            }
                         }
                     }
                 }

@@ -311,19 +311,28 @@ pub(super) async fn execute(
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
             let auto_inspected = mcps.iter().any(|item| item.get("inspection").is_some());
-            let guidance = if auto_inspected {
-                "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from that inspection result; do not call another tool to re-read the same thing. Never invent scene, node, or file names beyond what the inspection shows."
+            let bridge_status = if !can_bridge { "no MCP bridge is linked" } else if any_reachable { "an MCP bridge is connected" } else { "an MCP bridge is linked but did not respond" };
+            let folder_status = if can_files { "a project folder is connected for direct file access" } else { "no project folder is set for direct file access" };
+            // Direct file access is the most reliable path for a small model, so prefer it; MCP
+            // bridges are secondary and only needed for live-editor state a file read cannot give.
+            let guidance = if can_files {
+                format!("Prefer direct file access ({folder_status}). Use project_files with action \"list\" or \"search\" to read the project's REAL files — scenes are .tscn files, scripts are .gd files, usually under res://. This is the reliable way to answer file, scene, folder and script questions: report only the filenames and contents it returns and never invent names. To change files use project_files action \"write\" or \"replace\" (approval required). Separately, {bridge_status}: use call_project_tool ONLY for live-editor state that a file read cannot give (the currently open scene, running errors, a live editor screenshot).")
+            } else if auto_inspected {
+                "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from it; do not re-read the same thing. No project folder is set, so you cannot list files directly — tell the user they can set a 'Project folder (direct file access)' in Settings > Projects for reliable file and scene listings. Never invent scene, node, or file names beyond what the inspection shows.".to_string()
             } else if any_reachable {
-                "Each connected mcps entry lists its tools, and each tool shows its requiredArgs and arg types. For the current subtask, choose the single most relevant tool and call call_project_tool with connection_id set to the bridge id (or omit connection_id when only one bridge is linked), tool_name set to that tool, arguments built from its requiredArgs/args (use {} when it needs none), and effect:\"read\" to inspect or \"write\" to change the project. You do NOT need list_project_tools; everything needed is here. Work one tool call at a time, read back the result, then pick the next tool. Report ONLY what calls return; never invent scene, node, or file names."
+                "No project folder is set for direct file access, but an MCP bridge is connected. Each mcps entry lists its tools with requiredArgs and arg types; choose the single most relevant tool and call call_project_tool with connection_id (or omit it when only one bridge is linked), tool_name, arguments built from requiredArgs (use {} when none), and effect \"read\" or \"write\". Work one call at a time and report ONLY what it returns. For more reliable file and scene listings, tell the user they can set a 'Project folder (direct file access)' in Settings > Projects. Never invent names.".to_string()
             } else if can_bridge {
-                "The linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user the bridge is unreachable and quote the error; for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and that the launch command (e.g. uv) is installed. Do NOT invent scene, node, or file names."
-            } else if can_files {
-                "No MCP bridge is linked, but a repository/project root is available: use project_files to inspect files. Report only what it returns; do not invent names."
+                "Nothing is reachable: no project folder is set for direct file access, and the linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user plainly what is not hooked up — either set a 'Project folder (direct file access)' in Settings > Projects for reliable file access, or fix the bridge (for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and the launch command installed). Do NOT invent scene, node, or file names.".to_string()
             } else {
-                "This project has no enabled, linked MCP bridge or repository. You cannot inspect its scenes, nodes, or files. Tell the user to enable and link an MCP bridge or repository in Settings > Projects, and do not invent any scene, node, or file names."
+                "This project has nothing connected: no project folder for direct file access and no linked MCP bridge or repository. You cannot inspect its scenes, nodes, or files. Tell the user to set a 'Project folder (direct file access)' in Settings > Projects (most reliable), or link an MCP bridge or repository, and do not invent any names.".to_string()
             };
+            let not_hooked_up: Vec<String> = [
+                (!can_files).then(|| "project folder for direct file access".to_string()),
+                (!can_bridge).then(|| "MCP bridge".to_string()),
+            ].into_iter().flatten().collect();
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
                 "mcps":mcps,"sshs":sshs,"repositories":repositories,
+                "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":["project folder (direct file access)","MCP bridge"],"notHookedUp":not_hooked_up},
                 "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
         }
         "list_project_tools" | "call_project_tool" => {
