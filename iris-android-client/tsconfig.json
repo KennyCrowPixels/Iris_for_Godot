@@ -1,6 +1,12 @@
 {
-  "extends": "expo/tsconfig.base",
+  "//": "Mirrors expo/tsconfig.base so typechecking works before `npm install`; Expo build/prebuild is unaffected.",
   "compilerOptions": {
+    "allowJs": true,
+    "target": "ESNext",
+    "module": "ESNext",
+    "lib": ["DOM", "ESNext"],
+    "noEmit": true,
+    "resolveJsonModule": true,
     "strict": true,
     "jsx": "react-jsx",
     "moduleResolution": "bundler",

@@ -691,7 +691,10 @@ fn record_reasoning(window: &tauri::Window, event_name: &str, task: &mut AgentTa
 pub(super) fn message_reasoning_log(app: &tauri::AppHandle, tab_id: u32, reply: &str) -> Option<Value> {
     let task=load_task(app,tab_id).ok().flatten().filter(|task|task.last_message==reply)?;
     if task.reasoning_log.is_empty() {return None;}
-    Some(json!({"capturedAt":now_ts(),"prompt":task.goal,"responseModel":task.model,
+    let first_ts=task.reasoning_log.first().and_then(|entry|entry["ts"].as_i64());
+    let last_ts=task.reasoning_log.last().and_then(|entry|entry["ts"].as_i64());
+    let elapsed_ms=match (first_ts,last_ts){(Some(start),Some(end)) if end>=start=>end-start,_=>0};
+    Some(json!({"capturedAt":now_ts(),"prompt":task.goal,"responseModel":task.model,"elapsedMs":elapsed_ms,
         "plannerPath":"local-agent","plannerIntent":"semantic request assessment","plannerStrategy":"Evidence-guided execution",
         "routeSummary":task.reasoning_log.iter().filter_map(|entry|entry["text"].as_str()).find(|text|text.starts_with("Request assessment:")).unwrap_or("Direct conversation or saved task"),
         "selectedProfile":"","profileReason":"","plannerPhase":"","plannerResumeHint":if task.status==TaskStatus::Completed {""} else {"Saved task can be resumed"},

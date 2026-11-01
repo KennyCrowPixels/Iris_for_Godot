@@ -76,6 +76,7 @@ type IrisMessageThinkingLog = {
   checkpointCount: number;
   suggestedGodotVersion: string;
   runtimePhase: string;
+  elapsedMs?: number;
   workLog: WorkLogEntry[];
   actionTrace: IrisActionTrace[];
 };
@@ -652,6 +653,17 @@ function formatRuntimePhaseLabel(phase: CognitiveRuntimePhase): string {
   const raw = String(phase || "").replace(/_/g, " ").trim();
   if (!raw) return "idle";
   return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+// Human-readable "time to answer" for a reasoning log; empty when unknown.
+function formatThinkingDuration(ms?: number): string {
+  if (!ms || !Number.isFinite(ms) || ms <= 0) return "";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSeconds = ms / 1000;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
 function normalizeMessages(raw: any[] | undefined): Message[] {
@@ -3047,6 +3059,14 @@ function App() {
   const speakReplyOnDoneRef = useRef<Record<number, boolean>>({});
   const sttSupported = isSpeechRecognitionSupported();
   const ttsSupported = isSpeechSynthesisSupported();
+  // The desktop webview can't reach the browser speech service, so voice dictation only works in the
+  // web build (used for testing). Detect the Tauri desktop app to hide the non-functional mic there.
+  const [isDesktopApp, setIsDesktopApp] = useState<boolean>(() => typeof window !== "undefined" && !!(window as any).__TAURI__?.invoke);
+  useEffect(() => {
+    let cancelled = false;
+    void waitForTauri().then(() => { if (!cancelled) setIsDesktopApp(!!(window as any).__TAURI__?.invoke); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -5676,10 +5696,12 @@ function App() {
     const workLog = (workLogByTabRef.current[args.tabId] || []).slice(args.workLogStartIndex);
     const actionTrace = (actionTraceByTabRef.current[args.tabId] || []).slice(args.actionTraceStartIndex);
     const runtimeState = activeRuntimeStateForTab(args.tabId);
+    const elapsedMs = workLog.length >= 2 ? Math.max(0, workLog[workLog.length - 1].ts - workLog[0].ts) : 0;
     return {
       capturedAt: Math.floor(Date.now() / 1000),
       prompt: args.prompt,
       responseModel: args.responseModel,
+      elapsedMs,
       plannerPath: args.plannerPath,
       plannerIntent: args.plannerIntent,
       plannerStrategy: args.plannerStrategy,
@@ -5723,7 +5745,7 @@ function App() {
         `=== ${assistantLabel} reasoning log / response #${responseIndex} — ${formatMessageTimestamp(msg.time) || "(no timestamp)"} ===`,
         `Planner: ${log.plannerPath || "(n/a)"} | ${log.plannerIntent || "(n/a)"} | ${log.plannerStrategy || "(n/a)"}`,
         `Route: ${log.routeSummary || "(n/a)"}`,
-        `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}`,
+        `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}${formatThinkingDuration(log.elapsedMs) ? ` | answered in ${formatThinkingDuration(log.elapsedMs)}` : ""}`,
         "",
         "Reasoning summaries:",
         log.workLog?.length ? log.workLog.map((e) => `${new Date(e.ts).toLocaleTimeString()} | ${e.text}`).join("\n") : "(empty)",
@@ -10802,9 +10824,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               onClick={e => e.stopPropagation()}
               onMouseLeave={() => { setOpenMenu(null); setOpenSubmenu(null); }}
             >
-              <div className="dropdown-item" onClick={handleSettings}>Settings</div>
-              <div className="dropdown-item" onClick={handleToolsCenter}>Tools Center</div>
-              <div className="dropdown-item" onClick={() => { handleAgentStats(); setOpenMenu(null); }}>Agent Stats</div>
+              <div className="dropdown-item" onClick={handleSettings} title="Open Iris settings: models, projects, bridges, appearance, and voice">Settings</div>
+              <div className="dropdown-item" onClick={handleToolsCenter} title="Browse and manage available tools, bridges, and integrations">Tools Center</div>
+              <div className="dropdown-item" onClick={() => { handleAgentStats(); setOpenMenu(null); }} title="View agent activity metrics and per-turn runtime stats">Agent Stats</div>
               <div className="dropdown-item" onClick={() => { void copyChatActivityLogs(); setOpenMenu(null); }} title="Copy to clipboard all reasoning logs from the open chat log">Copy Reasoning Logs</div>
 
               {ENABLE_DEVELOPER_TOOLS && <div
@@ -10813,6 +10835,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 onMouseLeave={() => setOpenSubmenu(null)}
                 onClick={e => e.stopPropagation()}
                 style={{ position: "relative" }}
+                title="Developer utilities"
               >
                 <span>Development</span><span>▶</span>
                 {openSubmenu === "development" && (
@@ -10829,6 +10852,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                         setOpenSubmenu(null);
                         setOpenMenu(null);
                       }}
+                      title="View agent activity metrics and per-turn runtime stats"
                     >
                       Agent Stats
                     </div>
@@ -10847,6 +10871,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           alert("Failed to open devtools: " + err?.message);
                         }
                       }}
+                      title="Open the webview developer tools console"
                     >
                       Open DevTools
                     </div>
@@ -10866,6 +10891,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   setOpenSubmenu(null);
                   setOpenMenu(null);
                 }}
+                title="Show or hide the panel for scheduled autonomous tasks"
               >
                 <span>{autonomousPanelEnabled ? "✓ " : ""}Autonomous Tasks Panel</span>
               </div>
@@ -10882,6 +10908,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                   setOpenSubmenu(null);
                   setOpenMenu(null);
                 }}
+                title="Toggle the always-on desktop dashboard window"
               >
                 <span>{desktopDashboardEnabled ? "✓ " : ""}Desktop Dashboard</span>
               </div>
@@ -11380,7 +11407,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           `${messageLogViewer.title} — ${messageLogViewer.timestamp}`,
                           `Planner: ${log.plannerPath || "(n/a)"} | ${log.plannerIntent || "(n/a)"} | ${log.plannerStrategy || "(n/a)"}`,
                           `Route: ${log.routeSummary || "(n/a)"}`,
-                          `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}`,
+                          `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}${formatThinkingDuration(log.elapsedMs) ? ` | answered in ${formatThinkingDuration(log.elapsedMs)}` : ""}`,
                           "",
                           "Reasoning summaries:",
                           log.workLog.length ? log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n") : "(empty)",
@@ -11411,7 +11438,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div><strong>Planner:</strong> {messageLogViewer.log.plannerPath || "(n/a)"} | {messageLogViewer.log.plannerIntent || "(n/a)"} | {messageLogViewer.log.plannerStrategy || "(n/a)"}</div>
                 <div><strong>Route:</strong> {messageLogViewer.log.routeSummary || "(n/a)"}</div>
                 <div><strong>Profile:</strong> {messageLogViewer.log.selectedProfile || "(n/a)"}{messageLogViewer.log.profileReason ? ` | ${messageLogViewer.log.profileReason}` : ""}</div>
-                <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}</div>
+                <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}{formatThinkingDuration(messageLogViewer.log.elapsedMs) ? ` | answered in ${formatThinkingDuration(messageLogViewer.log.elapsedMs)}` : ""}</div>
                 <div><strong>Phase hints:</strong> {messageLogViewer.log.plannerPhase || "(n/a)"}{messageLogViewer.log.plannerResumeHint ? ` | ${messageLogViewer.log.plannerResumeHint}` : ""}{messageLogViewer.log.checkpointCount ? ` | checkpoints: ${messageLogViewer.log.checkpointCount}` : ""}</div>
                 <div>
                   <strong>Reasoning summaries</strong>
@@ -14602,7 +14629,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               }
             }}
           />
-          {sttSupported && (
+          {sttSupported && !isDesktopApp && (
             <button
               type="button"
               className={`mic-btn${micListening ? " listening" : ""}`}
