@@ -1219,8 +1219,13 @@ async fn run_tool(
             let hint=args.get("target_hint").and_then(Value::as_str).map(str::to_string);
             let capture=tokio::task::spawn_blocking(move||capture_screenshot_for_hint(hint.as_deref())).await.map_err(|err|err.to_string())?;
             match capture {
-                Ok((image,status))=>consult_model(app,"vision",&format!("{}\nInspect this capture for: {}",status,excerpt(&task.goal,1500)),&[image],control).await
-                    .unwrap_or_else(|error|serde_json::json!({"error":error})),
+                Ok((image,status))=>{
+                    let kb=image.len()/1400;
+                    let capture_note=format!("{status}. A real screen capture (~{kb} KB of PNG data) was taken just now.");
+                    let prompt=format!("This is a REAL screenshot captured from the user's screen moments ago ({capture_note}). Describe only what is actually visible — the windows, apps, visible text and layout you can literally see. Do not invent, assume, or guess content that is not clearly present; if part is blurry or unreadable, say that plainly. Then note anything relevant to the user's request: {}",excerpt(&task.goal,1200));
+                    let vision=consult_model(app,"vision",&prompt,&[image],control).await.unwrap_or_else(|error|serde_json::json!({"error":error}));
+                    serde_json::json!({"capture":capture_note,"visionReport":vision,"note":"The capture itself is real; visionReport is the local vision model's best-effort reading and may miss or misread details. Report what it actually saw and do not add screen contents it did not mention."})
+                },
                 Err(error)=>serde_json::json!({"error":error}),
             }
         }

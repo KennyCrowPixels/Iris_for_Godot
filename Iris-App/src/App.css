@@ -1866,7 +1866,7 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .autonomous-task-title, .autonomous-task-row label, .autonomous-task-progress, .autonomous-panel-subtitle { color: var(--app-text); }
 .autonomous-task-prompt, .autonomous-task-title-input, .autonomous-task-row select, .autonomous-task-time-wrap input, .autonomous-task-custom { background: var(--app-input-bg); color: var(--app-text); border-color: var(--app-border); }
 .autonomous-resource-badge { background: rgba(var(--app-accent-rgb),0.08); border-color: var(--app-border); color: var(--app-muted); border-radius: 4px; }
-.inline-permission-card { border-radius: 6px; max-height: 40dvh; overflow: auto; border-color: var(--app-accent); }
+.inline-permission-card { border-radius: 6px; border-color: var(--app-accent); flex-shrink: 0; }
 .inline-permission-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-progress-strip { display: flex; align-items: center; gap: 9px; padding: 5px 20px; min-height: 34px; background: transparent; color: var(--app-muted); font-size: 11px; flex-shrink: 0; }
 .agent-status-area { flex-shrink: 0; border-top: 1px solid var(--app-border); background: var(--app-panel-bg); }
