@@ -2705,6 +2705,8 @@ function applyUiScale(scale: number): void {
   try {
     // `zoom` scales every element (text and UI chrome) uniformly in the Chromium webview.
     (document.documentElement.style as any).zoom = String(scale);
+    // Mirror the factor as a variable so viewport-height layout can divide it back out and still fit.
+    document.documentElement.style.setProperty("--ui-scale", String(scale));
     localStorage.setItem("iris.ui.scale", String(scale));
   } catch {}
 }
@@ -3059,14 +3061,6 @@ function App() {
   const speakReplyOnDoneRef = useRef<Record<number, boolean>>({});
   const sttSupported = isSpeechRecognitionSupported();
   const ttsSupported = isSpeechSynthesisSupported();
-  // The desktop webview can't reach the browser speech service, so voice dictation only works in the
-  // web build (used for testing). Detect the Tauri desktop app to hide the non-functional mic there.
-  const [isDesktopApp, setIsDesktopApp] = useState<boolean>(() => typeof window !== "undefined" && !!(window as any).__TAURI__?.invoke);
-  useEffect(() => {
-    let cancelled = false;
-    void waitForTauri().then(() => { if (!cancelled) setIsDesktopApp(!!(window as any).__TAURI__?.invoke); }).catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -14629,7 +14623,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               }
             }}
           />
-          {sttSupported && !isDesktopApp && (
+          {sttSupported && (
             <button
               type="button"
               className={`mic-btn${micListening ? " listening" : ""}`}

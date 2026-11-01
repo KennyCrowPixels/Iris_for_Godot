@@ -20,7 +20,7 @@
           root.setAttribute("data-iris-theme-preset", themePreset);
           root.setAttribute("data-iris-color-mode", colorMode);
           var uiScale = Number(localStorage.getItem("iris.ui.scale"));
-          if (uiScale >= 0.8 && uiScale <= 1.6) { root.style.zoom = String(uiScale); }
+          if (uiScale >= 0.8 && uiScale <= 1.6) { root.style.zoom = String(uiScale); root.style.setProperty("--ui-scale", String(uiScale)); }
           if (document.readyState !== "loading" && document.body) {
             document.body.style.backgroundColor = themeColor;
           } else {
