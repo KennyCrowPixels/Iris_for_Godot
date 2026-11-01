@@ -573,23 +573,25 @@ async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequ
     let messages=vec![
         json!({"role":"system","content":format!("{} Prior research and paused tasks do not make a new stable-knowledge question require research. Do not add freshness or ambiguity that the current question does not need. A request for current measurements, conditions or changing facts must use web, not answer.",agent_research::INTAKE_PROTOCOL)}),
         json!({"role":"user","content":"Introduce yourself and explain what you can help with."}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\"}"}),
         json!({"role":"user","content":"What is the capital of Portugal?"}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\"}"}),
         json!({"role":"user","content":"Write an example movement script. This is a code snippet, not a request to inspect files."}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"normal\"}"}),
         json!({"role":"user","content":"Which version is documented in the repository attached to this chat?"}),
-        json!({"role":"assistant","content":"{\"route\":\"project\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"project\",\"input\":\"\",\"effort\":\"normal\"}"}),
         json!({"role":"user","content":"Tell me about Springfield, but I have not specified which place with that name I mean."}),
-        json!({"role":"assistant","content":"{\"route\":\"clarify\",\"input\":\"Which Springfield do you mean?\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"clarify\",\"input\":\"Which Springfield do you mean?\",\"effort\":\"trivial\"}"}),
         json!({"role":"user","content":"Search online for the current ratings and reviews of Example Quest."}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\",\"effort\":\"normal\"}"}),
         json!({"role":"user","content":"How warm is it in Oslo, Norway right now?"}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\",\"effort\":\"trivial\"}"}),
         json!({"role":"user","content":"Take a screenshot of my screen and tell me what you see."}),
-        json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\",\"effort\":\"normal\"}"}),
+        json!({"role":"user","content":"Write a detailed five-paragraph essay comparing two newer games, with sources."}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"the two named games features reception comparison\",\"effort\":\"deep\"}"}),
         json!({"role":"user","content":"Continue the saved unfinished task from its notes."}),
-        json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\",\"effort\":\"normal\"}"}),
         json!({"role":"system","content":format!("Context for resolving references only, not the current request. Today: {}. Attached project: {}. Saved unfinished objective: {}. Recent conversation:\n{}\nClassify only the user's next message.",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),context)}),
         json!({"role":"user","content":excerpt(question,1600)})
     ];
@@ -631,7 +633,9 @@ async fn deliver_best_effort(
         .collect::<Vec<_>>().join("\n");
     let protocol = "You could not fully finish through tools, but the user is waiting and must get a useful answer now. Using ONLY the gathered evidence below, write your best answer to their request in plain prose. Be specific about what is confirmed versus uncertain or missing; if a bridge or lookup failed, say so and quote the error. Never invent facts, names, scenes, or sources the evidence does not support. No JSON, no tool request.";
     let room = budget.input_char_budget().saturating_sub(protocol.chars().count() + 200);
-    let context = format!("User request: {}\n\nGathered evidence (untrusted; rely only on what it actually supports):\n{}\n\nResearch notebook:\n{}", excerpt(&task.goal, 600), excerpt(&evidence, room / 2), research.notebook(room / 2));
+    let confirmed = research.confirmed_digest(room / 3);
+    let confirmed_block = if confirmed.trim().is_empty() { String::new() } else { format!("\n\nConfirmed findings collected so far (build on these):\n{}", confirmed) };
+    let context = format!("User request: {}{}\n\nGathered evidence (untrusted; rely only on what it actually supports):\n{}\n\nResearch notebook:\n{}", excerpt(&task.goal, 600), confirmed_block, excerpt(&evidence, room / 3), research.notebook(room / 3));
     let messages = vec![json!({"role":"system","content":protocol}), json!({"role":"user","content":excerpt(&context, room)})];
     next_action(client, &task.model, messages, budget, control, None, |_| {}).await.ok()
         .map(|raw| research.cite(&agent_stream::visible_answer(&raw)))
@@ -779,7 +783,10 @@ pub(super) async fn run(
     if !resume_task && (attached.is_some() || tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search"))) {
         let _=window.emit(event_name,IrisEvent::Status("Checking whether this request needs current evidence...".into()));
         match assess_evidence_need(&client,request,&budget,&control,&project_context,previous.as_ref().filter(|task|task.status!=TaskStatus::Completed).map(|task|task.goal.as_str()),&tools).await {
-            Ok(need) => match {
+            Ok(need) => {
+                budget.apply_effort(&need.effort);
+                record_reasoning(window,event_name,&mut task,&format!("Effort assessed: {}.",need.effort));
+                match {
                 record_reasoning(window,event_name,&mut task,&format!("Request assessment: {}. {}",need.route,match need.route.as_str(){"answer"=>"Stable knowledge or conversation; no external lookup required.","web"=>"Fresh evidence is needed; select a directly relevant lookup.","project"=>"Inspect the linked project before making project-specific claims.","act"=>"A local device, app, or bridge action is requested; use the enabled tool or name what to enable.","clarify"=>"The current request needs a clarification.",_=>"Continue from the saved objective."}));
                 need.route.as_str()
             } {
@@ -814,7 +821,7 @@ pub(super) async fn run(
                     }
                 }
                 _ => {},
-            },
+            }},
             Err(error) => {
                 feedback=format!("Evidence assessment unavailable: {}. If this request needs current or uncertain facts, use the enabled web tools before answering. Never substitute training-memory claims.",excerpt(&error,300));
             }
@@ -1330,8 +1337,9 @@ mod tests {
     fn intake_requires_a_valid_lookup_and_pause_messages_hide_the_catalog() {
         let schema=agent_research::intake_schema();
         let validator=jsonschema::validator_for(&schema).unwrap();
-        assert!(validator.is_valid(&json!({"route":"answer","input":""})));
-        assert!(validator.is_valid(&json!({"route":"web","input":"current conditions"})));
+        assert!(validator.is_valid(&json!({"route":"answer","input":"","effort":"trivial"})));
+        assert!(validator.is_valid(&json!({"route":"web","input":"current conditions","effort":"normal"})));
+        assert!(!validator.is_valid(&json!({"route":"answer","input":""})));
         let lookup_schema=network_action_schema(&build_default_tools());
         let lookup_validator=jsonschema::validator_for(&lookup_schema).unwrap();
         assert!(lookup_validator.is_valid(&json!({"action":"tool","tool":"get_current_weather","arguments":{"location":"Durham, NC"}})));

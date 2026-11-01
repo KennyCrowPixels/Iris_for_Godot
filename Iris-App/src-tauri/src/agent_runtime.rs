@@ -53,6 +53,19 @@ impl ModelBudget {
         self.research.max_reviews=self.research.max_reviews.saturating_mul(multiplier).max(12).min(36);
     }
 
+    /// Scale the action/research budget to the request's assessed effort so a trivial question
+    /// resolves fast instead of spinning through a full research loop, while deep work keeps the
+    /// full allowance. Normal leaves the persistence-mode budget unchanged.
+    pub fn apply_effort(&mut self, effort: &str) {
+        if effort == "trivial" {
+            self.max_actions = self.max_actions.min(6);
+            self.research.max_searches = self.research.max_searches.min(2);
+            self.research.max_reads = self.research.max_reads.min(2);
+            self.research.max_reviews = self.research.max_reviews.min(2);
+            self.research.suggested_sources = 1;
+        }
+    }
+
     pub fn for_capacity(memory_gib: u64, model_billions: f64, model_context: usize) -> Self {
         let constrained = memory_gib < 12 || (memory_gib <= 16 && model_billions >= 12.0);
         let context_tokens = if constrained { 4096 } else if memory_gib <= 16 { 8192 } else { 16384 }

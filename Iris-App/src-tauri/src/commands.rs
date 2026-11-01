@@ -167,6 +167,9 @@ pub struct OllamaChatRequest {
   pub read_only: bool,
 }
 
+// Retired pre-agent-executor streaming / tool-call path. Superseded by agent_stream + agent_executor;
+// kept compiled-but-unused for reference pending the MCP bridge rework.
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct OllamaChatStreamMessage {
   #[serde(default)]
@@ -175,6 +178,7 @@ pub struct OllamaChatStreamMessage {
   pub tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct OllamaChatStreamChunk {
   #[serde(default)]
@@ -1157,6 +1161,7 @@ fn record_integrity_metrics(assessment: &IntegrityAssessment, policy: &Recommend
   }
 }
 
+#[allow(dead_code)]
 fn request_warrants_tools(input_text: &str, has_images: bool) -> bool {
   if has_images {
     return true;
@@ -1309,6 +1314,7 @@ fn normalize_ollama_images(images: &[String]) -> Vec<String> {
   images.iter().filter_map(|v| normalize_ollama_image_data(v)).collect()
 }
 
+#[allow(dead_code)]
 fn looks_like_tool_payload_text(text: &str) -> bool {
   let trimmed = text.trim();
   let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
@@ -1339,6 +1345,7 @@ fn is_screenshot_intent_text(input: &str) -> bool {
   ])
 }
 
+#[allow(dead_code)]
 fn drain_ndjson_lines(buffer: &mut String) -> Vec<String> {
   let mut lines = Vec::new();
   while let Some(pos) = buffer.find('\n') {
@@ -1352,6 +1359,7 @@ fn drain_ndjson_lines(buffer: &mut String) -> Vec<String> {
   lines
 }
 
+#[allow(dead_code)]
 async fn execute_ollama_chat_stream_inner(
   app: &tauri::AppHandle,
   tab_id: u32,
@@ -1574,6 +1582,7 @@ async fn execute_ollama_chat_stream(
   result
 }
 
+#[allow(dead_code)]
 fn build_plain_text_retry_request(request: &OllamaChatRequest) -> OllamaChatRequest {
   let mut messages = Vec::with_capacity(request.messages.len() + 1);
   messages.push(OllamaMessage {
@@ -2150,6 +2159,7 @@ fn execute_bridge_project_action(app: &tauri::AppHandle, tab_id: u32, instructio
   }
 }
 
+#[allow(dead_code)]
 fn extract_weather_location_for_fallback(input: &str) -> Option<String> {
   if let Ok(re) = Regex::new(r"(?i)\b(?:in|for|at)\s+([a-z0-9\s,.'\-]+?)(?:\s+now)?\??\s*$") {
     if let Some(cap) = re.captures(input.trim()) {
@@ -2172,6 +2182,7 @@ fn latest_user_message(messages: &[OllamaMessage]) -> Option<&str> {
     .map(|msg| msg.content.as_str())
 }
 
+#[allow(dead_code)]
 fn derive_fallback_tool_call(request: &OllamaChatRequest, model_text: &str) -> Option<OllamaToolCall> {
   let user_text = latest_user_message(&request.messages)?;
   let user_lower = user_text.to_lowercase();
@@ -2327,6 +2338,9 @@ fn godot_watchers() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
   GODOT_WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Retired deterministic Godot / MCP bridge handoff path (pre-agent-executor). The agent executor now
+// drives bridge inspection; retained for reference while the MCP bridge rework is pending.
+#[allow(dead_code)]
 fn is_godot_primary_request(input: &str) -> bool {
   let normalized = input.to_lowercase();
   let keywords = [
@@ -2335,6 +2349,7 @@ fn is_godot_primary_request(input: &str) -> bool {
   keywords.iter().any(|k| normalized.contains(k))
 }
 
+#[allow(dead_code)]
 fn is_bridge_contextual_request(input: &str) -> bool {
   let normalized = input.to_lowercase();
   let explicit_bridge = contains_any(&normalized, &[
@@ -2395,6 +2410,7 @@ fn is_scene_count_request(input: &str) -> bool {
   asks_count && asks_scene
 }
 
+#[allow(dead_code)]
 fn extract_scene_paths_from_text(text: &str) -> Vec<String> {
   let mut seen: HashSet<String> = HashSet::new();
   let mut out: Vec<String> = Vec::new();
@@ -2415,6 +2431,7 @@ fn extract_scene_paths_from_text(text: &str) -> Vec<String> {
   out
 }
 
+#[allow(dead_code)]
 fn is_bridge_follow_up_request(input: &str) -> bool {
   let normalized = input.trim().to_lowercase();
   if normalized.is_empty() {
@@ -2795,6 +2812,7 @@ fn build_schema_aware_arg_candidates(
   candidates
 }
 
+#[allow(dead_code)]
 fn try_external_handoff(
   app: &tauri::AppHandle,
   payload: &UserTurnPayload,
@@ -2903,6 +2921,7 @@ fn try_external_handoff(
   true
 }
 
+#[allow(dead_code)]
 fn try_bridge_inventory_handoff(
   app: &tauri::AppHandle,
   payload: &UserTurnPayload,
@@ -5926,6 +5945,7 @@ pub fn restore_project_checkpoint(
   ))
 }
 
+#[allow(dead_code)]
 fn shell_single_quote(s: &str) -> String {
   let escaped = s.replace('"', "\\\"").replace('\\', "\\\\");
   format!("\"{}\"", escaped)
@@ -8773,6 +8793,38 @@ pub async fn list_open_tabs(app: tauri::AppHandle) -> Result<Vec<Snapshot>, Stri
     Ok(out)
 }
 
+// Approximate parameter count (in billions) parsed from an Ollama `details.parameter_size`
+// label such as "7.6B" or "3.2B". Returns None when the label cannot be parsed.
+fn param_billions(label: &str) -> Option<f32> {
+  let lowered = label.trim().to_ascii_lowercase();
+  let digits: String = lowered.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+  digits.parse::<f32>().ok()
+}
+
+// Target parameter count (in billions) implied by a base model tag such as
+// "qwen2.5:7b-instruct-q4_K_M" or "llama3.2:3b".
+fn base_target_billions(base: &str) -> Option<f32> {
+  let b = base.to_ascii_lowercase();
+  if b.contains("14b") { Some(14.0) }
+  else if b.contains("13b") { Some(13.0) }
+  else if b.contains("7b") { Some(7.0) }
+  else if b.contains("4b") { Some(4.0) }
+  else if b.contains("3b") { Some(3.0) }
+  else if b.contains("1.5b") { Some(1.5) }
+  else if b.contains("1b") { Some(1.0) }
+  else { None }
+}
+
+// True only when the installed model is clearly smaller than the modelfile base now wants
+// (e.g. an existing 3B organizer when the template was upgraded to 7B). Any parse failure
+// returns false so a correctly-sized or unknown model is never needlessly rebuilt.
+fn base_expects_larger_than_installed(base: &str, installed: Option<&str>) -> bool {
+  match (base_target_billions(base), installed.and_then(param_billions)) {
+    (Some(target), Some(have)) => have + 1.0 < target,
+    _ => false,
+  }
+}
+
 #[tauri::command]
 pub async fn ensure_model(name: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -8797,15 +8849,38 @@ pub async fn ensure_model(name: String) -> Result<(), String> {
             .json(&serde_json::json!({ "name": name }))
             .send();
 
-        let need_pull = match show {
-            Ok(resp) => resp.status() == reqwest::StatusCode::NOT_FOUND,
+        let (need_pull, installed_param_size) = match show {
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    (true, None)
+                } else {
+                    let size = resp.json::<serde_json::Value>().ok()
+                        .and_then(|body| body.get("details")
+                            .and_then(|details| details.get("parameter_size"))
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string()));
+                    (false, size)
+                }
+            }
             Err(_) => {
                 // if Ollama is down, surface that
                 return Err("Cannot reach Ollama at 127.0.0.1:11434".into());
             }
         };
 
-        if need_pull {
+        // Rebuild an existing custom model when the installed weights are clearly smaller than the
+        // modelfile base now specifies (e.g. a frozen 3B organizer after the 7B upgrade). ollama
+        // create overwrites the existing tag, so no explicit removal is needed.
+        let needs_rebuild = if need_pull {
+            false
+        } else {
+            model_definitions(None).iter()
+                .find(|(tag, _, _)| *tag == name)
+                .map(|(_, base, _)| base_expects_larger_than_installed(base, installed_param_size.as_deref()))
+                .unwrap_or(false)
+        };
+
+        if need_pull || needs_rebuild {
           // Custom Iris tags must be created from modelfiles, not pulled directly.
           let definitions = model_definitions(None);
           if let Some((custom_name, base_model, modelfile_file)) =
@@ -9331,6 +9406,7 @@ fn pull_candidates(base: &str) -> Vec<String> {
     "qwen2.5-coder:3b-instruct" => vec!["qwen2.5-coder:3b-instruct".to_string(), "qwen2.5-coder:3b".to_string(), "qwen2.5-coder:1.5b-instruct".to_string()],
     "qwen2.5-coder:1.5b-instruct" => vec!["qwen2.5-coder:1.5b-instruct".to_string(), "qwen2.5-coder:3b-instruct".to_string()],
     "qwen2.5:14b-instruct" => vec!["qwen2.5:14b-instruct".to_string(), "qwen2.5:14b".to_string(), "qwen2.5:7b-instruct".to_string()],
+    "qwen2.5:7b-instruct-q4_K_M" => vec!["qwen2.5:7b-instruct-q4_K_M".to_string(), "qwen2.5:7b-instruct".to_string(), "qwen2.5:7b".to_string(), "llama3.2:3b".to_string()],
     "qwen2.5:7b-instruct" => vec!["qwen2.5:7b-instruct".to_string(), "qwen2.5:7b".to_string(), "llama3.2:3b".to_string()],
     "qwen2.5:1.5b-instruct" => vec!["qwen2.5:1.5b-instruct".to_string(), "qwen2.5:3b-instruct".to_string(), "llama3.2:3b".to_string()],
     "gemma3:4b" => vec!["gemma3:4b".to_string(), "gemma3:1b".to_string()],
@@ -9352,6 +9428,25 @@ fn pull_candidates(base: &str) -> Vec<String> {
   }
 }
 
+fn modelfile_from_line(path: &std::path::Path) -> Option<String> {
+  let raw = fs::read_to_string(path).ok()?;
+  for line in raw.lines() {
+    let t = line.trim();
+    if t.starts_with("FROM ") {
+      let parsed = t.trim_start_matches("FROM ").trim();
+      if !parsed.is_empty() { return Some(parsed.to_string()); }
+    }
+  }
+  None
+}
+
+// A base model that older installs auto-provisioned for the organizer before the 7B upgrade.
+// Used to detect a stale app-data modelfile that should be refreshed from the bundled template.
+fn is_legacy_small_base(base: &str) -> bool {
+  let b = base.trim().to_ascii_lowercase();
+  b.starts_with("llama3.2:3b") || b == "llama3.2" || b.starts_with("llama2:")
+}
+
 fn locate_modelfiles_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
   if let Some(app) = app {
     let directory = app.path().app_data_dir().map_err(|err|err.to_string())?.join("model_files");
@@ -9359,14 +9454,25 @@ fn locate_modelfiles_dir(app: Option<&tauri::AppHandle>) -> Result<PathBuf, Stri
     let profile = ModelProfile::parse(&read_setup_flags(app).model_profile);
     for (name,filename) in MODEL_FILES {
       let target = directory.join(filename);
+      let bundled = app.path().resource_dir().ok().map(|resource|resource.join("model_files").join(filename));
+      let local = std::env::current_dir().ok().and_then(|cwd| [cwd.join("model_files").join(filename),cwd.join("..").join("model_files").join(filename)].into_iter().find(|path|path.is_file()));
+      let source = local.or(bundled.filter(|path|path.is_file()));
       if !target.exists() {
-        let bundled = app.path().resource_dir().ok().map(|resource|resource.join("model_files").join(filename));
-        let local = std::env::current_dir().ok().and_then(|cwd| [cwd.join("model_files").join(filename),cwd.join("..").join("model_files").join(filename)].into_iter().find(|path|path.is_file()));
-        let source = local.or(bundled.filter(|path|path.is_file()));
         if cfg!(target_os = "macos") || source.is_none() {
           fs::write(&target,build_modelfile(name,default_base_model_for(name,profile),profile)).map_err(|err|err.to_string())?;
-        } else if let Some(source) = source {
+        } else if let Some(source) = &source {
           fs::copy(source,&target).map_err(|err|err.to_string())?;
+        }
+      } else if !cfg!(target_os = "macos") {
+        // An older install froze a smaller base (e.g. llama3.2:3b) here and never refreshed it.
+        // When the bundled template now specifies a larger base, adopt it so the upgrade actually
+        // takes effect instead of silently rebuilding the old 3B model forever.
+        if let Some(source) = &source {
+          if let (Some(current),Some(desired)) = (modelfile_from_line(&target),modelfile_from_line(source)) {
+            if current != desired && is_legacy_small_base(&current) {
+              let _ = fs::copy(source,&target);
+            }
+          }
         }
       }
     }
