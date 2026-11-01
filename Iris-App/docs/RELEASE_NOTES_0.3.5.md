@@ -47,6 +47,24 @@ For tasks that exceed a small model's one-shot ability (deep research, multi-sou
 
 - Connecting a bridge now reports **which layer failed**: starting/connecting the bridge process vs. discovering its tools. A Godot/GDAI bridge that connects but returns no tools now tells you to make sure the Godot editor is open with the MCP plugin active. This makes it possible to tell whether a failure is the command (e.g. `uv` not found), the bridge process, or the editor not running.
 
+## MCP that inspects the project for you
+
+Testing showed a small model couldn't reliably drive the bridge call sequence (it passed the bridge's display name where an id was expected, omitted required fields, and looped). So the app now does the heavy lifting:
+
+- **Auto-inspection.** When you ask about a project's scenes/nodes/structure and the bridge is reachable, Iris now **runs the most relevant read tool for you automatically** and includes the real result in the connection snapshot — the model just reports it, instead of trying (and failing) to orchestrate the call itself.
+- **Forgiving ids.** The bridge id now accepts the display name or a stale value and **defaults to the single linked bridge** when there's only one, so a minor mismatch no longer blocks inspection.
+- **Direct file access.** The project's folder-on-disk (renamed from "Manipulation root folder" to **"Project folder (direct file access)"**) lets Iris read and edit project files directly; it's preferred for ordinary file work, with the bridge reserved for engine-specific actions.
+- Fixed an awkward deflection where Iris quoted its internal "working style guidelines" and treated a benign project question as "risky."
+
+## Text & UI size
+
+- General settings now has a **Text & UI size** control (Small · Default · Large · Larger · Largest) right by the theme/appearance options. It scales **all** text and the whole interface uniformly; the panels expand to use the extra room. The choice persists and is applied before the app paints, so there's no flash on launch.
+
+## Reasoning logs & interruption safety
+
+- **Options ▾ → Copy Reasoning Logs** (renamed from "Copy activity logs", with a hover tooltip) copies every reasoning log in the open chat to the clipboard.
+- Fixed a gap where a message could be sent while Iris was still working — a new turn is now hard-blocked until the current one finishes, so you can't accidentally interrupt mid-thought.
+
 ## Smoother startup
 
 - A lightweight **loading splash** (logo + spinner + "Starting Iris…") now shows immediately while the webview and app initialize, instead of a blank/dark screen on slower cold starts.

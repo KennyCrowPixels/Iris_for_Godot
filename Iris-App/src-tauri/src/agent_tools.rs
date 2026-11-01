@@ -59,8 +59,43 @@ fn project_for_task(app: &tauri::AppHandle, task: &AgentTask) -> Result<(Project
 
 fn linked_mcp(app: &tauri::AppHandle, task: &AgentTask, id: &str) -> Result<McpConnection, String> {
     let (project, store) = project_for_task(app, task)?;
-    store.mcps.into_iter().find(|connection| connection.enabled && connection.id == id && project.mcp_ids.contains(&connection.id))
-        .ok_or("MCP connection is not enabled and linked to this project".into())
+    let linked: Vec<McpConnection> = store.mcps.into_iter().filter(|connection| connection.enabled && project.mcp_ids.contains(&connection.id)).collect();
+    if linked.is_empty() { return Err("No MCP bridge is enabled and linked to this project.".into()); }
+    if let Some(found) = linked.iter().find(|connection| connection.id == id || connection.name == id) { return Ok(found.clone()); }
+    // A small model often passes the bridge's display name or a stale id. When exactly one bridge
+    // is linked, use it so a minor id mismatch does not block the whole inspection.
+    if linked.len() == 1 { return Ok(linked.into_iter().next().expect("one linked bridge")); }
+    Err(format!("No linked MCP bridge matches '{id}'. Linked bridge ids: {}.", linked.iter().map(|connection| connection.id.as_str()).collect::<Vec<_>>().join(", ")))
+}
+
+/// Pick the single most relevant read-only, no-argument bridge tool to auto-run for a
+/// project-structure question, so a small model gets the real data directly rather than having to
+/// orchestrate call_project_tool itself. Returns None when the goal is not about project structure
+/// or no safe matching tool exists.
+fn best_inspection_tool(catalog: &[McpToolInfo], goal: &str) -> Option<String> {
+    let goal = goal.to_lowercase();
+    let wants = ["scene", "node", "tree", "project", "current", "structure", "hierarchy", "script", "resource"];
+    let mentioned: Vec<&str> = wants.iter().copied().filter(|word| goal.contains(*word)).collect();
+    if mentioned.is_empty() { return None; }
+    let mutating = ["set", "create", "delete", "remove", "add", "write", "update", "move", "rename", "modify", "exec", "run", "save", "open", "close", "instantiate", "spawn"];
+    catalog.iter()
+        .filter(|tool| {
+            let name_lower = tool.name.to_lowercase();
+            if mutating.iter().any(|word| name_lower.contains(*word)) { return false; }
+            let read_only = tool.annotations.get("readOnlyHint").and_then(Value::as_bool).unwrap_or_else(|| {
+                let nd = format!("{} {}", tool.name, tool.description).to_lowercase();
+                ["get", "list", "read", "view", "tree", "show", "current", "fetch", "inspect"].iter().any(|word| nd.contains(*word))
+            });
+            let required_empty = tool.input_schema.get("required").and_then(Value::as_array).map(|items| items.is_empty()).unwrap_or(true);
+            read_only && required_empty
+        })
+        .filter_map(|tool| {
+            let nd = format!("{} {}", tool.name, tool.description).to_lowercase();
+            let score = mentioned.iter().filter(|word| nd.contains(**word)).count();
+            (score > 0).then(|| (score, tool.name.clone()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, name)| name)
 }
 
 fn linked_root(app: &tauri::AppHandle, task: &AgentTask, id: &str) -> Result<String, String> {
@@ -246,7 +281,18 @@ pub(super) async fn execute(
                     Ok(catalog) => {
                         any_reachable = true;
                         let tools = catalog.iter().take(40).map(|entry|serde_json::json!({"tool_name":entry.name,"description":excerpt(&entry.description,140)})).collect::<Vec<_>>();
-                        mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"connected","toolCount":catalog.len(),"tools":tools}));
+                        let mut entry = serde_json::json!({"id":item.id,"name":item.name,"status":"connected","toolCount":catalog.len(),"tools":tools});
+                        // Auto-run the single most relevant no-argument read tool so the model gets
+                        // the real project data up front instead of having to orchestrate the call.
+                        if let Some(best) = best_inspection_tool(&catalog, &task.goal) {
+                            let (id,target,ctype,cmd,cargs,tname) = (item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone(),best.clone());
+                            if let Ok(result) = blocking_call(move|| mcp_call_tool(id,target,ctype,cmd,cargs,tname,serde_json::json!({}))).await {
+                                if !mcp_response_has_error(&result) {
+                                    entry["inspection"] = serde_json::json!({"tool_name":best,"result":result});
+                                }
+                            }
+                        }
+                        mcps.push(entry);
                     }
                     Err(error) => mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"unreachable","error":excerpt(&error,400)})),
                 }
@@ -255,7 +301,10 @@ pub(super) async fn execute(
             let repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
-            let guidance = if any_reachable {
+            let auto_inspected = mcps.iter().any(|item| item.get("inspection").is_some());
+            let guidance = if auto_inspected {
+                "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from that inspection result; do not call another tool to re-read the same thing. Never invent scene, node, or file names beyond what the inspection shows."
+            } else if any_reachable {
                 "Each connected mcps entry already lists its tools. To read data (scene list, current scene, node names), call call_project_tool NOW with connection_id set to that EXACT id, tool_name set to one of its listed tool_name values, arguments set to the tool's inputs (often {}), and effect:\"read\". You do NOT need list_project_tools. Report ONLY what the call returns; never invent scene, node, or file names."
             } else if can_bridge {
                 "The linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user the bridge is unreachable and quote the error; for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and that the launch command (e.g. uv) is installed. Do NOT invent scene, node, or file names."
@@ -266,10 +315,11 @@ pub(super) async fn execute(
             };
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
                 "mcps":mcps,"sshs":sshs,"repositories":repositories,
-                "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"guidance":guidance})
+                "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
         }
         "list_project_tools" | "call_project_tool" => {
-            let connection = linked_mcp(app,task,&connection_arg(args)?)?;
+            let conn_id = connection_arg(args).unwrap_or_default();
+            let connection = linked_mcp(app,task,&conn_id)?;
             let catalog = mcp_list_tools(connection.id.clone(),connection.target.clone(),connection.connection_type.clone(),connection.launch_command.clone(),connection.launch_args.clone()).await?;
             if tool=="list_project_tools" {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();

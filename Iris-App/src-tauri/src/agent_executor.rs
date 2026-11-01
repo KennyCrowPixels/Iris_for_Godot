@@ -1069,6 +1069,8 @@ pub(super) async fn run(
                                     let reachable = result.value.get("bridgeReachable").and_then(Value::as_bool).unwrap_or(false);
                                     let has_files = result.value.get("repositories").and_then(Value::as_array).map(|items|!items.is_empty()).unwrap_or(false);
                                     project_bridge_down = !reachable && !has_files;
+                                    // Auto-inspection already read real project data; the model may answer from it.
+                                    if result.value.get("autoInspected").and_then(Value::as_bool)==Some(true) { project_inspection = false; }
                                 }
                                 repeated_calls.insert(signature,count+1);
                                 let evidence = task.observe(&tool, result.ok, result.verifies_state, result.side_effect_attempted, &result.value.to_string());

@@ -2673,6 +2673,30 @@ function readStoredColorMode(): "dark" | "light" {
   return "dark";
 }
 
+const UI_SCALE_OPTIONS: { label: string; value: number }[] = [
+  { label: "Small", value: 0.9 },
+  { label: "Default", value: 1.0 },
+  { label: "Large", value: 1.15 },
+  { label: "Larger", value: 1.3 },
+  { label: "Largest", value: 1.5 },
+];
+
+function readStoredUiScale(): number {
+  try {
+    const raw = Number(localStorage.getItem("iris.ui.scale"));
+    if (Number.isFinite(raw) && raw >= 0.8 && raw <= 1.6) return raw;
+  } catch {}
+  return 1.0;
+}
+
+function applyUiScale(scale: number): void {
+  try {
+    // `zoom` scales every element (text and UI chrome) uniformly in the Chromium webview.
+    (document.documentElement.style as any).zoom = String(scale);
+    localStorage.setItem("iris.ui.scale", String(scale));
+  } catch {}
+}
+
 function hexToRgb(hex: string): { r: number; g: number; b: number } {
   const clean = hex.replace("#", "").trim();
   const full = clean.length === 3 ? clean.split("").map((c) => `${c}${c}`).join("") : clean;
@@ -3134,6 +3158,7 @@ function App() {
   const [themePreset, setThemePreset] = useState<ThemePreset>(() => readStoredThemePreset());
   const [customThemeColor, setCustomThemeColor] = useState(() => readStoredThemeColor());
   const [colorMode, setColorMode] = useState<"dark" | "light">(() => readStoredColorMode());
+  const [uiScale, setUiScale] = useState<number>(() => readStoredUiScale());
   const [networkEnabled, setNetworkEnabled] = useState(false);
   const [universalDatawebEnabled, setUniversalDatawebEnabled] = useState(true);
   const [networkDraftEnabled, setNetworkDraftEnabled] = useState(false);
@@ -3400,6 +3425,7 @@ function App() {
     }
     document.documentElement.style.colorScheme = isLightMode ? "light" : "dark";
   }, [themePreset, customThemeColor, isLightMode]);
+  useEffect(() => { applyUiScale(uiScale); }, [uiScale]);
   const assistantLabel = assistantName.trim() || "Iris";
   const activeProjectId = tabProjectMap[activeTab] ?? null;
   const chatMessages = currentTab?.messages || [];
@@ -5966,6 +5992,11 @@ function App() {
   async function sendMessage(e: React.FormEvent) {
     e.preventDefault();
     if (menuLocked) {
+      return;
+    }
+    // Hard guard: never begin a new turn while one is already in flight, so the user can't
+    // interrupt Iris mid-thought even if the composer briefly shows the send (not stop) state.
+    if (isGeneratingRef.current || activeRustRequestRef.current !== null) {
       return;
     }
 
@@ -10774,7 +10805,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               <div className="dropdown-item" onClick={handleSettings}>Settings</div>
               <div className="dropdown-item" onClick={handleToolsCenter}>Tools Center</div>
               <div className="dropdown-item" onClick={() => { handleAgentStats(); setOpenMenu(null); }}>Agent Stats</div>
-              <div className="dropdown-item" onClick={() => { void copyChatActivityLogs(); setOpenMenu(null); }}>Copy activity logs</div>
+              <div className="dropdown-item" onClick={() => { void copyChatActivityLogs(); setOpenMenu(null); }} title="Copy to clipboard all reasoning logs from the open chat log">Copy Reasoning Logs</div>
 
               {ENABLE_DEVELOPER_TOOLS && <div
                 className="dropdown-item"
@@ -12068,6 +12099,24 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
               </div>
 
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Text &amp; UI size</label>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {UI_SCALE_OPTIONS.map((option) => (
+                    <button
+                      key={option.label}
+                      className={`setup-btn${Math.abs(uiScale - option.value) < 0.001 ? " primary" : ""}`}
+                      onClick={() => setUiScale(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <p style={{ marginTop: 6, marginBottom: 0, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
+                  Scales all text and the whole interface. The panels expand to use the extra room.
+                </p>
+              </div>
+
               {!useRustEngine && <div style={{ marginBottom: 14 }}>
                 <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Response wait threshold (minutes)</label>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -12727,7 +12776,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       </div>
 
                       <div style={{ marginBottom: 8 }}>
-                        <label style={{ display: "block", fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Manipulation root folder</label>
+                        <label style={{ display: "block", fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Project folder (direct file access)</label>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                           <input
                             value={projectManipulationRootDrafts[project.id] ?? project.manipulationRootPath ?? ""}
@@ -12772,7 +12821,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           </button>
                         </div>
                         <div style={{ marginTop: 6, fontSize: 12, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>
-                          When both a manipulation root and MCP are available, Iris should usually prefer direct filesystem work here and reserve MCP for engine-specific actions.
+                          Point this at the project's folder on disk (e.g. your Godot project) so Iris can read and edit its files directly. When both this folder and an MCP bridge are available, Iris usually prefers direct file work here and reserves the bridge for engine-specific actions.
                         </div>
                       </div>
 
