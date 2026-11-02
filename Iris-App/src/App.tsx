@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
-import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, ListChecks, Mic, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, GripVertical, ListChecks, Mic, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
 import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
 import { themeTokens } from "./lib/theme";
 import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
@@ -2302,6 +2302,7 @@ type ProjectDef = {
   entryIds: string[];
   mcpIds: string[];
   sshIds: string[];
+  connectionPriority: string[];
 };
 
 type RepoProjectStore = {
@@ -4797,6 +4798,7 @@ function App() {
                     entryIds: Array.isArray(p?.entryIds) ? p.entryIds.map(String) : [],
                     mcpIds: Array.isArray(p?.mcpIds) ? p.mcpIds.map(String) : [],
                     sshIds: Array.isArray(p?.sshIds) ? p.sshIds.map(String) : [],
+                    connectionPriority: Array.isArray(p?.connectionPriority) ? p.connectionPriority.map(String) : [],
                   }))
                 : [],
               tools: Array.isArray((store as any).tools)
@@ -12681,6 +12683,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       entryIds: [],
                       mcpIds: [],
                       sshIds: [],
+                      connectionPriority: [],
                     };
                     await persistRepoStore({ ...repoStore, projects: [...repoStore.projects, p] });
                   }}
@@ -12692,6 +12695,21 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 {repoStore.projects.map((project) => {
                   const linkedRepos = repoStore.repos.filter((r) => project.repoIds.includes(r.id));
                   const availableEntries = linkedRepos.flatMap((r) => r.entries.filter((e) => r.selectedEntryIds.includes(e.id)));
+                  const connectionItems: { key: string; kind: "folder" | "repo" | "mcp" | "ssh"; name: string; linked: boolean; toggleable: boolean }[] = [
+                    ...(((project.manipulationRootPath || "").trim()) ? [{ key: "project", kind: "folder" as const, name: "Project folder (direct file access)", linked: true, toggleable: false }] : []),
+                    ...repoStore.repos.map((r) => ({ key: r.id, kind: "repo" as const, name: r.name, linked: project.repoIds.includes(r.id), toggleable: true })),
+                    ...(llmCapabilities.mcpAvailable ? repoStore.mcps.map((m) => ({ key: m.id, kind: "mcp" as const, name: m.name, linked: (project.mcpIds || []).includes(m.id), toggleable: true })) : []),
+                    ...repoStore.sshs.map((s) => ({ key: s.id, kind: "ssh" as const, name: s.name, linked: (project.sshIds || []).includes(s.id), toggleable: true })),
+                  ];
+                  const connPriority = project.connectionPriority || [];
+                  const orderedConnections = [...connectionItems].sort((a, b) => {
+                    const ia = connPriority.indexOf(a.key);
+                    const ib = connPriority.indexOf(b.key);
+                    if (ia === -1 && ib === -1) return 0;
+                    if (ia === -1) return 1;
+                    if (ib === -1) return -1;
+                    return ia - ib;
+                  });
                   return (
                     <div key={project.id} style={{ border: "1px solid var(--app-border)", borderRadius: 8, padding: 10, background: "var(--app-panel-bg)", width: "100%", boxSizing: "border-box", minWidth: 0 }}>
                       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
@@ -12847,106 +12865,87 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                       </div>
 
                       <div style={{ marginBottom: 8 }}>
-                        <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>Associated repositories</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                          {repoStore.repos.map((repo) => (
-                            <label key={repo.id} style={{ fontSize: 12, color: "var(--app-text)", border: "1px solid var(--app-border)", borderRadius: 6, padding: "4px 8px", background: isLightMode ? "rgba(255,255,255,0.12)" : "transparent" }}>
-                              <input
-                                type="checkbox"
-                                checked={project.repoIds.includes(repo.id)}
-                                onChange={async (e) => {
-                                  const checked = e.target.checked;
-                                  const repoIds = checked
-                                    ? [...project.repoIds, repo.id]
-                                    : project.repoIds.filter((id) => id !== repo.id);
-                                  const allowed = new Set(
-                                    repoStore.repos
-                                      .filter((r) => repoIds.includes(r.id))
-                                      .flatMap((r) => r.selectedEntryIds)
-                                  );
-                                  const entryIds = project.entryIds.filter((id) => allowed.has(id));
-                                  await persistRepoStore({
-                                    ...repoStore,
-                                    projects: repoStore.projects.map((p) => p.id === project.id ? { ...p, repoIds, entryIds } : p),
-                                  });
-                                }}
-                                style={{ marginRight: 6 }}
-                              />
-                              {repo.name}
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-
-                      {llmCapabilities.mcpAvailable ? (
-                        <div style={{ marginBottom: 8 }}>
-                          <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>
-                            Associated MCP connections {llmCapabilities.multiMcpEnabled ? "(multi-tool profile mode)" : "(single-tool profile mode)"}
-                          </div>
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                            {repoStore.mcps.map((mcp) => (
-                              <label key={mcp.id} style={{ fontSize: 12, color: "var(--app-text)", border: "1px solid var(--app-border)", borderRadius: 6, padding: "4px 8px", background: isLightMode ? "rgba(255,255,255,0.12)" : "transparent" }}>
-                                <input
-                                  type="checkbox"
-                                  checked={project.mcpIds?.includes(mcp.id)}
-                                  onChange={async (e) => {
-                                    const checked = e.target.checked;
-                                    let mcpIds = checked
-                                      ? Array.from(new Set([...(project.mcpIds || []), mcp.id]))
-                                      : (project.mcpIds || []).filter((id) => id !== mcp.id);
-                                    if (!llmCapabilities.multiMcpEnabled && mcpIds.length > 1) {
-                                      mcpIds = [mcp.id];
-                                    }
-                                    await persistRepoStore({
-                                      ...repoStore,
-                                      projects: repoStore.projects.map((p) => p.id === project.id ? { ...p, mcpIds } : p),
-                                    });
-                                  }}
-                                  style={{ marginRight: 6 }}
-                                />
-                                {mcp.name}
-                              </label>
-                            ))}
-                            {!repoStore.mcps.length && (
-                              <div style={{ fontSize: 12, color: "#9d9d9d" }}>No MCP connections configured yet.</div>
-                            )}
-                          </div>
-                        </div>
-                      ) : (
-                        <div style={{ marginBottom: 8, fontSize: 12, color: "#9d9d9d" }}>
-                          MCP linking is unavailable for this profile mode.
-                        </div>
-                      )}
-
-                      <div style={{ marginBottom: 8 }}>
                         <div style={{ fontSize: 12, color: "var(--app-text)", marginBottom: 4 }}>
-                          Associated SSH connections
+                          Connection priority
+                          <span style={{ color: isLightMode ? "#4b627a" : "#9fb2c9", fontWeight: 400 }}> — drag to order; Iris prefers the topmost enabled connection and falls back down the list. Toggle one on to use it for this project.</span>
                         </div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                          {repoStore.sshs.map((ssh) => (
-                            <label key={ssh.id} style={{ fontSize: 12, color: "var(--app-text)", border: "1px solid var(--app-border)", borderRadius: 6, padding: "4px 8px", background: isLightMode ? "rgba(255,255,255,0.12)" : "transparent" }}>
-                              <input
-                                type="checkbox"
-                                checked={project.sshIds?.includes(ssh.id)}
-                                onChange={async (e) => {
-                                  const checked = e.target.checked;
-                                  const sshIds = checked
-                                    ? Array.from(new Set([...(project.sshIds || []), ssh.id]))
-                                    : (project.sshIds || []).filter((id) => id !== ssh.id);
-                                  await persistRepoStore({
-                                    ...repoStore,
-                                    projects: repoStore.projects.map((p) => p.id === project.id ? { ...p, sshIds } : p),
-                                  });
-                                }}
-                                style={{ marginRight: 6 }}
-                              />
-                              {ssh.name}
-                            </label>
-                          ))}
-                          {!repoStore.sshs.length && (
-                            <div style={{ fontSize: 12, color: "#9d9d9d" }}>No SSH connections configured yet.</div>
-                          )}
-                        </div>
+                        {!orderedConnections.length ? (
+                          <div style={{ fontSize: 12, color: "#9d9d9d" }}>No connections yet. Set a project folder above, or add an MCP bridge / SSH connection / repository.</div>
+                        ) : (
+                          <DragDropContext onDragEnd={({ source, destination }) => {
+                            if (!destination || destination.index === source.index) return;
+                            const next = [...orderedConnections];
+                            const [moved] = next.splice(source.index, 1);
+                            next.splice(destination.index, 0, moved);
+                            void persistRepoStore({
+                              ...repoStore,
+                              projects: repoStore.projects.map((p) => p.id === project.id ? { ...p, connectionPriority: next.map((c) => c.key) } : p),
+                            });
+                          }}>
+                            <Droppable droppableId={`conn-priority-${project.id}`}>
+                              {(dropProvided) => (
+                                <div ref={dropProvided.innerRef} {...dropProvided.droppableProps} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                                  {orderedConnections.map((conn, index) => (
+                                    <Draggable key={conn.key} draggableId={`${project.id}:${conn.key}`} index={index}>
+                                      {(dragProvided) => (
+                                        <div
+                                          ref={dragProvided.innerRef}
+                                          {...dragProvided.draggableProps}
+                                          style={{ display: "flex", alignItems: "center", gap: 8, border: "1px solid var(--app-border)", borderRadius: 6, padding: "6px 8px", background: isLightMode ? "rgba(255,255,255,0.12)" : "var(--app-input-bg)", opacity: conn.toggleable && !conn.linked ? 0.6 : 1, ...dragProvided.draggableProps.style }}
+                                        >
+                                          <span {...dragProvided.dragHandleProps} title="Drag to reorder" style={{ cursor: "grab", color: "var(--app-muted)", display: "inline-flex", flexShrink: 0 }}><GripVertical size={15} /></span>
+                                          <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4, color: "var(--app-accent)", border: "1px solid var(--app-border)", borderRadius: 4, padding: "1px 5px", flexShrink: 0 }}>{conn.kind === "folder" ? "Folder" : conn.kind === "mcp" ? "MCP" : conn.kind === "ssh" ? "SSH" : "Repo"}</span>
+                                          <span style={{ fontSize: 12, color: "var(--app-text)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conn.name}</span>
+                                          {conn.toggleable ? (
+                                            <label style={{ fontSize: 11, color: "var(--app-text)", display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+                                              <input
+                                                type="checkbox"
+                                                checked={conn.linked}
+                                                onChange={(e) => {
+                                                  const checked = e.target.checked;
+                                                  void persistRepoStore({
+                                                    ...repoStore,
+                                                    projects: repoStore.projects.map((p) => {
+                                                      if (p.id !== project.id) return p;
+                                                      if (conn.kind === "repo") {
+                                                        const repoIds = checked ? Array.from(new Set([...(p.repoIds || []), conn.key])) : (p.repoIds || []).filter((id) => id !== conn.key);
+                                                        const allowed = new Set(repoStore.repos.filter((r) => repoIds.includes(r.id)).flatMap((r) => r.selectedEntryIds));
+                                                        const entryIds = (p.entryIds || []).filter((id) => allowed.has(id));
+                                                        return { ...p, repoIds, entryIds };
+                                                      }
+                                                      if (conn.kind === "mcp") {
+                                                        let mcpIds = checked ? Array.from(new Set([...(p.mcpIds || []), conn.key])) : (p.mcpIds || []).filter((id) => id !== conn.key);
+                                                        if (!llmCapabilities.multiMcpEnabled && mcpIds.length > 1) mcpIds = [conn.key];
+                                                        return { ...p, mcpIds };
+                                                      }
+                                                      const sshIds = checked ? Array.from(new Set([...(p.sshIds || []), conn.key])) : (p.sshIds || []).filter((id) => id !== conn.key);
+                                                      return { ...p, sshIds };
+                                                    }),
+                                                  });
+                                                }}
+                                                style={{ margin: 0 }}
+                                              />
+                                              {conn.linked ? "On" : "Off"}
+                                            </label>
+                                          ) : (
+                                            <span style={{ fontSize: 11, color: "var(--app-accent)", flexShrink: 0 }}>Direct file access</span>
+                                          )}
+                                        </div>
+                                      )}
+                                    </Draggable>
+                                  ))}
+                                  {dropProvided.placeholder}
+                                </div>
+                              )}
+                            </Droppable>
+                          </DragDropContext>
+                        )}
+                        {!llmCapabilities.mcpAvailable && (
+                          <div style={{ marginTop: 6, fontSize: 11, color: "#9d9d9d" }}>MCP linking is unavailable for this profile mode.</div>
+                        )}
+                        {llmCapabilities.mcpAvailable && !llmCapabilities.multiMcpEnabled && (
+                          <div style={{ marginTop: 6, fontSize: 11, color: isLightMode ? "#4b627a" : "#9fb2c9" }}>Single-tool profile: only one MCP bridge can be enabled at a time.</div>
+                        )}
                       </div>
 
                       <div>

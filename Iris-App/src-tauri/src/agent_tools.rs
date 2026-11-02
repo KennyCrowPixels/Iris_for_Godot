@@ -307,10 +307,27 @@ pub(super) async fn execute(
                 }
             }
             let sshs = store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>();
-            let repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
+            let mut repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
+            // Honor the user's configured connection-priority order (ids; "project" is the folder).
+            let priority = project.connection_priority.clone();
+            let prio_rank = |value: &Value| priority.iter().position(|key| Some(key.as_str()) == value.get("id").and_then(Value::as_str)).unwrap_or(usize::MAX);
+            mcps.sort_by_key(|item| prio_rank(item));
+            repositories.sort_by_key(|item| prio_rank(item));
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
             let auto_inspected = mcps.iter().any(|item| item.get("inspection").is_some());
+            let mut preferred_order: Vec<String> = priority.iter().filter_map(|id| {
+                if id == "project" { return (!project.manipulation_root_path.is_empty()).then(|| "Project folder (direct file access)".to_string()); }
+                if let Some(found) = store.mcps.iter().find(|m| &m.id == id && m.enabled && project.mcp_ids.contains(&m.id)) { return Some(format!("MCP: {}", found.name)); }
+                if let Some(found) = store.sshs.iter().find(|s| &s.id == id && s.enabled && project.ssh_ids.contains(&s.id)) { return Some(format!("SSH: {}", found.name)); }
+                if let Some(found) = store.repos.iter().find(|r| &r.id == id && r.enabled && project.repo_ids.contains(&r.id)) { return Some(format!("repo: {}", found.name)); }
+                None
+            }).collect();
+            if preferred_order.is_empty() {
+                if can_files { preferred_order.push("Project folder (direct file access)".to_string()); }
+                if can_bridge { preferred_order.push("MCP bridge".to_string()); }
+            }
+            let priority_note = if priority.is_empty() { String::new() } else { format!("User-configured connection priority (use the highest available first): {}. ", preferred_order.join(" > ")) };
             let bridge_status = if !can_bridge { "no MCP bridge is linked" } else if any_reachable { "an MCP bridge is connected" } else { "an MCP bridge is linked but did not respond" };
             let folder_status = if can_files { "a project folder is connected for direct file access" } else { "no project folder is set for direct file access" };
             // Direct file access is the most reliable path for a small model, so prefer it; MCP
@@ -326,13 +343,14 @@ pub(super) async fn execute(
             } else {
                 "This project has nothing connected: no project folder for direct file access and no linked MCP bridge or repository. You cannot inspect its scenes, nodes, or files. Tell the user to set a 'Project folder (direct file access)' in Settings > Projects (most reliable), or link an MCP bridge or repository, and do not invent any names.".to_string()
             };
+            let guidance = format!("{priority_note}{guidance}");
             let not_hooked_up: Vec<String> = [
                 (!can_files).then(|| "project folder for direct file access".to_string()),
                 (!can_bridge).then(|| "MCP bridge".to_string()),
             ].into_iter().flatten().collect();
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
                 "mcps":mcps,"sshs":sshs,"repositories":repositories,
-                "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":["project folder (direct file access)","MCP bridge"],"notHookedUp":not_hooked_up},
+                "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":preferred_order,"notHookedUp":not_hooked_up},
                 "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
         }
         "list_project_tools" | "call_project_tool" => {

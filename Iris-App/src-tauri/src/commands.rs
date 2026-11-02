@@ -4688,6 +4688,8 @@ pub struct ProjectDef {
   pub mcp_ids: Vec<String>,
   #[serde(default)]
   pub ssh_ids: Vec<String>,
+  #[serde(default)]
+  pub connection_priority: Vec<String>,
 }
 
 fn default_true_flag() -> bool { true }
