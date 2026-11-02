@@ -565,7 +565,7 @@ async fn review_research(
 
 async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequest, budget: &ModelBudget, control: &RunControl, project_context: &str, saved_goal: Option<&str>, tools: &[Value]) -> Result<agent_research::EvidenceNeed,String> {
     let mut intake_budget=budget.clone();
-    intake_budget.output_tokens=160;
+    intake_budget.output_tokens=240;
     let latest=request.messages.iter().rposition(|message|message.role=="user").unwrap_or(0);
     let context=request.messages[..latest].iter().rev().filter(|message|matches!(message.role.as_str(),"user"|"assistant")).take(4)
         .map(|message|format!("{}: {}",message.role,excerpt(&message.content,350))).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
@@ -586,10 +586,12 @@ async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequ
         json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\",\"effort\":\"normal\"}"}),
         json!({"role":"user","content":"How warm is it in Oslo, Norway right now?"}),
         json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\",\"effort\":\"trivial\"}"}),
+        json!({"role":"user","content":"What's the weather in Durham, NC and also Honolulu, HI?"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions\",\"effort\":\"normal\",\"requirements\":[\"current weather in Durham, NC\",\"current weather in Honolulu, HI\"]}"}),
         json!({"role":"user","content":"Take a screenshot of my screen and tell me what you see."}),
         json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\",\"effort\":\"normal\"}"}),
         json!({"role":"user","content":"Write a detailed five-paragraph essay comparing two newer games, with sources."}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"the two named games features reception comparison\",\"effort\":\"deep\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"the two named games features reception comparison\",\"effort\":\"deep\",\"requirements\":[\"introduction\",\"body paragraph: first game\",\"body paragraph: second game\",\"body paragraph: comparison\",\"conclusion\"]}"}),
         json!({"role":"user","content":"Continue the saved unfinished task from its notes."}),
         json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\",\"effort\":\"normal\"}"}),
         json!({"role":"system","content":format!("Context for resolving references only, not the current request. Today: {}. Attached project: {}. Saved unfinished objective: {}. Recent conversation:\n{}\nClassify only the user's next message.",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),context)}),
@@ -756,6 +758,7 @@ pub(super) async fn run(
         turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:format!("{memory_digest}\nThis recalled memory is background only; it is not proof. Verify with a tool before stating it as a current fact."),images:None,tool_calls:None});
     }
     let mut feedback = String::new();
+    let mut checklist = String::new();
     let mut last_action_error = String::new();
     let mut direct_answer = false;
     // Set when the turn is inspecting an attached project that actually has an inspectable bridge
@@ -790,6 +793,10 @@ pub(super) async fn run(
             Ok(need) => {
                 budget.apply_effort(&need.effort);
                 record_reasoning(window,event_name,&mut task,&format!("Effort assessed: {}.",need.effort));
+                if need.requirements.len() >= 2 {
+                    checklist = format!("\nRequirements checklist — satisfy EVERY item before finishing; do not stop after the first, and confirm each is covered in your answer:\n{}", need.requirements.iter().enumerate().map(|(index,item)| format!("{}. {}",index+1,item)).collect::<Vec<_>>().join("\n"));
+                    record_reasoning(window,event_name,&mut task,&format!("Checklist: {}.", need.requirements.join("; ")));
+                }
                 match {
                 record_reasoning(window,event_name,&mut task,&format!("Request assessment: {}. {}",need.route,match need.route.as_str(){"answer"=>"Stable knowledge or conversation; no external lookup required.","web"=>"Fresh evidence is needed; select a directly relevant lookup.","project"=>"Inspect the linked project before making project-specific claims.","act"=>"A local device, app, or bridge action is requested; use the enabled tool or name what to enable.","clarify"=>"The current request needs a clarification.",_=>"Continue from the saved objective."}));
                 need.route.as_str()
@@ -934,7 +941,7 @@ pub(super) async fn run(
         task.total_actions += 1;
         emit_progress(window, event_name, &task, &budget);
         let _ = window.emit(event_name, IrisEvent::Status(format!("Agent action {} | {}", task.total_actions, task.current_step().map(|step| step.title.as_str()).unwrap_or("assessing request"))));
-        let context_feedback=if research.active() {format!("{feedback}\nResearch notebook: {}",research.notebook(budget.research.notebook_chars))} else {feedback.clone()};
+        let context_feedback=format!("{}{}",if research.active() {format!("{feedback}\nResearch notebook: {}",research.notebook(budget.research.notebook_chars))} else {feedback.clone()}, checklist);
         let messages = action_messages(&turn_request, &task, if direct_answer {None} else {previous.as_ref()}, &budget, &tools, &context_feedback, &previous_response);
         let can_stream = task.completion_ready().is_ok() && (!research.active() || research.ready());
         let generated = if let Some(action)=research_next.take() { Ok(serde_json::to_string(&action).map_err(|error|error.to_string())?) } else { next_action(&client, &task.model, messages, &budget, &control, repair_schema.take(), |delta| {
