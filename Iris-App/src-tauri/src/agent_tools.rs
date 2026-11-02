@@ -270,13 +270,18 @@ pub(super) async fn execute(
     let result: Result<Value,String> = async { Ok(match tool {
         "project_connections" => {
             let (project,store) = project_for_task(app,task)?;
-            // Eagerly fetch each linked bridge's live tool catalog so the model can call a tool in
-            // ONE step (call_project_tool) with the exact id, instead of the separate
-            // list_project_tools round-trip it frequently malforms. An unresponsive bridge is
-            // reported here with its error so the model can tell the user instead of looping.
+            let folder_set = !project.manipulation_root_path.trim().is_empty();
+            // When a project folder is set and ranked first (or no explicit order), do not probe the
+            // MCP bridge: reading files directly is more reliable and avoids launching the editor's
+            // debug instance on every call.
+            let folder_first = folder_set && (project.connection_priority.is_empty() || project.connection_priority.first().map(String::as_str) == Some("project"));
             let mut mcps = Vec::new();
             let mut any_reachable = false;
             for item in store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)) {
+                if folder_first {
+                    mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"linked_not_probed","note":"Linked but not probed, to avoid launching the editor; the project folder is preferred. Use call_project_tool on this bridge only for live editor state (the open scene, running errors) that files cannot give."}));
+                    continue;
+                }
                 match mcp_list_tools(item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone()).await {
                     Ok(catalog) => {
                         any_reachable = true;
@@ -316,6 +321,14 @@ pub(super) async fn execute(
             let can_bridge = !mcps.is_empty();
             let can_files = !repositories.is_empty();
             let auto_inspected = mcps.iter().any(|item| item.get("inspection").is_some());
+            // Deterministically list the project folder's files so the model answers from real data
+            // (a scene is a .tscn file) instead of orchestrating a project_files call it often malforms.
+            let (file_inventory, files_auto_listed) = if folder_set {
+                match local_files(&project.manipulation_root_path, &serde_json::json!({"action":"list"})) {
+                    Ok(listing) => (listing, true),
+                    Err(_) => (serde_json::Value::Null, false),
+                }
+            } else { (serde_json::Value::Null, false) };
             let mut preferred_order: Vec<String> = priority.iter().filter_map(|id| {
                 if id == "project" { return (!project.manipulation_root_path.is_empty()).then(|| "Project folder (direct file access)".to_string()); }
                 if let Some(found) = store.mcps.iter().find(|m| &m.id == id && m.enabled && project.mcp_ids.contains(&m.id)) { return Some(format!("MCP: {}", found.name)); }
@@ -332,7 +345,9 @@ pub(super) async fn execute(
             let folder_status = if can_files { "a project folder is connected for direct file access" } else { "no project folder is set for direct file access" };
             // Direct file access is the most reliable path for a small model, so prefer it; MCP
             // bridges are secondary and only needed for live-editor state a file read cannot give.
-            let guidance = if can_files {
+            let guidance = if files_auto_listed {
+                format!("The fileInventory field already lists this project's REAL files, read straight from the project folder — a scene is a .tscn file, a script is a .gd file. Answer file, scene, folder and script questions directly from fileInventory and NEVER invent names. For a file's contents use project_files action \"read\"; to change a file use project_files action \"write\" or \"replace\" (approval required). {bridge_status}; use call_project_tool on a bridge ONLY for live editor state fileInventory cannot give (the currently open scene, running errors).")
+            } else if can_files {
                 format!("Prefer direct file access ({folder_status}). Use project_files with action \"list\" or \"search\" to read the project's REAL files — scenes are .tscn files, scripts are .gd files, usually under res://. This is the reliable way to answer file, scene, folder and script questions: report only the filenames and contents it returns and never invent names. To change files use project_files action \"write\" or \"replace\" (approval required). Separately, {bridge_status}: use call_project_tool ONLY for live-editor state that a file read cannot give (the currently open scene, running errors, a live editor screenshot).")
             } else if auto_inspected {
                 "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from it; do not re-read the same thing. No project folder is set, so you cannot list files directly — tell the user they can set a 'Project folder (direct file access)' in Settings > Projects for reliable file and scene listings. Never invent scene, node, or file names beyond what the inspection shows.".to_string()
@@ -349,7 +364,7 @@ pub(super) async fn execute(
                 (!can_bridge).then(|| "MCP bridge".to_string()),
             ].into_iter().flatten().collect();
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
-                "mcps":mcps,"sshs":sshs,"repositories":repositories,
+                "mcps":mcps,"sshs":sshs,"repositories":repositories,"fileInventory":file_inventory,"filesAutoListed":files_auto_listed,
                 "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":preferred_order,"notHookedUp":not_hooked_up},
                 "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
         }
