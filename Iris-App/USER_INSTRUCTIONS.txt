@@ -1,0 +1,397 @@
+===============================================================================
+ IRIS - USER INSTRUCTIONS  (version 0.3.5 alpha)
+===============================================================================
+
+Iris is a local AI companion for your desktop. It chats, researches the web,
+reads and edits your projects (especially Godot game projects), looks at your
+screen, takes voice input, and can be used from your phone.
+
+ - The AI runs on YOUR computer (through Ollama). Nothing is sent to a cloud AI.
+ - Iris only goes online when you turn Network on.
+ - Anything risky (editing files, controlling apps) asks for your approval first.
+
+This file is also written so you can hand it to another AI agent that needs
+to operate Iris for you (see section 10).
+
+
+-------------------------------------------------------------------------------
+ CONTENTS
+-------------------------------------------------------------------------------
+  1. Install Iris (Windows, Mac, Android)
+  2. First launch
+  3. The window at a glance
+  4. Chatting
+  5. Voice input and spoken replies
+  6. What Iris can do for you
+  7. Settings tour
+  8. Working with a Godot project
+  9. Connect the Android app to the desktop app
+ 10. Letting another AI agent control Iris
+ 11. Reasoning logs and troubleshooting
+ 12. Privacy and safety
+ 13. Keyboard shortcuts
+
+
+===============================================================================
+ 1. INSTALL IRIS
+===============================================================================
+
+All downloads are on the Releases page:
+  https://github.com/KennyCrowPixels/Iris_for_Godot/releases
+Pick the newest release and look under "Assets".
+
+-------------------------------------------------------------------------------
+ 1A. Windows (10 or 11, 64-bit)
+-------------------------------------------------------------------------------
+ 1. Download   iris-app_<version>_x64-setup.exe   (or the .msi if you prefer).
+ 2. Run it. Windows SmartScreen may say "Windows protected your PC" because
+    alpha builds are not code-signed yet. Click "More info", then "Run anyway".
+ 3. Follow the installer, then open Iris from the Start menu.
+ 4. Continue with section 2 (First launch).
+
+-------------------------------------------------------------------------------
+ 1B. Mac (Apple Silicon: M1, M2, M3, M4)
+-------------------------------------------------------------------------------
+ 1. Download   iris-app_<version>_aarch64.dmg
+ 2. Open the .dmg and drag iris-app into Applications.
+ 3. Open it from Applications. Because alpha builds are not notarized yet,
+    macOS may block it the first time:
+      System Settings > Privacy & Security > scroll down > "Open Anyway".
+    Only do this for a build you downloaded from the official Releases page.
+ 4. For voice input on Mac, install the speech engine once (needs Homebrew,
+    from https://brew.sh):
+        brew install whisper-cpp
+ 5. Continue with section 2 (First launch).
+
+-------------------------------------------------------------------------------
+ 1C. Android phone (the "Iris Companion" app)
+-------------------------------------------------------------------------------
+ The phone app is a remote control for the desktop app. The desktop does all
+ the AI work, so the desktop app must be running.
+
+ 1. On the phone, open the Releases page and download
+        iris-companion-<version>.apk
+ 2. Tap the downloaded file. If Android asks, allow
+    "Install unknown apps" for your browser or Files app.
+ 3. If Google Play Protect warns about an unknown developer, tap
+    "More details" > "Install anyway". (Alpha builds are not on the Play Store.)
+ 4. Open "Iris Companion" and follow section 9 to pair it with your desktop.
+
+ Requires Android 7.0 or newer.
+
+-------------------------------------------------------------------------------
+ 1D. Building from source (developers only)
+-------------------------------------------------------------------------------
+ - Windows:  setup-windows.bat --dev --yes    then   launch-dev.bat
+ - Mac:      bash setup-macos.sh --dev --models balanced
+             then   bash launch-macos.command
+ - Android:  see iris-android-client/README.md
+ Details: README.md, CONTRIBUTING.md and docs/MACOS_SETUP.md.
+
+
+===============================================================================
+ 2. FIRST LAUNCH
+===============================================================================
+ 1. Iris needs Ollama (the free local AI runner). If it is missing, Iris
+    offers to install it and download its models. Let it finish; the models
+    are several gigabytes and only download once.
+ 2. Open Options > Settings > General and look at the
+    "First-Run Readiness Checklist". It shows what is set up and what is not.
+ 3. Optional but recommended:
+      - Settings > Network: turn Network on so Iris can search the web.
+      - Settings > Bridges: turn "Desktop Tools" on if you want Iris to see
+        your screen and work with other apps.
+ 4. Press + on the tab bar and say hello.
+
+
+===============================================================================
+ 3. THE WINDOW AT A GLANCE
+===============================================================================
+ Top bar
+  - File: new tab, close tab.
+  - Options: Settings, Tools Center, Agent Stats, Copy Reasoning Logs, and
+    panels you can show or hide. Hover any item to see what it does.
+  - Project (top right): attaches a project to the current chat.
+
+ Tabs
+  - Each tab is a separate chat. Press + to open one.
+  - Double-click a tab to rename it. Drag tabs to reorder them.
+
+ Chat area
+  - Your messages and Iris's replies, with time stamps.
+  - Hover a reply to copy it or to open its reasoning log.
+  - Hover your last message to edit and resend it.
+
+ Status strip (just above the message box, while Iris works)
+  - Shows what Iris is doing, how long it has taken, and steps or actions.
+  - Pause: stops and saves progress.     Resume: continues saved work.
+  - Book icon: the task's saved notes and checklist.
+  - "Reasoning log": the live list of what Iris is doing and why.
+
+ Message box (bottom)
+  - Microphone button: voice input (section 5).
+  - Arrow button: send.  While Iris works it becomes a Stop (square) button.
+
+
+===============================================================================
+ 4. CHATTING
+===============================================================================
+ - Type and press Enter to send. Shift+Enter makes a new line.
+ - Press the Up arrow in an empty box to bring back earlier messages.
+ - Attach images by dragging them onto the chat or pasting them (Ctrl+V).
+   The vision model describes them.
+ - Ask several things at once - Iris makes a checklist and covers each one.
+   Example: "What's the weather in Durham, NC and Honolulu, HI?"
+ - Follow-ups work: after a weather answer you can just say
+   "what about Chicago?". Iris remembers the topic of the conversation.
+ - Iris may pause a long task to save progress. Press Resume (or type
+   "continue") to pick up where it stopped.
+ - Stop the current work at any time with the square Stop button.
+
+
+===============================================================================
+ 5. VOICE INPUT AND SPOKEN REPLIES
+===============================================================================
+ Desktop app
+  1. Click the microphone button and talk.
+  2. Pause for a moment when you are done - Iris stops listening by itself
+     (or click the button again).
+  3. Your speech is turned into text ON YOUR COMPUTER and sent as a message.
+     Iris then reads its reply out loud. Use the speaker button to stop it.
+
+  Good to know:
+  - The first time, Iris downloads its speech engine and model (about 70 MB)
+    and shows the progress. After that it works offline.
+  - If you already typed something in the box, your dictation is ADDED to it
+    and NOT sent automatically. Read it over, then press Enter.
+  - Windows: if nothing is heard, check Settings > System > Sound > Input,
+    and Settings > Privacy & security > Microphone (allow desktop apps).
+  - Mac: allow Iris under System Settings > Privacy & Security > Microphone,
+    and install the engine once with:  brew install whisper-cpp
+
+ Phone app
+  - The microphone uses the phone's own speech recognition. Replies can be
+    spoken by the phone's voice.
+
+
+===============================================================================
+ 6. WHAT IRIS CAN DO FOR YOU
+===============================================================================
+ - Conversation and writing: questions, explanations, jokes, stories, code.
+ - Web research (Network must be on): Iris plans several searches, runs them
+   in parallel, reads the best pages, and writes an answer with numbered
+   sources. Ask for a format and it will follow it, for example:
+   "Research the game X and write a formal 5-paragraph essay on its themes,
+   features and reception."
+ - Live facts: current weather (one place or several at once).
+ - Your projects: list, read and edit files in a project folder, and tell you
+   which Godot scene is open (section 8).
+ - Your screen (Desktop Tools on): take a screenshot and describe what is
+   visible. The capture is real; the description comes from a small local
+   vision model and can miss details.
+ - Long tasks: Iris keeps task notes and a checklist, pauses safely, and
+   resumes later.
+ - Auto Tasks (Options > Autonomous Tasks Panel): recurring or scheduled
+   jobs. They run only while Iris is open.
+
+
+===============================================================================
+ 7. SETTINGS TOUR   (Options > Settings)
+===============================================================================
+ General
+  - Assistant name, Theme, Appearance (Dark/Light).
+  - Text & UI size: makes everything bigger or smaller.
+  - Keep Iris on top - "Compact & on top": shrinks Iris into the bottom-right
+    corner of your screen and keeps it above all other windows, so you can
+    chat while you work. Click again to restore the normal size.
+  - Permissions:
+      Balanced  - asks before risky actions (recommended).
+      Ask Often - asks before nearly everything.
+      Autopilot - keeps working until a task is done instead of stopping to
+                  check in. Risky actions still ask for approval.
+
+ Projects
+  - New Project, then give it a name and description.
+  - "Project folder (direct file access)" - Pick Folder and choose the
+    project on disk (for Godot, the folder that contains project.godot).
+    This is the most reliable way for Iris to read and edit a project.
+  - Link repositories, MCP bridges and SSH connections with the checkboxes.
+  - "Connection priority" (appears when a project has 2+ connections):
+    drag to choose which connection Iris should try first.
+
+ Repos
+  - Add reference folders (documentation, other code) Iris may read.
+
+ Bridges
+  - MCP connections (for example a Godot MCP plugin) and SSH connections.
+  - Desktop Tools: ON/OFF - lets Iris take screenshots and work with windows.
+
+ LLMs
+  - Which local models Iris uses (organizer, coder, summarizer, vision) and
+    model profile settings.
+
+ Network
+  - Turn web search on or off. Manual app update settings.
+
+ Server
+  - The companion/controller server for the phone app and other agents
+    (sections 9 and 10).
+
+
+===============================================================================
+ 8. WORKING WITH A GODOT PROJECT
+===============================================================================
+ Set up once
+  1. Settings > Projects > New Project. Name it.
+  2. "Project folder (direct file access)" > Pick Folder > choose the folder
+     that contains project.godot. Save.
+  3. In a chat, pick the project from the Project menu (top right).
+
+ Things to ask
+  - "What scenes are in the project?"  - Iris reads the real files.
+  - "Which scene is open in Godot right now?"
+       Iris reads the layout the Godot editor saves. Godot updates it when you
+       switch scenes or save, so switch or save first if the answer is stale.
+  - "Rename the Sphere node in SphereScene to Cube."
+  - "Show me player.gd" / "Find where jump_velocity is used."
+
+ How edits work
+  1. Iris shows an approval card with the exact change. Choose Yes or No.
+  2. Iris writes the change and reads the file back to confirm it.
+  3. If the scene is open in Godot, Godot will say the file changed on disk.
+     Choose "Reload" to see the change.
+  Tip: keep your project in Git (or make a backup) before big edits.
+
+ MCP bridge (optional)
+  - A Godot MCP plugin can give live editor information. Link it under
+    Settings > Projects. When the project folder is set and ranked first,
+    Iris works from the files and does not start the bridge for normal
+    questions. Some Godot MCP tools briefly open a "(DEBUG)" game window;
+    that is the bridge running your project, not Iris itself.
+
+
+===============================================================================
+ 9. CONNECT THE ANDROID APP TO THE DESKTOP APP
+===============================================================================
+ Before you start
+  - The phone and the computer must be on the SAME Wi-Fi network.
+  - The desktop Iris app must be open (it does the AI work and shows any
+    approvals).
+
+ On the desktop
+  1. Options > Settings > Server.
+  2. Tick these boxes:
+       [x] Read chats and task status
+       [x] Create chats, submit turns and cancel work   (needed to chat
+           from the phone)
+       [x] Allow companion devices on this Wi-Fi
+       [x] Auto-discovery (mDNS) for the Android companion   (optional; lets
+           the phone find the computer by itself)
+     Leave the Port at 1435 unless something else uses it.
+  3. Click "Start server".
+  4. The "Android companion pairing" box now shows the Host IP, the Port and
+     a 6-digit Pairing PIN. Keep it on screen.
+  5. If Windows asks whether to allow Iris on networks, allow
+     "Private networks" (your home Wi-Fi).
+
+ On the phone
+  1. Open Iris Companion.
+  2. Tap your computer in the discovered list, OR under "Or enter manually"
+     type the Host IP (for example 192.168.1.23) and port 1435.
+  3. Type the 6-digit Pairing PIN and tap "Pair & connect".
+  4. Chat. Your messages run on the desktop. Tap "Disconnect" when done.
+
+ If it does not connect
+  - Not in the list? Enter the Host IP and port by hand.
+  - Check that both devices use the same Wi-Fi (not a guest network) and
+    that the desktop server says "Listening".
+  - Windows Firewall: allow iris-app on Private networks
+    (Windows Security > Firewall & network protection > Allow an app).
+  - "Pairing is locked": too many wrong PINs. On the desktop click
+    "New pairing PIN" and use the new one.
+  - Turn off "Allow companion devices on this Wi-Fi" when you are on a
+    public network (cafe, airport, hotel).
+
+
+===============================================================================
+ 10. LETTING ANOTHER AI AGENT CONTROL IRIS
+===============================================================================
+ Another program or AI agent on this computer can drive Iris through the
+ Controller API (plain HTTP on 127.0.0.1, port 1435 by default).
+
+ Turn it on
+  1. Settings > Server: tick "Read chats and task status", and also
+     "Create chats, submit turns and cancel work" if the agent should send
+     messages.
+  2. Click "Start server", then "Copy token". Give the token to the agent
+     privately. Never paste it into a chat or commit it to code.
+  3. Every request must include the header:
+        Authorization: Bearer <token>
+
+ Endpoints (base URL http://127.0.0.1:1435)
+  GET  /v1/health                 - check the connection and permissions
+  GET  /v1/chats                  - list chats
+  POST /v1/chats                  - create a chat   body: {"title":"..."}
+  GET  /v1/chats/{id}             - read a chat's transcript and task state
+  POST /v1/chats/{id}/turns       - send a message
+                                    body: {"input":"...","networkAllowed":false}
+  GET  /v1/jobs/{id}              - check a sent message's progress/result
+  POST /v1/jobs/{id}/cancel       - stop it
+
+ Rules the agent should follow
+  - Send one message, then poll /v1/jobs/{id} until it finishes, then read
+    the chat. Only one remote message runs at a time.
+  - Approvals for risky actions still appear on the desktop for a human.
+  - Set "networkAllowed": true only when web research is needed (Network
+    must also be on in Settings).
+  - Rotating the token ("Revoke and rotate token") or stopping the server
+    disconnects the agent immediately.
+ Full reference: docs/CONTROLLER_API.md
+
+
+===============================================================================
+ 11. REASONING LOGS AND TROUBLESHOOTING
+===============================================================================
+ Reasoning logs
+  - Hover any reply and click the log icon to see how Iris handled it:
+    route, effort, checklist, searches, pages read, sources, and how long
+    it took ("answered in ...").
+  - Options > Copy Reasoning Logs copies every log in the current chat -
+    useful for bug reports.
+
+ Common problems
+  - Iris is slow to start answering: the first message after starting
+    loads the AI model into memory. Later messages are much faster.
+  - "Network is off": Settings > Network, turn it on.
+  - Iris cannot see the project: set the Project folder (section 8) and
+    attach the project to the chat.
+  - The message box is hidden: Settings > General > Text & UI size >
+    Default, then make the window larger.
+  - Voice does nothing: see section 5 for microphone permissions.
+  - A task stopped halfway: press Resume. Progress and notes are saved.
+
+
+===============================================================================
+ 12. PRIVACY AND SAFETY
+===============================================================================
+ - AI models run locally through Ollama. Your chats stay on your computer.
+ - Voice is transcribed on your computer (desktop) or phone (Android).
+ - Web access happens only when Network is on.
+ - File edits, app control and other risky actions need your approval.
+ - The phone link only works on your local Wi-Fi, needs the pairing PIN, and
+   uses a session token you can revoke at any time.
+
+
+===============================================================================
+ 13. KEYBOARD SHORTCUTS
+===============================================================================
+  Enter              Send message
+  Shift + Enter      New line
+  Up / Down arrow    Earlier / later messages you sent (in an empty box)
+  Ctrl + T           New tab
+  Ctrl + Shift + T   Reopen the last closed tab
+  Ctrl + V           Paste text or an image
+  Ctrl + A           (with the chat focused) select the whole conversation
+  On Mac, use Cmd instead of Ctrl.
+
+===============================================================================

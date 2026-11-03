@@ -50,6 +50,10 @@ export default function OllamaSetupModal({ onComplete }: Props) {
   const unlistenRefs = useRef<(() => void)[]>([]);
 
   useEffect(() => {
+    if (!(window as any).__TAURI_INTERNALS__) {
+      onComplete("missing-ollama");
+      return;
+    }
     listen<ModelProgressPayload>("ollama-setup-progress", (event) => {
       setModelProgress(event.payload);
       if (event.payload.phase === "done") setPhase("done");
@@ -75,10 +79,7 @@ export default function OllamaSetupModal({ onComplete }: Props) {
   async function checkSetup() {
     try {
       const flags = await invoke<SetupFlags>("get_setup_flags");
-      if (flags.ollamaVerified && flags.modelsVerified) {
-        onComplete("ready");
-        return;
-      }
+      void flags;
 
       const installed = await invoke<boolean>("check_ollama_installed");
       if (!installed) { setPhase("need-ollama"); return; }
@@ -87,7 +88,8 @@ export default function OllamaSetupModal({ onComplete }: Props) {
       await checkModels();
     } catch (e) {
       console.error("Ollama setup check failed:", e);
-      onComplete("ready");
+      setInstallError(String(e));
+      setPhase("install-error");
     }
   }
 
@@ -101,7 +103,8 @@ export default function OllamaSetupModal({ onComplete }: Props) {
       }
     } catch (e) {
       console.error("Model check failed:", e);
-      onComplete("ready");
+      setModelError(String(e));
+      setPhase("need-models");
     }
   }
 
@@ -111,7 +114,6 @@ export default function OllamaSetupModal({ onComplete }: Props) {
     setDlProgress(null);
     try {
       await invoke("download_and_install_ollama");
-      await invoke("set_setup_flags", { args: { ollamaVerified: true } });
       setPhase("awaiting-restart-ollama");
     } catch (e) {
       setInstallError(String(e));
@@ -227,11 +229,11 @@ export default function OllamaSetupModal({ onComplete }: Props) {
     return (
       <div className="setup-overlay">
         <div className="setup-modal">
-          <h2>Installer Launched</h2>
-          <p>Complete the Ollama installer that just opened, then restart this app.</p>
+          <h2>Ollama Installation</h2>
+          <p>Complete installation from the opened installer or official download page.</p>
           <div className="setup-buttons">
-            <button className="setup-btn primary" onClick={() => invoke("restart_app")}>
-              Restart App
+            <button className="setup-btn primary" onClick={() => { setPhase("checking"); void checkSetup(); }}>
+              Check Installation
             </button>
             <button className="setup-btn" onClick={() => onComplete("missing-ollama")}>
               Skip for Now
@@ -253,7 +255,7 @@ export default function OllamaSetupModal({ onComplete }: Props) {
             registered Ollama models?
           </p>
           <p className="setup-note">
-            This will download approximately 10 GB of model data and may take a while.
+            Download size depends on the selected profile. Models are downloaded one at a time.
           </p>
           {modelError && <p className="setup-error">{modelError}</p>}
           <div className="setup-buttons">

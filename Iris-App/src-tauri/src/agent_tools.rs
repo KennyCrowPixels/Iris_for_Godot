@@ -1,0 +1,603 @@
+use super::*;
+
+pub(super) fn catalog(flags: &SetupFlags) -> Vec<Value> {
+    let mut tools = vec![schema("project_connections", "List configured project and connection ids; not proof of connectivity.", serde_json::json!({}), &[])];
+    if flags.mcp_enabled {
+        tools.push(schema("list_project_tools", "List a linked MCP bridge's tools. connection_id is the exact mcp id from project_connections (mcp_id is also accepted).", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0}}), &[]));
+        tools.push(schema("call_project_tool", "Call one tool on a linked MCP bridge. connection_id is the exact mcp id (mcp_id accepted); tool_name is one of that bridge's listed tools. arguments defaults to {} when the tool takes none; effect defaults to read.", serde_json::json!({"connection_id":{"type":"string"},"mcp_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object"},"effect":{"enum":["read","write"]}}), &["tool_name"]));
+        tools.push(schema("ssh_action", "Use linked SSH within its root. Mutation/exec needs approval.", serde_json::json!({"connection_id":{"type":"string"},"action":{"enum":["list","read","write","mkdir","move","delete","exec"]},"arguments":{"type":"object"}}), &["connection_id","action","arguments"]));
+    }
+    if flags.repos_enabled {
+        tools.push(schema("project_files", "List/search all scoped files with pagination; read line ranges; write or exact replace with approval.", serde_json::json!({
+            "repo_id":{"type":"string"},"action":{"enum":["list","search","read","write","replace","mkdir","move","delete"]},
+            "path":{"type":"string"},"query":{"type":"string"},"extension":{"type":"string"},"offset":{"type":"integer","minimum":0},
+            "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"content":{"type":"string"},
+            "old_text":{"type":"string"},"new_text":{"type":"string"},"to":{"type":"string"},"overwrite":{"type":"boolean"}
+        }), &["repo_id","action"]));
+        if flags.network_enabled {
+            tools.push(schema("clone_repository", "Clone HTTPS repo into a linked root after approval; never runs repo code.", serde_json::json!({"repo_id":{"type":"string"},"url":{"type":"string"}}), &["repo_id","url"]));
+        }
+    }
+    if flags.network_enabled {
+        tools.push(schema("read_web_page", "Fetch HTTP(S) page text with source URL; offset reads long documents.", serde_json::json!({"url":{"type":"string"},"offset":{"type":"integer","minimum":0}}), &["url"]));
+    }
+    if flags.desktop_tools_enabled {
+        tools.push(schema("desktop_action", "Inspect windows or launch/focus an application. Focus/launch requires approval.", serde_json::json!({"action":{"enum":["list","focus","launch"]},"target":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}}), &["action"]));
+    }
+    tools
+}
+
+pub(super) fn handles(name: &str) -> bool {
+    matches!(name,"project_connections"|"list_project_tools"|"call_project_tool"|"project_files"|"ssh_action"|"clone_repository"|"read_web_page"|"desktop_action")
+}
+
+fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    serde_json::json!({"type":"function","function":{"name":name,"description":description,"parameters":{
+        "type":"object","properties":properties,"required":required,"additionalProperties":false
+    }}})
+}
+
+fn string_arg<'value>(args: &'value Value, key: &str) -> Result<&'value str, String> {
+    args.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty()).ok_or_else(|| format!("'{key}' is required"))
+}
+
+// The model often passes the bridge id as mcp_id (the guidance calls it the "mcp id"); accept the
+// common aliases so a correct intent is not rejected on a parameter-name technicality.
+fn connection_arg(args: &Value) -> Result<String, String> {
+    ["connection_id", "mcp_id", "connectionId", "id"].iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()))
+        .map(str::to_string)
+        .ok_or_else(|| "connection_id is required: use the exact mcp id shown in project_connections.".to_string())
+}
+
+fn project_for_task(app: &tauri::AppHandle, task: &AgentTask) -> Result<(ProjectDef, RepoProjectStore), String> {
+    let store = read_repo_project_store(app);
+    let project = store.projects.iter().find(|project| project.enabled && Some(&project.id) == task.project_id.as_ref())
+        .cloned().ok_or("This tab has no enabled linked project. Link it in Projects before project actions.")?;
+    Ok((project, store))
+}
+
+fn linked_mcp(app: &tauri::AppHandle, task: &AgentTask, id: &str) -> Result<McpConnection, String> {
+    let (project, store) = project_for_task(app, task)?;
+    let linked: Vec<McpConnection> = store.mcps.into_iter().filter(|connection| connection.enabled && project.mcp_ids.contains(&connection.id)).collect();
+    if linked.is_empty() { return Err("No MCP bridge is enabled and linked to this project.".into()); }
+    if let Some(found) = linked.iter().find(|connection| connection.id == id || connection.name == id) { return Ok(found.clone()); }
+    // A small model often passes the bridge's display name or a stale id. When exactly one bridge
+    // is linked, use it so a minor id mismatch does not block the whole inspection.
+    if linked.len() == 1 { return Ok(linked.into_iter().next().expect("one linked bridge")); }
+    Err(format!("No linked MCP bridge matches '{id}'. Linked bridge ids: {}.", linked.iter().map(|connection| connection.id.as_str()).collect::<Vec<_>>().join(", ")))
+}
+
+/// Pick the single most relevant read-only, no-argument bridge tool to auto-run for a
+/// project-structure question, so a small model gets the real data directly rather than having to
+/// orchestrate call_project_tool itself. Returns None when the goal is not about project structure
+/// or no safe matching tool exists.
+fn best_inspection_tool(catalog: &[McpToolInfo], goal: &str) -> Option<String> {
+    let goal = goal.to_lowercase();
+    let wants = ["scene", "node", "tree", "project", "current", "structure", "hierarchy", "script", "resource"];
+    let mentioned: Vec<&str> = wants.iter().copied().filter(|word| goal.contains(*word)).collect();
+    if mentioned.is_empty() { return None; }
+    let mutating = ["set", "create", "delete", "remove", "add", "write", "update", "move", "rename", "modify", "exec", "run", "save", "open", "close", "instantiate", "spawn"];
+    catalog.iter()
+        .filter(|tool| {
+            let name_lower = tool.name.to_lowercase();
+            if mutating.iter().any(|word| name_lower.contains(*word)) { return false; }
+            let read_only = tool.annotations.get("readOnlyHint").and_then(Value::as_bool).unwrap_or_else(|| {
+                let nd = format!("{} {}", tool.name, tool.description).to_lowercase();
+                ["get", "list", "read", "view", "tree", "show", "current", "fetch", "inspect"].iter().any(|word| nd.contains(*word))
+            });
+            let required_empty = tool.input_schema.get("required").and_then(Value::as_array).map(|items| items.is_empty()).unwrap_or(true);
+            read_only && required_empty
+        })
+        .filter_map(|tool| {
+            let nd = format!("{} {}", tool.name, tool.description).to_lowercase();
+            let score = mentioned.iter().filter(|word| nd.contains(**word)).count();
+            (score > 0).then(|| (score, tool.name.clone()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, name)| name)
+}
+
+fn linked_root(app: &tauri::AppHandle, task: &AgentTask, id: &str) -> Result<String, String> {
+    let (project, store) = project_for_task(app, task)?;
+    if id == "project" && !project.manipulation_root_path.trim().is_empty() { return Ok(project.manipulation_root_path); }
+    store.repos.into_iter().find(|repo| repo.enabled && repo.id == id && project.repo_ids.contains(&repo.id)).map(|repo| repo.path)
+        .ok_or("Repository is not enabled and linked to this project".into())
+}
+
+/// Which scenes the Godot editor has open, from the layout Godot saves on scene switches
+/// (.godot/editor/editor_layout.cfg). None for folders that are not Godot projects.
+fn godot_editor_state(root: &str) -> Option<Value> {
+    let root = std::path::Path::new(root);
+    let project_dir = if root.join("project.godot").is_file() { root.to_path_buf() } else {
+        fs::read_dir(root).ok()?.filter_map(Result::ok).map(|entry| entry.path()).find(|path| path.join("project.godot").is_file())?
+    };
+    let layout_path = project_dir.join(".godot").join("editor").join("editor_layout.cfg");
+    let layout = fs::read_to_string(&layout_path).ok()?;
+    let mut in_editor_node = false;
+    let mut current: Option<String> = None;
+    let mut open: Vec<String> = Vec::new();
+    for line in layout.lines().map(str::trim) {
+        if line.starts_with('[') { in_editor_node = line == "[EditorNode]"; continue; }
+        if !in_editor_node { continue; }
+        if let Some(value) = line.strip_prefix("current_scene=") {
+            current = Some(value.trim().trim_matches('"').to_string()).filter(|value| !value.is_empty());
+        } else if let Some(value) = line.strip_prefix("open_scenes=") {
+            open = value.split('"').skip(1).step_by(2).map(str::to_string).filter(|value| !value.is_empty()).collect();
+        }
+    }
+    let saved_seconds_ago = fs::metadata(&layout_path).and_then(|meta| meta.modified()).ok()
+        .and_then(|modified| modified.elapsed().ok()).map(|elapsed| elapsed.as_secs());
+    Some(serde_json::json!({"currentScene":current,"openScenes":open,"savedSecondsAgo":saved_seconds_ago,
+        "source":".godot/editor/editor_layout.cfg",
+        "note":"Saved by the Godot editor when a scene is switched or saved; it can lag a few seconds behind the live editor."}))
+}
+
+/// Full text of inventory files the request names (e.g. "SphereScene" -> Assets/Scenes/SphereScene.tscn),
+/// so the model can quote exact text for a replace instead of first orchestrating a read.
+fn mentioned_files(root: &str, inventory: &Value, goal: &str) -> Vec<Value> {
+    let goal = goal.to_lowercase();
+    inventory["entries"].as_array().into_iter().flatten()
+        .filter_map(|entry| entry["path"].as_str())
+        .filter(|path| {
+            let stem = std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_lowercase();
+            stem.chars().count() >= 4 && goal.contains(&stem)
+        })
+        .take(2)
+        .filter_map(|path| local_files(root, &serde_json::json!({"action":"read","path":path,"start_line":1,"end_line":300})).ok())
+        .collect()
+}
+
+async fn blocking_call<T: Send + 'static>(operation: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::time::timeout(Duration::from_secs(90), tokio::task::spawn_blocking(operation)).await
+        .map_err(|_| "External action timed out; outcome is unknown. Inspect state before retrying.".to_string())?
+        .map_err(|err| err.to_string())?
+}
+
+fn paged_text(text: &str, offset: usize, limit: usize) -> Value {
+    let total = text.chars().count();
+    serde_json::json!({"content":text.chars().skip(offset).take(limit).collect::<String>(),"offset":offset,"totalChars":total,
+        "complete":offset.saturating_add(limit)>=total,"nextOffset":if offset.saturating_add(limit)<total {Some(offset+limit)} else {None}})
+}
+
+fn local_files(root: &str, args: &Value) -> Result<Value, String> {
+    let action = string_arg(args, "action")?;
+    let relative = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let path = resolve_within_root(root, relative)?;
+    match action {
+        "list" | "search" => {
+            let extension = args.get("extension").and_then(Value::as_str).unwrap_or("").trim_start_matches('.');
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            if action=="search" && query.is_empty() { return Err("search requires a nonempty literal query".into()); }
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut matches: Vec<Value> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
+            let root_path = fs::canonicalize(root).map_err(|err| err.to_string())?;
+            let mut scanned = 0usize;
+            let mut capped = false;
+            for entry in ignore::WalkBuilder::new(&path).hidden(false).follow_links(false)
+                .filter_entry(|entry| !matches!(entry.file_name().to_str(),Some(".git"|".godot"|"node_modules"|"target")))
+                .sort_by_file_path(|left,right| left.cmp(right)).build() {
+                let entry = match entry { Ok(entry) => entry, Err(err) => { errors.push(err.to_string()); continue; } };
+                scanned += 1;
+                if scanned > 100_000 { capped = true; break; }
+                if entry.file_type().is_none_or(|kind| !kind.is_file()) { continue; }
+                let file = entry.path();
+                let relative = file.strip_prefix(&root_path).unwrap_or(file).to_string_lossy().replace('\\',"/");
+                if !extension.is_empty() && !file.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case(extension)) { continue; }
+                if action == "list" {
+                    if query.is_empty() || relative.to_lowercase().contains(&query) { matches.push(serde_json::json!({"path":relative})); }
+                } else if is_text_like_file(file) && file.metadata().map(|meta| meta.len() <= 2_000_000).unwrap_or(false) {
+                    match fs::read_to_string(file) {
+                        Ok(text) => for (index,line) in text.lines().enumerate() {
+                            if line.to_lowercase().contains(&query) {
+                                matches.push(serde_json::json!({"path":relative,"line":index+1,"text":excerpt(line,500)}));
+                                if matches.len() >= 20_000 { capped = true; break; }
+                            }
+                        },
+                        Err(err) => errors.push(format!("{relative}: {err}")),
+                    }
+                }
+                if capped { break; }
+            }
+            let total = matches.len();
+            let page: Vec<_> = matches.into_iter().skip(offset).take(80).collect();
+            Ok(serde_json::json!({"entries":page,"totalMatches":total,"inventoryComplete":!capped && errors.is_empty(),
+                "scope":"Gitignore-aware files within linked root; excludes generated dependency/build directories, symlinks; content search reads text files <= 2 MB", "errors":errors,
+                "nextOffset":if offset.saturating_add(80)<total {Some(offset+80)} else {None}}))
+        }
+        "read" => {
+            if fs::metadata(&path).map_err(|err| err.to_string())?.len()>4_000_000 { return Err("File exceeds 4 MB text-read limit".into()); }
+            let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+            let start = args.get("start_line").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+            let end = args.get("end_line").and_then(Value::as_u64).unwrap_or((start+159) as u64) as usize;
+            if end < start { return Err("end_line must be >= start_line".into()); }
+            let lines: Vec<_> = text.lines().collect();
+            let actual_end = end.min(start+299).min(lines.len());
+            let content = lines.iter().enumerate().skip(start-1).take(actual_end.saturating_sub(start-1))
+                .map(|(index,line)| format!("{}: {}",index+1,line)).collect::<Vec<_>>().join("\n");
+            Ok(serde_json::json!({"path":relative,"startLine":start,"endLine":actual_end,"totalLines":lines.len(),"complete":start==1 && actual_end==lines.len(),"content":content}))
+        }
+        "write" => {
+            if path.exists() && !args.get("overwrite").and_then(Value::as_bool).unwrap_or(false) { return Err("File exists. Read it and prefer exact replacement, or explicitly set overwrite.".into()); }
+            atomic_write_text(&path, string_arg(args,"content")?)?;
+            Ok(serde_json::json!({"saved":relative,"requiresReadback":true}))
+        }
+        "replace" => {
+            let original = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+            let old = string_arg(args,"old_text")?;
+            let replacement = args.get("new_text").and_then(Value::as_str).ok_or("new_text is required")?;
+            if original.matches(old).count()!=1 { return Err("old_text must occur exactly once; read the file and use exact surrounding context".into()); }
+            atomic_write_text(&path,&original.replacen(old,replacement,1))?;
+            Ok(serde_json::json!({"saved":relative,"requiresReadback":true}))
+        }
+        "mkdir" => { fs::create_dir_all(path).map_err(|err| err.to_string())?; Ok(serde_json::json!({"created":relative})) }
+        "move" => { let to = resolve_within_root(root,string_arg(args,"to")?)?; if to.exists() {return Err("Move target already exists".into());} fs::rename(path,to).map_err(|err| err.to_string())?; Ok(serde_json::json!({"moved":relative})) }
+        "delete" => { if path==fs::canonicalize(root).map_err(|err|err.to_string())? {return Err("Cannot delete the linked root".into());} if path.is_dir() { fs::remove_dir(path) } else { fs::remove_file(path) }.map_err(|err|err.to_string())?; Ok(serde_json::json!({"deleted":relative})) }
+        _ => Err("Unsupported local file action".into()),
+    }
+}
+
+pub(super) async fn read_web(url: &str, offset: usize) -> Result<Value, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|err| err.to_string())?;
+    if !matches!(parsed.scheme(),"https"|"http") || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Only HTTP(S) URLs without embedded credentials are supported".into());
+    }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(25)).redirect(reqwest::redirect::Policy::limited(5)).build().map_err(|err|err.to_string())?;
+    // A user-initiated page read; a browser-like agent avoids the blanket bot blocks many sites apply.
+    let response = client.get(parsed)
+        .header("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 Iris/0.3")
+        .header("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language","en-US,en;q=0.9")
+        .send().await.map_err(|err|err.to_string())?.error_for_status().map_err(|err|err.to_string())?;
+    let final_url = response.url().to_string();
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value|value.to_str().ok()).unwrap_or("text/html").to_string();
+    if !content_type.starts_with("text/") && !content_type.contains("json") && !content_type.contains("xhtml") {
+        return Err(format!("Unsupported page content type: {content_type}. Use an HTML or text source."));
+    }
+    let body = read_bounded_network_text(response, 2_000_000).await?;
+    extract_web_content(&body, &content_type, &final_url, offset)
+}
+
+fn extract_web_content(body: &str, content_type: &str, url: &str, offset: usize) -> Result<Value, String> {
+    let (text, title, published, links) = if content_type.contains("html") {
+        let html = Html::parse_document(body);
+        let main_selector=Selector::parse("main, [role=main]").unwrap();
+        let article_selector=Selector::parse("article").unwrap();
+        let body_selector=Selector::parse("body").unwrap();
+        let mut articles=html.select(&article_selector);
+        let single_article=articles.next().filter(|_|articles.next().is_none());
+        let root=html.select(&main_selector).next().or(single_article).or_else(||html.select(&body_selector).next()).unwrap_or_else(||html.root_element());
+        let text = root.descendants().filter_map(|node| {
+            let scraper::Node::Text(text) = node.value() else { return None; };
+            let hidden = node.ancestors().filter_map(scraper::ElementRef::wrap).any(|ancestor| {
+                matches!(ancestor.value().name(), "script"|"style"|"noscript"|"nav"|"header"|"footer"|"aside"|"form"|"svg")
+                    || ancestor.value().attr("hidden").is_some() || ancestor.value().attr("aria-hidden") == Some("true")
+            });
+            if hidden { None } else { Some(text.text.to_string()) }
+        }).collect::<Vec<_>>().join(" ");
+        let title = html.select(&Selector::parse("title").unwrap()).next().map(|node|node.text().collect::<String>()).unwrap_or_default();
+        let published = html.select(&Selector::parse("meta[property='article:published_time'], meta[name='date'], meta[itemprop='datePublished']").unwrap())
+            .find_map(|node|node.value().attr("content").or_else(||node.value().attr("datetime"))).map(str::to_string);
+        let mut seen=HashSet::new();
+        let base=reqwest::Url::parse(url).ok();
+        let links=root.select(&Selector::parse("a[href]").unwrap()).filter_map(|anchor| {
+            if anchor.ancestors().filter_map(scraper::ElementRef::wrap).any(|ancestor|matches!(ancestor.value().name(),"nav"|"footer"|"header"|"aside")) {return None;}
+            let destination=base.as_ref()?.join(anchor.value().attr("href")?).ok()?;
+            let title=anchor.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+            if !matches!(destination.scheme(),"http"|"https") || !destination.username().is_empty() || destination.password().is_some() || title.len()<8 || !seen.insert(destination.to_string()) {return None;}
+            Some(json!({"title":excerpt(&title,180),"url":destination.to_string(),"snippet":"Link from retrieved source page"}))
+        }).take(24).collect::<Vec<_>>();
+        (text, title, published, links)
+    } else { (body.to_string(), String::new(), None, Vec::new()) };
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() { return Err("The page has no readable text; it may require JavaScript or block automated access. Try another source.".into()); }
+    Ok(serde_json::json!({"url":url,"title":excerpt(&title,200),"publishedAt":published,"retrievedAt":now_ts(),"evidenceKind":"page_text","page":paged_text(&normalized,offset,6000),"links":links}))
+}
+
+pub(super) fn requires_plan(tool: &str, args: &Value) -> bool {
+    match tool {
+        // An exact-text replace is approved by the user and read back automatically, so it does not
+        // also need a multi-step plan; creating, moving or deleting files still does.
+        "project_files" => !matches!(args["action"].as_str(), Some("list" | "search" | "read" | "replace")),
+        "ssh_action" => !matches!(args["action"].as_str(), Some("list" | "read")),
+        "desktop_action" => args["action"].as_str() != Some("list"),
+        "call_project_tool" => args.get("effect").and_then(Value::as_str) == Some("write"),
+        "clone_repository" => true,
+        _ => false,
+    }
+}
+
+pub(super) async fn execute(
+    app: &tauri::AppHandle, window: &tauri::Window, event_name: &str, control: &RunControl,
+    task: &AgentTask, tool: &str, args: &Value, policy_read_only: bool,
+) -> Result<AgentToolResult, String> {
+    if requires_plan(tool,args) && task.steps.is_empty() {
+        return Err("Plan small steps with verifiable acceptance criteria before project/desktop work".into());
+    }
+    let mut attempted_mutation = false;
+    let mut verifies_state = !matches!(tool,"project_connections"|"list_project_tools");
+    let result: Result<Value,String> = async { Ok(match tool {
+        "project_connections" => {
+            let (project,store) = project_for_task(app,task)?;
+            let folder_set = !project.manipulation_root_path.trim().is_empty();
+            // When a project folder is set and ranked first (or no explicit order), do not probe the
+            // MCP bridge: reading files directly is more reliable and avoids launching the editor's
+            // debug instance on every call.
+            let folder_first = folder_set && (project.connection_priority.is_empty() || project.connection_priority.first().map(String::as_str) == Some("project"));
+            let mut mcps = Vec::new();
+            let mut any_reachable = false;
+            for item in store.mcps.iter().filter(|item| item.enabled && project.mcp_ids.contains(&item.id)) {
+                if folder_first {
+                    mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"linked_not_probed","note":"Linked but not probed, to avoid launching the editor; the project folder is preferred. Use call_project_tool on this bridge only for live editor state (the open scene, running errors) that files cannot give."}));
+                    continue;
+                }
+                match mcp_list_tools(item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone()).await {
+                    Ok(catalog) => {
+                        any_reachable = true;
+                        // Include each tool's required-argument names and a compact arg-type hint so
+                        // the model can form a valid call_project_tool for ANY subtask (not just reads)
+                        // without a separate schema round-trip it tends to malform.
+                        let tools = catalog.iter().take(40).map(|entry| {
+                            let required = entry.input_schema.get("required").and_then(Value::as_array).cloned().unwrap_or_default();
+                            let args_hint = entry.input_schema.get("properties").and_then(Value::as_object)
+                                .map(|props| props.iter().map(|(key, value)| format!("{}:{}", key, value.get("type").and_then(Value::as_str).unwrap_or("any"))).collect::<Vec<_>>().join(", "))
+                                .unwrap_or_default();
+                            serde_json::json!({"tool_name":entry.name,"description":excerpt(&entry.description,140),"requiredArgs":required,"args":excerpt(&args_hint,220)})
+                        }).collect::<Vec<_>>();
+                        let mut entry = serde_json::json!({"id":item.id,"name":item.name,"status":"connected","toolCount":catalog.len(),"tools":tools});
+                        // Auto-run the single most relevant no-argument read tool so the model gets
+                        // the real project data up front instead of having to orchestrate the call.
+                        if let Some(best) = best_inspection_tool(&catalog, &task.goal) {
+                            let (id,target,ctype,cmd,cargs,tname) = (item.id.clone(),item.target.clone(),item.connection_type.clone(),item.launch_command.clone(),item.launch_args.clone(),best.clone());
+                            if let Ok(result) = blocking_call(move|| mcp_call_tool(id,target,ctype,cmd,cargs,tname,serde_json::json!({}))).await {
+                                if !mcp_response_has_error(&result) {
+                                    entry["inspection"] = serde_json::json!({"tool_name":best,"result":result});
+                                }
+                            }
+                        }
+                        mcps.push(entry);
+                    }
+                    Err(error) => mcps.push(serde_json::json!({"id":item.id,"name":item.name,"status":"unreachable","error":excerpt(&error,400)})),
+                }
+            }
+            let sshs = store.sshs.iter().filter(|item| item.enabled && project.ssh_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name,"root":item.remote_root})).collect::<Vec<_>>();
+            let mut repositories = store.repos.iter().filter(|item| item.enabled && project.repo_ids.contains(&item.id)).map(|item|serde_json::json!({"id":item.id,"name":item.name})).chain((!project.manipulation_root_path.is_empty()).then(||serde_json::json!({"id":"project","name":"Project root"}))).collect::<Vec<_>>();
+            // Honor the user's configured connection-priority order (ids; "project" is the folder).
+            let priority = project.connection_priority.clone();
+            let prio_rank = |value: &Value| priority.iter().position(|key| Some(key.as_str()) == value.get("id").and_then(Value::as_str)).unwrap_or(usize::MAX);
+            mcps.sort_by_key(|item| prio_rank(item));
+            repositories.sort_by_key(|item| prio_rank(item));
+            let can_bridge = !mcps.is_empty();
+            let can_files = !repositories.is_empty();
+            let auto_inspected = mcps.iter().any(|item| item.get("inspection").is_some());
+            // Deterministically list the project folder's files so the model answers from real data
+            // (a scene is a .tscn file) instead of orchestrating a project_files call it often malforms.
+            let (file_inventory, files_auto_listed) = if folder_set {
+                match local_files(&project.manipulation_root_path, &serde_json::json!({"action":"list"})) {
+                    Ok(listing) => (listing, true),
+                    Err(_) => (serde_json::Value::Null, false),
+                }
+            } else { (serde_json::Value::Null, false) };
+            let editor_state = if folder_set { godot_editor_state(&project.manipulation_root_path) } else { None };
+            let named_files = if files_auto_listed { mentioned_files(&project.manipulation_root_path, &file_inventory, &task.goal) } else { Vec::new() };
+            let mut preferred_order: Vec<String> = priority.iter().filter_map(|id| {
+                if id == "project" { return (!project.manipulation_root_path.is_empty()).then(|| "Project folder (direct file access)".to_string()); }
+                if let Some(found) = store.mcps.iter().find(|m| &m.id == id && m.enabled && project.mcp_ids.contains(&m.id)) { return Some(format!("MCP: {}", found.name)); }
+                if let Some(found) = store.sshs.iter().find(|s| &s.id == id && s.enabled && project.ssh_ids.contains(&s.id)) { return Some(format!("SSH: {}", found.name)); }
+                if let Some(found) = store.repos.iter().find(|r| &r.id == id && r.enabled && project.repo_ids.contains(&r.id)) { return Some(format!("repo: {}", found.name)); }
+                None
+            }).collect();
+            if preferred_order.is_empty() {
+                if can_files { preferred_order.push("Project folder (direct file access)".to_string()); }
+                if can_bridge { preferred_order.push("MCP bridge".to_string()); }
+            }
+            let priority_note = if priority.is_empty() { String::new() } else { format!("User-configured connection priority (use the highest available first): {}. ", preferred_order.join(" > ")) };
+            let bridge_status = if !can_bridge { "no MCP bridge is linked" } else if any_reachable { "an MCP bridge is connected" } else { "an MCP bridge is linked but did not respond" };
+            let folder_status = if can_files { "a project folder is connected for direct file access" } else { "no project folder is set for direct file access" };
+            // Direct file access is the most reliable path for a small model, so prefer it; MCP
+            // bridges are secondary and only needed for live-editor state a file read cannot give.
+            let guidance = if files_auto_listed {
+                format!("The fileInventory field already lists this project's REAL files, read straight from the project folder — a scene is a .tscn file, a script is a .gd file. Answer file, scene, folder and script questions directly from fileInventory and NEVER invent names.{} {} To change a file, call project_files with action \"replace\", repo_id \"project\", the file's path, old_text copied EXACTLY from its content and new_text (the user approves the edit; Iris reads it back automatically). In a .tscn, a node is a line like [node name=\"Sphere\" type=\"MeshInstance3D\" ...] and its mesh is a [sub_resource type=\"SphereMesh\" ...]; replace those exact lines. {bridge_status}; use call_project_tool on a bridge ONLY for live editor state not covered here.",
+                    if editor_state.is_some() { " editorState.currentScene is the scene currently open in the Godot editor (and openScenes lists its open tabs) — use it for 'which scene is open'." } else { "" },
+                    if named_files.is_empty() { "For a file's contents use project_files action \"read\".".to_string() } else { format!("mentionedFiles already contains the full text of {} — use it directly; do not read it again.", named_files.iter().filter_map(|file| file["path"].as_str()).collect::<Vec<_>>().join(", ")) })
+            } else if can_files {
+                format!("Prefer direct file access ({folder_status}). Use project_files with action \"list\" or \"search\" to read the project's REAL files — scenes are .tscn files, scripts are .gd files, usually under res://. This is the reliable way to answer file, scene, folder and script questions: report only the filenames and contents it returns and never invent names. To change files use project_files action \"write\" or \"replace\" (approval required). Separately, {bridge_status}: use call_project_tool ONLY for live-editor state that a file read cannot give (the currently open scene, running errors, a live editor screenshot).")
+            } else if auto_inspected {
+                "A connected bridge's 'inspection' field already contains REAL project data that was just read for you. Answer the user directly from it; do not re-read the same thing. No project folder is set, so you cannot list files directly — tell the user they can set a 'Project folder (direct file access)' in Settings > Projects for reliable file and scene listings. Never invent scene, node, or file names beyond what the inspection shows.".to_string()
+            } else if any_reachable {
+                "No project folder is set for direct file access, but an MCP bridge is connected. Each mcps entry lists its tools with requiredArgs and arg types; choose the single most relevant tool and call call_project_tool with connection_id (or omit it when only one bridge is linked), tool_name, arguments built from requiredArgs (use {} when none), and effect \"read\" or \"write\". Work one call at a time and report ONLY what it returns. For more reliable file and scene listings, tell the user they can set a 'Project folder (direct file access)' in Settings > Projects. Never invent names.".to_string()
+            } else if can_bridge {
+                "Nothing is reachable: no project folder is set for direct file access, and the linked MCP bridge(s) did not respond (see each mcps entry's error). Tell the user plainly what is not hooked up — either set a 'Project folder (direct file access)' in Settings > Projects for reliable file access, or fix the bridge (for a Godot/GDAI bridge, confirm the editor is open with the MCP plugin active and the launch command installed). Do NOT invent scene, node, or file names.".to_string()
+            } else {
+                "This project has nothing connected: no project folder for direct file access and no linked MCP bridge or repository. You cannot inspect its scenes, nodes, or files. Tell the user to set a 'Project folder (direct file access)' in Settings > Projects (most reliable), or link an MCP bridge or repository, and do not invent any names.".to_string()
+            };
+            let guidance = format!("{priority_note}{guidance}");
+            let not_hooked_up: Vec<String> = [
+                (!can_files).then(|| "project folder for direct file access".to_string()),
+                (!can_bridge).then(|| "MCP bridge".to_string()),
+            ].into_iter().flatten().collect();
+            serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
+                "mcps":mcps,"sshs":sshs,"repositories":repositories,"fileInventory":file_inventory,"filesAutoListed":files_auto_listed,"editorState":editor_state,"mentionedFiles":named_files,
+                "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":preferred_order,"notHookedUp":not_hooked_up},
+                "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
+        }
+        "list_project_tools" | "call_project_tool" => {
+            let conn_id = connection_arg(args).unwrap_or_default();
+            let connection = linked_mcp(app,task,&conn_id)?;
+            let catalog = mcp_list_tools(connection.id.clone(),connection.target.clone(),connection.connection_type.clone(),connection.launch_command.clone(),connection.launch_args.clone()).await?;
+            if tool=="list_project_tools" {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("").to_lowercase();
+                let filtered:Vec<_> = catalog.into_iter().filter(|entry| query.is_empty() || format!("{} {}",entry.name,entry.description).to_lowercase().contains(&query)).collect();
+                let total = filtered.len();
+                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                serde_json::json!({"tools":filtered.into_iter().skip(offset).take(8).collect::<Vec<_>>(),"totalTools":total,"nextOffset":if offset+8<total {Some(offset+8)}else{None}})
+            } else {
+                let name = string_arg(args,"tool_name")?.to_string();
+                let entry = catalog.iter().find(|entry|entry.name==name).ok_or("Tool is not advertised by this MCP server")?;
+                let arguments = args.get("arguments").cloned().filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+                let validator = jsonschema::validator_for(&entry.input_schema).map_err(|err|format!("Server schema is invalid: {err}"))?;
+                if let Err(err) = validator.validate(&arguments) { return Err(format!("MCP arguments failed validation: {err}. Correct them; no call was made.")); }
+                let read_only_hint = entry.annotations.get("readOnlyHint").and_then(Value::as_bool);
+                let read_only = read_only_hint.unwrap_or(args.get("effect").and_then(Value::as_str) != Some("write"));
+                if !read_only && task.steps.is_empty() { return Err("This MCP operation changes state. Create a small verifiable plan before executing it.".into()); }
+                if policy_read_only && read_only_hint != Some(true) {return Err("Read-only policy requires an explicitly read-only MCP capability".into());}
+                verifies_state = read_only;
+                if read_only_hint != Some(true) {
+                    approve(window,event_name,control,&format!("{} MCP {} / {}",if read_only {"Read-only request:"}else{"Change request:"},connection.name,name),&arguments.to_string()).await?;
+                    attempted_mutation = !read_only;
+                }
+                let kill_id = connection.id.clone();
+                let operation = blocking_call(move||mcp_call_tool(connection.id,connection.target,connection.connection_type,connection.launch_command,connection.launch_args,name,arguments));
+                let response = tokio::select! {
+                    _ = control.cancelled() => { kill_mcp_by_pid_if_known(&kill_id); Err("Cancelled MCP call; inspect target state before retrying".into()) },
+                    response = operation => response,
+                };
+                if response.is_err() { kill_mcp_by_pid_if_known(&kill_id); }
+                response?
+            }
+        }
+        "project_files" => {
+            let root = linked_root(app,task,string_arg(args,"repo_id")?)?;
+            let action = string_arg(args,"action")?;
+            verifies_state = matches!(action,"list"|"search"|"read");
+            if !verifies_state {
+                if args["repo_id"].as_str()!=Some("project") {return Err("Reference repositories are read-only. Set a project manipulation root to enable approved edits.".into());}
+                if policy_read_only {return Err("This turn is read-only; repository changes are disabled".into());}
+                approve(window,event_name,control,&format!("Local repository {action}"),&args.to_string()).await?;
+                attempted_mutation = true;
+            }
+            let arguments = args.clone();
+            blocking_call(move||local_files(&root,&arguments)).await?
+        }
+        "ssh_action" => {
+            let (project,store) = project_for_task(app,task)?;
+            let id = string_arg(args,"connection_id")?;
+            let connection = store.sshs.into_iter().find(|connection|connection.enabled && connection.id==id && project.ssh_ids.contains(&connection.id)).ok_or("SSH connection is not linked")?;
+            let action = string_arg(args,"action")?.to_string();
+            let arguments = args.get("arguments").cloned().ok_or("arguments is required")?;
+            verifies_state = matches!(action.as_str(),"list"|"read");
+            if !verifies_state {
+                if policy_read_only {return Err("This turn is read-only; SSH changes are disabled".into());}
+                approve(window,event_name,control,&format!("SSH {} / {}",connection.name,action),&arguments.to_string()).await?;
+                attempted_mutation = true;
+            }
+            blocking_call(move||ssh_tool_call(connection,action,arguments)).await?
+        }
+        "clone_repository" => {
+            if args["repo_id"].as_str()!=Some("project") {return Err("Clone only into the configured project manipulation root".into());}
+            if policy_read_only {return Err("This turn is read-only; cloning is disabled".into());}
+            let root = linked_root(app,task,string_arg(args,"repo_id")?)?;
+            let url = string_arg(args,"url")?.to_string();
+            let parsed = reqwest::Url::parse(&url).map_err(|err|err.to_string())?;
+            if parsed.scheme()!="https" || !parsed.username().is_empty() || parsed.password().is_some() { return Err("Use HTTPS without embedded credentials".into()); }
+            approve(window,event_name,control,"Clone repository",&format!("{url} into {root}")).await?;
+            attempted_mutation = true;
+            verifies_state = false;
+            serde_json::json!({"result":blocking_call(move||clone_repo_into_folder(url,root)).await?})
+        }
+        "read_web_page" => read_web(string_arg(args,"url")?,args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize).await?,
+        "desktop_action" => {
+            let action = string_arg(args,"action")?;
+            if action=="list" { serde_json::to_value(blocking_call(list_windows).await?).map_err(|err|err.to_string())? }
+            else {
+                if policy_read_only {return Err("This turn is read-only; desktop actions are disabled".into());}
+                let target = string_arg(args,"target")?.to_string();
+                approve(window,event_name,control,&format!("Desktop {action}"),&args.to_string()).await?;
+                attempted_mutation = true;
+                verifies_state = false;
+                let arguments = args.get("args").and_then(Value::as_array).map(|items|items.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>());
+                serde_json::json!({"result":if action=="focus" {blocking_call(move||focus_window_by_title(target)).await?} else {blocking_call(move||launch_desktop_item(target,arguments)).await?}})
+            }
+        }
+        _ => return Err("Unsupported project tool".into()),
+    }) }.await;
+    let (value,ok) = match result {
+        Ok(value) => { let ok = !mcp_response_has_error(&value); (value,ok) },
+        Err(error) => (serde_json::json!({"error":error,"outcomeUnknown":attempted_mutation}),false),
+    };
+    Ok(AgentToolResult { value, ok, verifies_state, side_effect_attempted: attempted_mutation })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn godot_editor_layout_reveals_the_open_scene() {
+        let root = std::env::temp_dir().join(format!("iris_godot_layout_{}", std::process::id()));
+        let editor = root.join(".godot").join("editor");
+        fs::create_dir_all(&editor).unwrap();
+        fs::write(root.join("project.godot"), "config_version=5").unwrap();
+        fs::write(editor.join("editor_layout.cfg"), "[docks]\ndock_split=0\n\n[EditorNode]\n\nopen_scenes=PackedStringArray(\"res://Assets/Scenes/SphereScene.tscn\", \"res://main.tscn\")\ncurrent_scene=\"res://Assets/Scenes/SphereScene.tscn\"\n").unwrap();
+        let state = godot_editor_state(root.to_str().unwrap()).unwrap();
+        assert_eq!(state["currentScene"], "res://Assets/Scenes/SphereScene.tscn");
+        assert_eq!(state["openScenes"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&root);
+        assert!(godot_editor_state(root.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn inspection_can_inform_a_plan_but_mutations_still_require_one() {
+        for (tool,args) in [
+            ("list_project_tools",json!({"connection_id":"godot"})),
+            ("project_files",json!({"action":"read"})),
+            ("project_files",json!({"action":"search"})),
+            ("call_project_tool",json!({"effect":"read"})),
+            ("ssh_action",json!({"action":"list"})),
+            ("desktop_action",json!({"action":"list"})),
+        ] { assert!(!requires_plan(tool,&args),"{tool}"); }
+        assert!(requires_plan("project_files",&json!({"action":"write"})));
+        assert!(requires_plan("call_project_tool",&json!({"effect":"write"})));
+        assert!(requires_plan("ssh_action",&json!({"action":"exec"})));
+    }
+
+    #[test]
+    fn web_content_prefers_article_and_excludes_hidden_scripts() {
+        let page = extract_web_content("<html><head><title>Release notes</title><meta property='article:published_time' content='2026-10-27'></head><body><nav>Navigation noise</nav><article><h1>New series</h1><p>Announced, not yet released.</p><script>hidden instructions</script><div hidden>hidden text</div></article><footer>Legal boilerplate</footer></body></html>", "text/html", "https://example.com/series", 0).unwrap();
+        assert_eq!(page["page"]["content"], "New series Announced, not yet released.");
+        assert_eq!(page["title"], "Release notes");
+        assert_eq!(page["publishedAt"], "2026-10-27");
+        assert!(extract_web_content("", "text/plain", "source", 0).is_err());
+    }
+
+    #[test]
+    fn news_indexes_keep_all_main_articles_and_followable_links() {
+        let page=extract_web_content("<main><article><a href='/first'>First dated report</a></article><article><a href='/second'>Second dated report</a></article></main>","text/html","https://example.com/news",0).unwrap();
+        assert!(page["page"]["content"].as_str().unwrap().contains("Second dated report"));
+        assert_eq!(page["links"][1]["url"],"https://example.com/second");
+    }
+
+    #[test]
+    fn catalog_schemas_reject_extra_and_missing_fields() {
+        for tool in catalog(&SetupFlags::default()) {
+            let validator = jsonschema::validator_for(&tool["function"]["parameters"]).unwrap();
+            assert!(!validator.is_valid(&serde_json::json!({"invented":true})));
+        }
+    }
+
+    #[test]
+    fn file_inventory_counts_all_scenes_and_reads_ranges() {
+        let root = std::env::temp_dir().join(format!("iris_inventory_{}_{}",std::process::id(),NEXT_ID.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir_all(root.join("Scenes")).unwrap();
+        for index in 0..6 { fs::write(root.join(format!("Scenes/scene{index}.tscn")), "first\nsecond\nthird").unwrap(); }
+        fs::write(root.join("icon.svg"),"icon").unwrap();
+        let root_string = root.to_string_lossy();
+        let inventory = local_files(&root_string,&serde_json::json!({"action":"list","extension":"tscn"})).unwrap();
+        assert_eq!(inventory["totalMatches"],6);
+        assert_eq!(inventory["inventoryComplete"],true);
+        let read = local_files(&root_string,&serde_json::json!({"action":"read","path":"Scenes/scene0.tscn","start_line":2,"end_line":2})).unwrap();
+        assert_eq!(read["content"],"2: second");
+        assert_eq!(read["complete"],false);
+        assert!(local_files(&root_string,&serde_json::json!({"action":"read","path":"../outside.txt"})).is_err());
+        assert!(local_files(&root_string,&serde_json::json!({"action":"write","path":"Scenes/scene0.tscn","content":"oops"})).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_error_detection_does_not_reject_source_code() {
+        assert!(!mcp_response_has_error(&serde_json::json!({"content":[{"type":"text","text":"if error: print('failed')"}]})));
+        assert!(mcp_response_has_error(&serde_json::json!({"isError":true,"content":[]})));
+        assert!(mcp_response_has_error(&serde_json::json!({"content":[{"type":"text","text":"{\"ok\":false}"}]})));
+    }
+}

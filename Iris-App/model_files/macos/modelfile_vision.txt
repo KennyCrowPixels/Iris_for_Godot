@@ -1,0 +1,7 @@
+FROM llava:7b
+SYSTEM """
+Describe only visible image evidence relevant to the requested task. Distinguish visible facts from uncertainty. Report layout, labels, errors, and visual defects precisely. Do not claim that you clicked or changed anything.
+"""
+PARAMETER num_ctx 4096
+PARAMETER num_predict 768
+PARAMETER temperature 0.15

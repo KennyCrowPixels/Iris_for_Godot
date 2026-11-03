@@ -1,0 +1,42 @@
+name: Cross-Platform Checks
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - run: node scripts/setup-models.mjs --profile balanced --check
+      - run: node scripts/setup-models.mjs --profile 13b --check
+      - run: node scripts/setup-models.mjs --profile 14b --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Check Mac launcher syntax
+        if: runner.os == 'macOS'
+        run: |
+          bash -n setup-macos.sh
+          bash -n launch-macos.command
+      - name: Build macOS app and DMG
+        if: runner.os == 'macOS'
+        run: npm run tauri:build -- --bundles app,dmg
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: iris-macos-test-bundles
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

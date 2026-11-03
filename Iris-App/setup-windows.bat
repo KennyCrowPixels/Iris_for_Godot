@@ -5,6 +5,7 @@ pushd "%~dp0"
 set "MODE=dev"
 set "AUTO_YES=0"
 set "INCLUDE_BUILD_TOOLS=1"
+set "INSTALL_MODELS=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -16,6 +17,8 @@ if /I "%~1"=="--dev" (
   set "AUTO_YES=1"
 ) else if /I "%~1"=="--skip-buildtools" (
   set "INCLUDE_BUILD_TOOLS=0"
+) else if /I "%~1"=="--with-models" (
+  set "INSTALL_MODELS=1"
 )
 shift
 goto parse_args
@@ -34,6 +37,9 @@ call :ensure_command "node" "OpenJS.NodeJS.LTS" "Node.js LTS" || goto failed
 call :step 30 "Checking Rust toolchain..."
 call :ensure_command "cargo" "Rustlang.Rustup" "Rust (rustup + cargo)" || goto failed
 
+call :step 38 "Checking Ollama..."
+call :ensure_command "ollama" "Ollama.Ollama" "Ollama" || goto failed
+
 if "%INCLUDE_BUILD_TOOLS%"=="1" (
   call :step 45 "Checking C++ Build Tools..."
   call :ensure_build_tools || goto failed
@@ -42,24 +48,31 @@ if "%INCLUDE_BUILD_TOOLS%"=="1" (
 call :step 58 "Refreshing PATH for this terminal..."
 if exist "%ProgramFiles%\nodejs" set "PATH=%ProgramFiles%\nodejs;%PATH%"
 if exist "%USERPROFILE%\.cargo\bin" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+if exist "%LOCALAPPDATA%\Programs\Ollama" set "PATH=%LOCALAPPDATA%\Programs\Ollama;%PATH%"
 
 call :step 64 "Ensuring stable Rust toolchain..."
 if exist "%USERPROFILE%\.cargo\bin\rustup.exe" (
   call rustup default stable >nul 2>nul
 )
 
-call :step 72 "Installing npm dependencies..."
-call npm install --no-audit --no-fund
-if errorlevel 1 (
+call :step 72 "Checking and installing npm dependencies..."
+call npm install --include=dev --no-audit --no-fund
+if not "%ERRORLEVEL%"=="0" (
   echo [Iris Setup] npm install failed.
+  echo [Iris Setup] For EPERM or EBUSY, close this workspace's Iris/Vite processes and retry.
   goto failed
 )
 
 call :step 84 "Validating TypeScript setup..."
 call npm run check
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
   echo [Iris Setup] TypeScript check failed.
   goto failed
+)
+
+if "%INSTALL_MODELS%"=="1" (
+  call node scripts\setup-models.mjs --profile balanced
+  if errorlevel 1 goto failed
 )
 
 if "%MODE%"=="consumer" (
@@ -73,7 +86,7 @@ echo.
 echo [Iris Setup] Completed. Next steps:
 if "%MODE%"=="consumer" (
   echo   1. Run build-release.bat
-  echo   2. Share the generated installer from D:\Iris_for_Godot\Builds
+  echo   2. Share the generated installer from the builds folder
 ) else (
   echo   1. Run launch-dev.bat
   echo   2. Wait for Tauri + Vite to finish startup
@@ -84,7 +97,7 @@ exit /b 0
 :failed
 echo.
 echo [Iris Setup] Bootstrap failed.
-echo [Iris Setup] If a package install was denied, rerun this script as Administrator.
+echo [Iris Setup] Resolve the error above, then rerun this script.
 popd
 exit /b 1
 

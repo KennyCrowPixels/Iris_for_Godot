@@ -1,4 +1,20 @@
-export type Message = { role: "user" | "llm"; text: string; time?: number };
+export type Message = {
+  role: "user" | "llm";
+  text: string;
+  time?: number;
+  thinkingLog?: unknown;
+  images?: string[];
+};
+
+export function reorderTabs<T extends { id: number }>(tabs: T[], sourceId: number, targetId: number): T[] {
+  const sourceIndex = tabs.findIndex((tab) => tab.id === sourceId);
+  const targetIndex = tabs.findIndex((tab) => tab.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return tabs;
+  const reordered = [...tabs];
+  const [moved] = reordered.splice(sourceIndex, 1);
+  reordered.splice(targetIndex, 0, moved);
+  return reordered;
+}
 
 export function updateMessagesAppendUser(prev: Message[], text: string, images?: string[]): Message[] {
   return [...prev, { role: "user", text, time: Math.floor(Date.now() / 1000), ...(images && images.length ? { images } : {}) } as any];
@@ -12,6 +28,7 @@ export function patchLastLLMBubble(prev: Message[], delta: string): Message[] {
   if (!delta) return prev;
   const copy = [...prev];
   for (let i = copy.length - 1; i >= 0; --i) {
+    if (copy[i].role === "user") break;
     if (copy[i].role === "llm") {
       copy[i] = { ...copy[i], text: copy[i].text + delta };
       return copy;
@@ -31,4 +48,10 @@ export function extractArtifacts(text: string): Array<{ lang: string; filename?:
     if (content) out.push({ lang, content });
   }
   return out;
+}
+
+export function clearProvisionalReply(prev: Message[]): Message[] {
+  let end = prev.length;
+  while (end > 0 && prev[end - 1].role === "llm") end--;
+  return prev.slice(0, end);
 }

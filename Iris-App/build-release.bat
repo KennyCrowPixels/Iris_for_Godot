@@ -2,7 +2,7 @@
 setlocal
 pushd "%~dp0"
 
-set "BUILD_OUT_DIR=D:\Iris_for_Godot\Builds"
+if not defined BUILD_OUT_DIR set "BUILD_OUT_DIR=%~dp0builds"
 
 echo [Iris Build] [5%%] Bootstrapping dependencies...
 call "%~dp0setup-windows.bat" --consumer --yes
@@ -15,9 +15,6 @@ if errorlevel 1 (
 echo [Iris Build] [15%%] Preparing output directories...
 
 if not exist "%BUILD_OUT_DIR%" mkdir "%BUILD_OUT_DIR%"
-
-if exist "%BUILD_OUT_DIR%\*.exe" del /Q "%BUILD_OUT_DIR%\*.exe" >nul 2>nul
-if exist "%BUILD_OUT_DIR%\*.msi" del /Q "%BUILD_OUT_DIR%\*.msi" >nul 2>nul
 
 if exist "src-tauri\target\release\bundle\nsis\*.exe" del /Q "src-tauri\target\release\bundle\nsis\*.exe" >nul 2>nul
 if exist "src-tauri\target\release\bundle\msi\*.msi" del /Q "src-tauri\target\release\bundle\msi\*.msi" >nul 2>nul

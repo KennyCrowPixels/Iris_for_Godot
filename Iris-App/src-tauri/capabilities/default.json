@@ -8,6 +8,11 @@
     "core:webview:default",
     "opener:default",
     "core:window:default",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-unmaximize",
+    "core:window:allow-maximize",
     "core:event:default"
   ]
 }

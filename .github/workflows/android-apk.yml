@@ -1,0 +1,78 @@
+name: Android APK (Iris Companion)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag (e.g. v0.3.5) to attach the APK to"
+        required: false
+        default: ""
+  push:
+    paths:
+      - iris-android-client/**
+      - .github/workflows/android-apk.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: iris-android-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      # ubuntu-latest ships a ready Android SDK (ANDROID_HOME set, licenses accepted);
+      # no setup-android step is needed and the deprecated 'tools' package it installs fails.
+      - name: Install JS dependencies
+        run: npm install --no-audit --no-fund
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install
+      # The companion talks to the desktop over plain HTTP on the LAN (PIN-paired, token-authenticated);
+      # release builds block cleartext traffic unless the manifest allows it.
+      - name: Allow LAN HTTP to the desktop
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q 'usesCleartextTraffic' "$MANIFEST" || sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
+          grep -q 'usesCleartextTraffic="true"' "$MANIFEST"
+      - name: Configure Gradle for the CI runner
+        working-directory: iris-android-client/android
+        # Expo SDK 52's Compose compiler (1.5.15) requires Kotlin 1.9.25; the template defaults to 1.9.24.
+        run: |
+          echo "android.kotlinVersion=1.9.25" >> gradle.properties
+          echo "org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx2g" >> gradle.properties
+          echo "org.gradle.workers.max=2" >> gradle.properties
+      # A release build embeds the JavaScript bundle so the APK runs standalone (a debug build needs a
+      # Metro dev server). The Expo template signs release builds with its debug key, so it installs directly.
+      - name: Build standalone APK
+        working-directory: iris-android-client/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+      - name: Stage APK with a stable name
+        run: |
+          VERSION=$(node -p "require('./app.json').expo.version")
+          cp android/app/build/outputs/apk/release/app-release.apk "iris-companion-${VERSION}.apk"
+          echo "APK_NAME=iris-companion-${VERSION}.apk" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iris-companion-apk
+          path: iris-android-client/iris-companion-*.apk
+          if-no-files-found: error
+      - name: Attach APK to release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" "${APK_NAME}" --clobber --repo "${{ github.repository }}"
