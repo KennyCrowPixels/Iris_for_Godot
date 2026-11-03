@@ -35,6 +35,9 @@ mod agent_executor;
 #[path = "controller_server.rs"]
 pub mod controller_server;
 
+#[path = "speech.rs"]
+pub mod speech;
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct UserTurnPayload {
   pub tab_id: u32,

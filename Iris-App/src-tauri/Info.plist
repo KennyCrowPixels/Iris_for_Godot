@@ -4,6 +4,8 @@
 <dict>
   <key>NSAppleEventsUsageDescription</key>
   <string>Iris uses automation only for desktop actions you approve.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Iris uses the microphone for voice dictation. Speech is transcribed locally on this Mac.</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

@@ -14,6 +14,21 @@ const { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutco
 const { patchLastLLMBubble, clearProvisionalReply, reorderTabs } = await loadTypescript("../src/state/tabs.ts");
 const { persistSnapshot } = await loadTypescript("../src/state/memory.ts");
 const { sanitizeForSpeech, chunkForSpeech } = await loadTypescript("../src/lib/voice.ts");
+const { downsampleTo16k, pcm16Base64 } = await loadTypescript("../src/lib/whisperRecorder.ts");
+
+test("dictation audio is downsampled to 16 kHz and encoded as little-endian 16-bit PCM", () => {
+  const input = new Float32Array(48000).fill(0.5);
+  const down = downsampleTo16k(input, 48000);
+  assert.equal(down.length, 16000);
+  assert.ok(Math.abs(down[100] - 0.5) < 1e-6);
+  assert.equal(downsampleTo16k(input, 16000), input);
+  const bytes = Buffer.from(pcm16Base64(new Float32Array([0, 1, -1, 2])), "base64");
+  assert.equal(bytes.length, 8);
+  assert.equal(bytes.readInt16LE(0), 0);
+  assert.equal(bytes.readInt16LE(2), 32767);
+  assert.equal(bytes.readInt16LE(4), -32768);
+  assert.equal(bytes.readInt16LE(6), 32767);
+});
 
 test("TTS sanitization strips code, markdown, URLs and citation lists", () => {
   assert.equal(sanitizeForSpeech("Hello **world**!"), "Hello world!");

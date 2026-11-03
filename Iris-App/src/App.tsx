@@ -10,6 +10,7 @@ import irisMark from "../src-tauri/icons/Iris_icon-1024px.png";
 import { themeTokens } from "./lib/theme";
 import { advanceTaskClock, intervalMilliseconds, nextRecurringRun, parseTaskOutcome, taskIsDue } from "./lib/automation";
 import { VoiceRecognizer, speak, cancelSpeech, isSpeechRecognitionSupported, isSpeechSynthesisSupported } from "./lib/voice";
+import { WhisperRecorder, WHISPER_SAMPLE_RATE, isMicCaptureSupported } from "./lib/whisperRecorder";
 import "@fontsource-variable/manrope";
 import "./App.css";
 import type { ChatMessage, Artifact } from "./types/models";
@@ -3063,6 +3064,20 @@ function App() {
   const speakReplyOnDoneRef = useRef<Record<number, boolean>>({});
   const sttSupported = isSpeechRecognitionSupported();
   const ttsSupported = isSpeechSynthesisSupported();
+  // In the desktop app, dictation records locally and transcribes with the bundled whisper.cpp engine.
+  const desktopDictation = typeof window !== "undefined" && !!(window as any).__TAURI__ && isMicCaptureSupported();
+  const whisperRecorderRef = useRef<WhisperRecorder | null>(null);
+  const dictationTabRef = useRef<number | null>(null);
+  const [voiceStage, setVoiceStage] = useState<"" | "transcribing">("");
+  const [speechSetupPercent, setSpeechSetupPercent] = useState<number | null>(null);
+  useEffect(() => {
+    if (!desktopDictation) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ stage: string; percent?: number }>("speech_setup_progress", (event) => {
+      setSpeechSetupPercent(event.payload.stage === "ready" ? null : Math.max(0, Math.min(100, Number(event.payload.percent) || 0)));
+    }).then((stop) => { unlisten = stop; }).catch(() => {});
+    return () => unlisten?.();
+  }, [desktopDictation]);
   const [hoveredMessageKey, setHoveredMessageKey] = useState<string | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -9667,7 +9682,68 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
   }
 
   function stopVoiceInput() {
+    if (desktopDictation) {
+      void finishDesktopDictation();
+      return;
+    }
     voiceRecognizerRef.current?.stop();
+  }
+
+  async function startDesktopDictation() {
+    if (voiceStage) return;
+    stopSpeaking();
+    if (!whisperRecorderRef.current) whisperRecorderRef.current = new WhisperRecorder();
+    dictationTabRef.current = activeTab;
+    try {
+      await whisperRecorderRef.current.start({
+        onAutoStop: (reason) => {
+          if (reason === "no-speech") {
+            void finishDesktopDictation(true);
+            showRuntimeToast("I didn't hear anything. Check that the right microphone is selected in your system sound settings, then try again.");
+          } else {
+            void finishDesktopDictation();
+          }
+        },
+      });
+      setMicListening(true);
+    } catch (error) {
+      setMicListening(false);
+      showRuntimeToast(String((error as Error)?.message || error));
+    }
+  }
+
+  async function finishDesktopDictation(discard = false) {
+    const recorder = whisperRecorderRef.current;
+    if (!recorder?.recording) return;
+    setMicListening(false);
+    const captured = await recorder.stop();
+    if (discard || !captured) return;
+    setVoiceStage("transcribing");
+    try {
+      const text = (await invoke<string>("speech_transcribe", { pcmBase64: captured.pcmBase64, sampleRate: WHISPER_SAMPLE_RATE })).trim();
+      if (!text) {
+        showRuntimeToast("I couldn't make out any words. Try again a little closer to the microphone.");
+        return;
+      }
+      const draft = inputValueRef.current.trim();
+      const dictationTab = dictationTabRef.current ?? activeTabRef.current;
+      const tab = tabsRef.current.find((item) => item.id === dictationTab);
+      if (draft) {
+        // Never send typed-but-unsent text on the user's behalf; add the dictation for review instead.
+        setInput(`${draft} ${text}`);
+        showRuntimeToast("Added your dictation to the message box. Press Enter to send it.");
+      } else if (useRustEngine && tab?.type === "chat" && dictationTab === activeTabRef.current && !isGeneratingRef.current && activeRustRequestRef.current === null) {
+        speakReplyOnDoneRef.current[dictationTab] = true;
+        await sendRustTurn(dictationTab, text, [], tabProjectMap[dictationTab] ?? null);
+      } else {
+        setInput(text);
+      }
+    } catch (error) {
+      showRuntimeToast(`Voice input failed: ${String((error as Error)?.message || error)}`);
+    } finally {
+      setVoiceStage("");
+      setSpeechSetupPercent(null);
+    }
   }
 
   function clearNoAudioTimer() {
@@ -9678,6 +9754,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
   }
 
   function startVoiceInput() {
+    if (desktopDictation) {
+      void startDesktopDictation();
+      return;
+    }
     if (!sttSupported) {
       showRuntimeToast("Voice input is not available in this environment.");
       return;
@@ -9715,7 +9795,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         clearNoAudioTimer();
         const normalized = String(message || "").toLowerCase();
         if (normalized.includes("network")) {
-          showRuntimeToast("Voice input needs the browser speech service, which this desktop webview can't reach. Desktop dictation isn't supported here yet — the Android companion app uses native on-device speech instead.");
+          showRuntimeToast("Voice input needs the browser's online speech service, which isn't reachable here. In the desktop app, dictation runs locally instead.");
         } else if (normalized.includes("not-allowed") || normalized.includes("service-not-allowed")) {
           showRuntimeToast("Microphone access was blocked. Allow the mic for this app and try again.");
         } else {
@@ -14761,13 +14841,13 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               }
             }}
           />
-          {sttSupported && (
+          {(desktopDictation || sttSupported) && (
             <button
               type="button"
               className={`mic-btn${micListening ? " listening" : ""}`}
               aria-label={micListening ? "Listening — click to stop" : "Start voice input"}
-              title={micListening ? "Listening — click to stop (auto-stops after 10s of silence)" : "Speak your message"}
-              disabled={menuLocked || (respondingTab !== null && respondingTab !== activeTab && !isGenerating)}
+              title={micListening ? "Listening — click to stop, or just pause and Iris stops automatically" : voiceStage ? "Transcribing your speech…" : "Speak your message"}
+              disabled={menuLocked || !!voiceStage || (respondingTab !== null && respondingTab !== activeTab && !isGenerating)}
               onClick={toggleVoiceInput}
             >
               {micListening ? (
@@ -14777,8 +14857,10 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
               )}
             </button>
           )}
-          {micListening && (
-            <span className="listening-pill" role="status" aria-live="polite">Listening…</span>
+          {(micListening || voiceStage) && (
+            <span className="listening-pill" role="status" aria-live="polite">
+              {micListening ? "Listening…" : speechSetupPercent !== null ? `Setting up voice (one-time download) ${speechSetupPercent}%` : "Transcribing…"}
+            </span>
           )}
           {isSpeaking && (
             <button
