@@ -41,6 +41,13 @@ jobs:
         run: npm install --no-audit --no-fund
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install
+      # The companion talks to the desktop over plain HTTP on the LAN (PIN-paired, token-authenticated);
+      # release builds block cleartext traffic unless the manifest allows it.
+      - name: Allow LAN HTTP to the desktop
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q 'usesCleartextTraffic' "$MANIFEST" || sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
+          grep -q 'usesCleartextTraffic="true"' "$MANIFEST"
       - name: Configure Gradle for the CI runner
         working-directory: iris-android-client/android
         # Expo SDK 52's Compose compiler (1.5.15) requires Kotlin 1.9.25; the template defaults to 1.9.24.
