@@ -172,6 +172,17 @@ pub enum TaskStatus { Running, Paused, Blocked, Completed, Cancelled }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChecklistItem {
+    pub id: u32,
+    pub text: String,
+    /// "open", "done" or "dropped".
+    pub status: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentTask {
     pub id: String,
     pub tab_id: u32,
@@ -188,6 +199,8 @@ pub struct AgentTask {
     pub last_message: String,
     #[serde(default)]
     pub reasoning_log: Vec<Value>,
+    #[serde(default)]
+    pub checklist: Vec<ChecklistItem>,
 }
 
 impl AgentTask {
@@ -199,7 +212,68 @@ impl AgentTask {
             actions_since_review: 0, total_actions: 0, pending_writes: Vec::new(),
             last_message: String::new(),
             reasoning_log: Vec::new(),
+            checklist: Vec::new(),
         }
+    }
+
+    pub fn set_checklist(&mut self, items: &[String]) {
+        self.checklist = items.iter().map(|text| text.trim()).filter(|text| !text.is_empty()).take(12).enumerate()
+            .map(|(index, text)| ChecklistItem { id: index as u32 + 1, text: excerpt(text, 200), status: "open".into(), note: String::new() })
+            .collect();
+    }
+
+    pub fn open_checklist(&self) -> Vec<&ChecklistItem> {
+        self.checklist.iter().filter(|item| item.status == "open").collect()
+    }
+
+    pub fn render_checklist(&self) -> String {
+        if self.checklist.is_empty() { return String::new(); }
+        let lines = self.checklist.iter().map(|item| {
+            let mark = match item.status.as_str() { "done" => "[x]", "dropped" => "[-]", _ => "[ ]" };
+            if item.note.is_empty() { format!("{mark} {}. {}", item.id, item.text) } else { format!("{mark} {}. {} ({})", item.id, item.text, item.note) }
+        }).collect::<Vec<_>>().join("\n");
+        format!("Requirements checklist — cover EVERY open item before finishing; edit it with update_checklist (check, add, edit or drop items) as you learn more:\n{lines}")
+    }
+
+    /// Apply a model-issued edit: {check:[ids], uncheck:[ids], add:[text], edit:[{id,text}], drop:[ids], note:{id:text}}.
+    pub fn apply_checklist_update(&mut self, args: &Value) -> Result<String, String> {
+        let ids = |key: &str| args.get(key).and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_u64).map(|id| id as u32).collect::<Vec<_>>()).unwrap_or_default();
+        let mut changed = 0usize;
+        for (key, status) in [("check", "done"), ("uncheck", "open"), ("drop", "dropped")] {
+            for id in ids(key) {
+                let item = self.checklist.iter_mut().find(|item| item.id == id).ok_or(format!("Checklist item {id} does not exist"))?;
+                item.status = status.into();
+                changed += 1;
+            }
+        }
+        if let Some(edits) = args.get("edit").and_then(Value::as_array) {
+            for edit in edits {
+                let id = edit.get("id").and_then(Value::as_u64).ok_or("Each edit needs an id")? as u32;
+                let text = edit.get("text").and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).ok_or("Each edit needs nonempty text")?;
+                let item = self.checklist.iter_mut().find(|item| item.id == id).ok_or(format!("Checklist item {id} does not exist"))?;
+                item.text = excerpt(text, 200);
+                changed += 1;
+            }
+        }
+        if let Some(notes) = args.get("note").and_then(Value::as_object) {
+            for (key, value) in notes {
+                let Some(id) = key.parse::<u32>().ok() else { continue; };
+                if let (Some(item), Some(text)) = (self.checklist.iter_mut().find(|item| item.id == id), value.as_str()) {
+                    item.note = excerpt(text, 160);
+                    changed += 1;
+                }
+            }
+        }
+        if let Some(additions) = args.get("add").and_then(Value::as_array) {
+            for text in additions.iter().filter_map(Value::as_str).map(str::trim).filter(|text| !text.is_empty()) {
+                if self.checklist.len() >= 12 { return Err("The checklist is limited to 12 items; drop or merge items first".into()); }
+                let id = self.checklist.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+                self.checklist.push(ChecklistItem { id, text: excerpt(text, 200), status: "open".into(), note: String::new() });
+                changed += 1;
+            }
+        }
+        if changed == 0 { return Err("No checklist change was given. Use check, uncheck, add, edit, drop or note.".into()); }
+        Ok(self.render_checklist())
     }
 
     pub fn record_reasoning(&mut self, text: &str) {
@@ -348,6 +422,22 @@ pub fn excerpt(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checklist_can_be_checked_added_edited_and_dropped() {
+        let mut task = AgentTask::new("t".into(), 1, None, "goal".into(), "m".into());
+        task.set_checklist(&["weather in Durham".into(), "weather in Honolulu".into()]);
+        assert_eq!(task.open_checklist().len(), 2);
+        task.apply_checklist_update(&serde_json::json!({"check":[1],"add":["compare the two"],"edit":[{"id":2,"text":"current weather in Honolulu, HI"}]})).unwrap();
+        assert_eq!(task.checklist[0].status, "done");
+        assert_eq!(task.checklist[1].text, "current weather in Honolulu, HI");
+        assert_eq!(task.checklist[2].id, 3);
+        task.apply_checklist_update(&serde_json::json!({"drop":[3]})).unwrap();
+        assert_eq!(task.open_checklist().len(), 1);
+        assert!(task.render_checklist().contains("[x] 1."));
+        assert!(task.apply_checklist_update(&serde_json::json!({"check":[9]})).is_err());
+        assert!(task.apply_checklist_update(&serde_json::json!({})).is_err());
+    }
 
     #[test]
     fn reasoning_log_is_bounded_and_older_task_files_remain_readable() {

@@ -105,6 +105,49 @@ fn linked_root(app: &tauri::AppHandle, task: &AgentTask, id: &str) -> Result<Str
         .ok_or("Repository is not enabled and linked to this project".into())
 }
 
+/// Which scenes the Godot editor has open, from the layout Godot saves on scene switches
+/// (.godot/editor/editor_layout.cfg). None for folders that are not Godot projects.
+fn godot_editor_state(root: &str) -> Option<Value> {
+    let root = std::path::Path::new(root);
+    let project_dir = if root.join("project.godot").is_file() { root.to_path_buf() } else {
+        fs::read_dir(root).ok()?.filter_map(Result::ok).map(|entry| entry.path()).find(|path| path.join("project.godot").is_file())?
+    };
+    let layout_path = project_dir.join(".godot").join("editor").join("editor_layout.cfg");
+    let layout = fs::read_to_string(&layout_path).ok()?;
+    let mut in_editor_node = false;
+    let mut current: Option<String> = None;
+    let mut open: Vec<String> = Vec::new();
+    for line in layout.lines().map(str::trim) {
+        if line.starts_with('[') { in_editor_node = line == "[EditorNode]"; continue; }
+        if !in_editor_node { continue; }
+        if let Some(value) = line.strip_prefix("current_scene=") {
+            current = Some(value.trim().trim_matches('"').to_string()).filter(|value| !value.is_empty());
+        } else if let Some(value) = line.strip_prefix("open_scenes=") {
+            open = value.split('"').skip(1).step_by(2).map(str::to_string).filter(|value| !value.is_empty()).collect();
+        }
+    }
+    let saved_seconds_ago = fs::metadata(&layout_path).and_then(|meta| meta.modified()).ok()
+        .and_then(|modified| modified.elapsed().ok()).map(|elapsed| elapsed.as_secs());
+    Some(serde_json::json!({"currentScene":current,"openScenes":open,"savedSecondsAgo":saved_seconds_ago,
+        "source":".godot/editor/editor_layout.cfg",
+        "note":"Saved by the Godot editor when a scene is switched or saved; it can lag a few seconds behind the live editor."}))
+}
+
+/// Full text of inventory files the request names (e.g. "SphereScene" -> Assets/Scenes/SphereScene.tscn),
+/// so the model can quote exact text for a replace instead of first orchestrating a read.
+fn mentioned_files(root: &str, inventory: &Value, goal: &str) -> Vec<Value> {
+    let goal = goal.to_lowercase();
+    inventory["entries"].as_array().into_iter().flatten()
+        .filter_map(|entry| entry["path"].as_str())
+        .filter(|path| {
+            let stem = std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_lowercase();
+            stem.chars().count() >= 4 && goal.contains(&stem)
+        })
+        .take(2)
+        .filter_map(|path| local_files(root, &serde_json::json!({"action":"read","path":path,"start_line":1,"end_line":300})).ok())
+        .collect()
+}
+
 async fn blocking_call<T: Send + 'static>(operation: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     tokio::time::timeout(Duration::from_secs(90), tokio::task::spawn_blocking(operation)).await
         .map_err(|_| "External action timed out; outcome is unknown. Inspect state before retrying.".to_string())?
@@ -195,13 +238,18 @@ fn local_files(root: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
-async fn read_web(url: &str, offset: usize) -> Result<Value, String> {
+pub(super) async fn read_web(url: &str, offset: usize) -> Result<Value, String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| err.to_string())?;
     if !matches!(parsed.scheme(),"https"|"http") || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("Only HTTP(S) URLs without embedded credentials are supported".into());
     }
     let client = reqwest::Client::builder().timeout(Duration::from_secs(25)).redirect(reqwest::redirect::Policy::limited(5)).build().map_err(|err|err.to_string())?;
-    let response = client.get(parsed).header("User-Agent","Iris-local-agent/0.3").send().await.map_err(|err|err.to_string())?.error_for_status().map_err(|err|err.to_string())?;
+    // A user-initiated page read; a browser-like agent avoids the blanket bot blocks many sites apply.
+    let response = client.get(parsed)
+        .header("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 Iris/0.3")
+        .header("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language","en-US,en;q=0.9")
+        .send().await.map_err(|err|err.to_string())?.error_for_status().map_err(|err|err.to_string())?;
     let final_url = response.url().to_string();
     let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value|value.to_str().ok()).unwrap_or("text/html").to_string();
     if !content_type.starts_with("text/") && !content_type.contains("json") && !content_type.contains("xhtml") {
@@ -249,7 +297,9 @@ fn extract_web_content(body: &str, content_type: &str, url: &str, offset: usize)
 
 pub(super) fn requires_plan(tool: &str, args: &Value) -> bool {
     match tool {
-        "project_files" => !matches!(args["action"].as_str(), Some("list" | "search" | "read")),
+        // An exact-text replace is approved by the user and read back automatically, so it does not
+        // also need a multi-step plan; creating, moving or deleting files still does.
+        "project_files" => !matches!(args["action"].as_str(), Some("list" | "search" | "read" | "replace")),
         "ssh_action" => !matches!(args["action"].as_str(), Some("list" | "read")),
         "desktop_action" => args["action"].as_str() != Some("list"),
         "call_project_tool" => args.get("effect").and_then(Value::as_str) == Some("write"),
@@ -329,6 +379,8 @@ pub(super) async fn execute(
                     Err(_) => (serde_json::Value::Null, false),
                 }
             } else { (serde_json::Value::Null, false) };
+            let editor_state = if folder_set { godot_editor_state(&project.manipulation_root_path) } else { None };
+            let named_files = if files_auto_listed { mentioned_files(&project.manipulation_root_path, &file_inventory, &task.goal) } else { Vec::new() };
             let mut preferred_order: Vec<String> = priority.iter().filter_map(|id| {
                 if id == "project" { return (!project.manipulation_root_path.is_empty()).then(|| "Project folder (direct file access)".to_string()); }
                 if let Some(found) = store.mcps.iter().find(|m| &m.id == id && m.enabled && project.mcp_ids.contains(&m.id)) { return Some(format!("MCP: {}", found.name)); }
@@ -346,7 +398,9 @@ pub(super) async fn execute(
             // Direct file access is the most reliable path for a small model, so prefer it; MCP
             // bridges are secondary and only needed for live-editor state a file read cannot give.
             let guidance = if files_auto_listed {
-                format!("The fileInventory field already lists this project's REAL files, read straight from the project folder — a scene is a .tscn file, a script is a .gd file. Answer file, scene, folder and script questions directly from fileInventory and NEVER invent names. For a file's contents use project_files action \"read\"; to change a file use project_files action \"write\" or \"replace\" (approval required). {bridge_status}; use call_project_tool on a bridge ONLY for live editor state fileInventory cannot give (the currently open scene, running errors).")
+                format!("The fileInventory field already lists this project's REAL files, read straight from the project folder — a scene is a .tscn file, a script is a .gd file. Answer file, scene, folder and script questions directly from fileInventory and NEVER invent names.{} {} To change a file, call project_files with action \"replace\", repo_id \"project\", the file's path, old_text copied EXACTLY from its content and new_text (the user approves the edit; Iris reads it back automatically). In a .tscn, a node is a line like [node name=\"Sphere\" type=\"MeshInstance3D\" ...] and its mesh is a [sub_resource type=\"SphereMesh\" ...]; replace those exact lines. {bridge_status}; use call_project_tool on a bridge ONLY for live editor state not covered here.",
+                    if editor_state.is_some() { " editorState.currentScene is the scene currently open in the Godot editor (and openScenes lists its open tabs) — use it for 'which scene is open'." } else { "" },
+                    if named_files.is_empty() { "For a file's contents use project_files action \"read\".".to_string() } else { format!("mentionedFiles already contains the full text of {} — use it directly; do not read it again.", named_files.iter().filter_map(|file| file["path"].as_str()).collect::<Vec<_>>().join(", ")) })
             } else if can_files {
                 format!("Prefer direct file access ({folder_status}). Use project_files with action \"list\" or \"search\" to read the project's REAL files — scenes are .tscn files, scripts are .gd files, usually under res://. This is the reliable way to answer file, scene, folder and script questions: report only the filenames and contents it returns and never invent names. To change files use project_files action \"write\" or \"replace\" (approval required). Separately, {bridge_status}: use call_project_tool ONLY for live-editor state that a file read cannot give (the currently open scene, running errors, a live editor screenshot).")
             } else if auto_inspected {
@@ -364,7 +418,7 @@ pub(super) async fn execute(
                 (!can_bridge).then(|| "MCP bridge".to_string()),
             ].into_iter().flatten().collect();
             serde_json::json!({"project":{"id":project.id,"name":project.name,"description":project.description,"cachedEngineVersion":project.godot_version_cached,"cacheIsHintNotFreshInspection":true},
-                "mcps":mcps,"sshs":sshs,"repositories":repositories,"fileInventory":file_inventory,"filesAutoListed":files_auto_listed,
+                "mcps":mcps,"sshs":sshs,"repositories":repositories,"fileInventory":file_inventory,"filesAutoListed":files_auto_listed,"editorState":editor_state,"mentionedFiles":named_files,
                 "connections":{"projectFolder":can_files,"bridgeReachable":any_reachable,"preferredOrder":preferred_order,"notHookedUp":not_hooked_up},
                 "inspectable":can_bridge||can_files,"bridgeReachable":any_reachable,"autoInspected":auto_inspected,"guidance":guidance})
         }
@@ -468,6 +522,20 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn godot_editor_layout_reveals_the_open_scene() {
+        let root = std::env::temp_dir().join(format!("iris_godot_layout_{}", std::process::id()));
+        let editor = root.join(".godot").join("editor");
+        fs::create_dir_all(&editor).unwrap();
+        fs::write(root.join("project.godot"), "config_version=5").unwrap();
+        fs::write(editor.join("editor_layout.cfg"), "[docks]\ndock_split=0\n\n[EditorNode]\n\nopen_scenes=PackedStringArray(\"res://Assets/Scenes/SphereScene.tscn\", \"res://main.tscn\")\ncurrent_scene=\"res://Assets/Scenes/SphereScene.tscn\"\n").unwrap();
+        let state = godot_editor_state(root.to_str().unwrap()).unwrap();
+        assert_eq!(state["currentScene"], "res://Assets/Scenes/SphereScene.tscn");
+        assert_eq!(state["openScenes"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&root);
+        assert!(godot_editor_state(root.to_str().unwrap()).is_none());
+    }
 
     #[test]
     fn inspection_can_inform_a_plan_but_mutations_still_require_one() {

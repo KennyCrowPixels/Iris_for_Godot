@@ -12007,7 +12007,7 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
         <div className="chat-history" ref={historyRef}>
           <div className="bubble llm">
             <strong>{assistantLabel}:</strong>{" "}
-            No chats are open. Press <strong>File</strong> and then <strong>New tab</strong> to start a new conversation.
+            No chats are open. Press <strong>+</strong> on the tab bar, or <strong>File</strong> and then <strong>New tab</strong>, to start a new conversation.
           </div>
           <div ref={chatEndRef} />
         </div>
@@ -14474,8 +14474,11 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             {progress && <>
             <button type="button" className="icon-button" title="Open saved task notes" aria-label="Open saved task notes" onClick={async () => {
               try {
-                const saved = await invoke<{ goal: string; review: string; lastMessage: string; steps: { title: string; status: string; notes: string }[] } | null>("get_agent_task", { tabId: activeTab });
-                const notes = saved ? [saved.goal, ...saved.steps.map((step) => `${step.status}: ${step.title}${step.notes ? `\n${step.notes}` : ""}`), saved.review, saved.lastMessage].filter(Boolean).join("\n\n") : "No saved task notes.";
+                const saved = await invoke<{ goal: string; review: string; lastMessage: string; steps: { title: string; status: string; notes: string }[]; checklist?: { id: number; text: string; status: string; note?: string }[] } | null>("get_agent_task", { tabId: activeTab });
+                const checklist = saved?.checklist?.length
+                  ? `Checklist:\n${saved.checklist.map((item) => `${item.status === "done" ? "[x]" : item.status === "dropped" ? "[-]" : "[ ]"} ${item.id}. ${item.text}${item.note ? ` (${item.note})` : ""}`).join("\n")}`
+                  : "";
+                const notes = saved ? [saved.goal, checklist, ...saved.steps.map((step) => `${step.status}: ${step.title}${step.notes ? `\n${step.notes}` : ""}`), saved.review, saved.lastMessage].filter(Boolean).join("\n\n") : "No saved task notes.";
                 await askCenteredConfirm({ title: "Task notes", message: notes, confirmLabel: "Close" });
               } catch (error) { showRuntimeToast(String(error)); }
             }}><BookOpen size={16} /></button>

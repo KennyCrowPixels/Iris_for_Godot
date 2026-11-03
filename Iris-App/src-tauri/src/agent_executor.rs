@@ -12,6 +12,9 @@ mod agent_stream;
 #[path = "agent_research.rs"]
 mod agent_research;
 
+#[path = "agent_fanout.rs"]
+mod agent_fanout;
+
 static RUNS: OnceLock<Mutex<HashMap<u32, Arc<RunControl>>>> = OnceLock::new();
 static PERMISSIONS: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> = OnceLock::new();
 static INFERENCE: OnceLock<Semaphore> = OnceLock::new();
@@ -128,6 +131,126 @@ fn save_task(app: &tauri::AppHandle, task: &AgentTask) -> Result<(), String> {
 
 fn save_observation(app: &tauri::AppHandle, task: &AgentTask, id: u64, value: &Value) -> Result<(), String> {
     atomic_write_json(&task_dir(app, &task.id)?.join(format!("evidence_{id}.json")), &value.to_string())
+}
+
+/// One remembered turn. The model decides what the subject was (intake); the harness only keeps it
+/// and hands it back on later turns so references like "the game" or "what about Honolulu?" resolve.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct TopicMemory { ts: i64, route: String, subject: String, request: String, outcome: String }
+
+fn topic_memory_path(app: &tauri::AppHandle, tab_id: u32) -> Result<PathBuf, String> {
+    Ok(task_root(app)?.join(format!("memory_tab_{tab_id}.json")))
+}
+
+fn load_topic_memory(app: &tauri::AppHandle, tab_id: u32) -> Vec<TopicMemory> {
+    topic_memory_path(app, tab_id).ok().and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()
+}
+
+fn remember_turn(app: &tauri::AppHandle, tab_id: u32, entry: TopicMemory) {
+    let mut entries = load_topic_memory(app, tab_id);
+    entries.push(entry);
+    let overflow = entries.len().saturating_sub(10);
+    entries.drain(..overflow);
+    if let (Ok(path), Ok(json)) = (topic_memory_path(app, tab_id), serde_json::to_string(&entries)) {
+        let _ = atomic_write_json(&path, &json);
+    }
+}
+
+fn render_topic_memory(entries: &[TopicMemory]) -> String {
+    if entries.is_empty() { return String::new(); }
+    let lines = entries.iter().map(|entry| {
+        let topic = if entry.subject.trim().is_empty() { &entry.request } else { &entry.subject };
+        format!("- [{}] {} -> {}", if entry.route.is_empty() { "chat" } else { &entry.route }, excerpt(topic, 140), excerpt(&entry.outcome, 180))
+    }).collect::<Vec<_>>().join("\n");
+    format!("Conversation memory for this chat (earlier requests, oldest first). Use it to resolve references such as 'it', 'the game', 'that scene' or 'what about X?':\n{lines}")
+}
+
+/// Asks the model whether a draft answer actually covers each open checklist item.
+async fn verify_checklist(
+    client: &reqwest::Client, task: &AgentTask, answer: &str, budget: &ModelBudget, control: &RunControl,
+) -> Result<Vec<(u32, bool)>, String> {
+    let open = task.open_checklist();
+    if open.is_empty() { return Ok(Vec::new()); }
+    let items = open.iter().map(|item| format!("{}. {}", item.id, item.text)).collect::<Vec<_>>().join("\n");
+    let mut check_budget = budget.clone();
+    check_budget.output_tokens = 220;
+    let schema = json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"covered":{"type":"boolean"}},"required":["id","covered"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false});
+    let messages = vec![
+        json!({"role":"system","content":"Check a draft answer against a requirements checklist. For each item, covered is true only when the draft actually delivers that item's content (a real value, fact, or the requested section), not when it merely mentions the item or says it could not be found. Return every item id."}),
+        json!({"role":"user","content":format!("Requirements:\n{items}\n\nDraft answer:\n{}", excerpt(answer, budget.input_char_budget() / 2))}),
+    ];
+    let raw = next_action(client, &task.model, messages, &check_budget, control, Some(schema), |_| {}).await?;
+    let value: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    Ok(value["items"].as_array().into_iter().flatten()
+        .filter_map(|item| Some((item["id"].as_u64()? as u32, item["covered"].as_bool()?))).collect())
+}
+
+/// Splits a place list a model packed into one string ("['Durham, NC', 'Honolulu, HI']" or "A; B").
+fn split_place_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') {
+        let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
+        return inner.split(['\'', '"']).map(str::trim).filter(|part| !part.is_empty() && *part != ",").map(str::to_string).collect();
+    }
+    trimmed.split([';', '|']).map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect()
+}
+
+fn weather_places(args: &Value) -> Vec<String> {
+    let mut places: Vec<String> = Vec::new();
+    let mut add = |raw: &str| for place in split_place_list(raw) {
+        if !places.iter().any(|known| known.eq_ignore_ascii_case(&place)) { places.push(place); }
+    };
+    match args.get("location") {
+        Some(Value::String(text)) => add(text),
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).for_each(&mut add),
+        _ => {}
+    }
+    if let Some(items) = args.get("locations").and_then(Value::as_array) { items.iter().filter_map(Value::as_str).for_each(&mut add); }
+    places.truncate(6);
+    places
+}
+
+/// Looks up one or several places; several are fetched concurrently and reported together.
+async fn weather_for_places(args: &Value) -> Value {
+    let mut places = weather_places(args);
+    if places.is_empty() { return json!({"error":"A location is required"}); }
+    if places.len() == 1 {
+        match weather_lookup(places[0].clone(), None).await {
+            Ok(result) => return serde_json::to_value(result).unwrap_or_else(|error| json!({"error":error.to_string()})),
+            Err(error) => {
+                let parts: Vec<String> = places[0].split(" and ").map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect();
+                if parts.len() < 2 { return json!({"error":error}); }
+                places = parts;
+            }
+        }
+    }
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, place) in places.iter().cloned().enumerate() {
+        lookups.spawn(async move { (index, place.clone(), weather_lookup(place, None).await) });
+    }
+    let mut collected = Vec::new();
+    while let Some(Ok(entry)) = lookups.join_next().await { collected.push(entry); }
+    collected.sort_by_key(|(index, _, _)| *index);
+    let mut lines = Vec::new();
+    let mut results = Vec::new();
+    let mut source_url = String::new();
+    for (_, place, outcome) in collected {
+        match outcome {
+            Ok(result) => {
+                lines.push(result.summary.clone());
+                if source_url.is_empty() { source_url = result.source_url.clone(); }
+                results.push(serde_json::to_value(result).unwrap_or(Value::Null));
+            }
+            Err(error) => {
+                lines.push(format!("{place}: lookup failed ({error})"));
+                results.push(json!({"location":place,"error":error}));
+            }
+        }
+    }
+    if source_url.is_empty() { return json!({"error":lines.join("\n"),"places":results}); }
+    json!({"summary":lines.join("\n"),"sourceUrl":source_url,"title":"Current weather","places":results,"locationCount":places.len(),
+        "note":"Each place was looked up separately; report every place in the answer."})
 }
 
 fn read_evidence(app: &tauri::AppHandle, task: &AgentTask, args: &Value) -> Result<Value, String> {
@@ -447,7 +570,16 @@ async fn consult_model(
 
 async fn next_action(
     client: &reqwest::Client, model: &str, messages: Vec<Value>, budget: &ModelBudget, control: &RunControl,
-    schema: Option<Value>, mut on_delta: impl FnMut(&str),
+    schema: Option<Value>, on_delta: impl FnMut(&str),
+) -> Result<String, String> {
+    let temperature = if schema.is_some() {0.1} else {0.6};
+    chat_once(client, model, messages, budget, control, schema, temperature, on_delta).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn chat_once(
+    client: &reqwest::Client, model: &str, messages: Vec<Value>, budget: &ModelBudget, control: &RunControl,
+    schema: Option<Value>, temperature: f64, mut on_delta: impl FnMut(&str),
 ) -> Result<String, String> {
     let _permit = tokio::select! {
         _ = control.cancelled() => return Err("Cancelled".into()),
@@ -455,7 +587,7 @@ async fn next_action(
     };
     let mut request = serde_json::json!({
         "model": model, "messages": messages, "stream": true, "think": false, "keep_alive": "5m",
-        "options": {"num_ctx": budget.context_tokens, "num_predict": budget.output_tokens, "temperature": if schema.is_some() {0.1} else {0.6}, "repeat_penalty": 1.1}
+        "options": {"num_ctx": budget.context_tokens, "num_predict": budget.output_tokens, "temperature": temperature, "repeat_penalty": 1.1}
     });
     if let Some(schema) = schema { request["format"] = schema; }
     let mut response = tokio::select! {
@@ -563,45 +695,47 @@ async fn review_research(
     Err(format!("The model could not substantiate its research assessment: {}",research.last_error))
 }
 
-async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequest, budget: &ModelBudget, control: &RunControl, project_context: &str, saved_goal: Option<&str>, tools: &[Value]) -> Result<agent_research::EvidenceNeed,String> {
+async fn assess_evidence_need(client: &reqwest::Client, request: &OllamaChatRequest, budget: &ModelBudget, control: &RunControl, project_context: &str, saved_goal: Option<&str>, tools: &[Value], memory: &str) -> Result<agent_research::EvidenceNeed,String> {
     let mut intake_budget=budget.clone();
-    intake_budget.output_tokens=240;
+    intake_budget.output_tokens=280;
     let latest=request.messages.iter().rposition(|message|message.role=="user").unwrap_or(0);
-    let context=request.messages[..latest].iter().rev().filter(|message|matches!(message.role.as_str(),"user"|"assistant")).take(4)
-        .map(|message|format!("{}: {}",message.role,excerpt(&message.content,350))).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    let context=request.messages[..latest].iter().rev().filter(|message|matches!(message.role.as_str(),"user"|"assistant")).take(8)
+        .map(|message|format!("{}: {}",message.role,excerpt(&message.content,300))).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
     let question=request.messages.get(latest).map(|message|message.content.as_str()).unwrap_or("");
     let messages=vec![
         json!({"role":"system","content":format!("{} Prior research and paused tasks do not make a new stable-knowledge question require research. Do not add freshness or ambiguity that the current question does not need. A request for current measurements, conditions or changing facts must use web, not answer.",agent_research::INTAKE_PROTOCOL)}),
         json!({"role":"user","content":"Introduce yourself and explain what you can help with."}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\",\"subject\":\"\"}"}),
         json!({"role":"user","content":"What is the capital of Portugal?"}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"trivial\",\"subject\":\"capital of Portugal\"}"}),
         json!({"role":"user","content":"Write an example movement script. This is a code snippet, not a request to inspect files."}),
-        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"normal\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"answer\",\"input\":\"\",\"effort\":\"normal\",\"subject\":\"example movement script\"}"}),
         json!({"role":"user","content":"Which version is documented in the repository attached to this chat?"}),
-        json!({"role":"assistant","content":"{\"route\":\"project\",\"input\":\"\",\"effort\":\"normal\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"project\",\"input\":\"\",\"effort\":\"normal\",\"subject\":\"documented version in the attached repository\"}"}),
         json!({"role":"user","content":"Tell me about Springfield, but I have not specified which place with that name I mean."}),
-        json!({"role":"assistant","content":"{\"route\":\"clarify\",\"input\":\"Which Springfield do you mean?\",\"effort\":\"trivial\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"clarify\",\"input\":\"Which Springfield do you mean?\",\"effort\":\"trivial\",\"subject\":\"Springfield\"}"}),
         json!({"role":"user","content":"Search online for the current ratings and reviews of Example Quest."}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest current ratings reviews\",\"effort\":\"normal\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"Example Quest reviews ratings\",\"effort\":\"normal\",\"subject\":\"Example Quest (video game)\"}"}),
         json!({"role":"user","content":"How warm is it in Oslo, Norway right now?"}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\",\"effort\":\"trivial\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Oslo, Norway\",\"effort\":\"trivial\",\"subject\":\"current weather in Oslo, Norway\"}"}),
+        json!({"role":"user","content":"(Conversation memory: the previous request was the current weather in Oslo, Norway.) What about Lisbon?"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions in Lisbon, Portugal\",\"effort\":\"trivial\",\"subject\":\"current weather in Lisbon, Portugal\"}"}),
         json!({"role":"user","content":"What's the weather in Durham, NC and also Honolulu, HI?"}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions\",\"effort\":\"normal\",\"requirements\":[\"current weather in Durham, NC\",\"current weather in Honolulu, HI\"]}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"current conditions\",\"effort\":\"normal\",\"requirements\":[\"current weather in Durham, NC\",\"current weather in Honolulu, HI\"],\"subject\":\"current weather in Durham, NC and Honolulu, HI\"}"}),
         json!({"role":"user","content":"Take a screenshot of my screen and tell me what you see."}),
-        json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\",\"effort\":\"normal\"}"}),
+        json!({"role":"assistant","content":"{\"route\":\"act\",\"input\":\"\",\"effort\":\"normal\",\"subject\":\"screenshot of the user's screen\"}"}),
         json!({"role":"user","content":"Write a detailed five-paragraph essay comparing two newer games, with sources."}),
-        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"the two named games features reception comparison\",\"effort\":\"deep\",\"requirements\":[\"introduction\",\"body paragraph: first game\",\"body paragraph: second game\",\"body paragraph: comparison\",\"conclusion\"]}"}),
+        json!({"role":"assistant","content":"{\"route\":\"web\",\"input\":\"the two named games features reception comparison\",\"effort\":\"deep\",\"requirements\":[\"introduction\",\"body paragraph: first game\",\"body paragraph: second game\",\"body paragraph: comparison\",\"conclusion\"],\"subject\":\"the two named games\"}"}),
         json!({"role":"user","content":"Continue the saved unfinished task from its notes."}),
-        json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\",\"effort\":\"normal\"}"}),
-        json!({"role":"system","content":format!("Context for resolving references only, not the current request. Today: {}. Attached project: {}. Saved unfinished objective: {}. Recent conversation:\n{}\nClassify only the user's next message.",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),context)}),
+        json!({"role":"assistant","content":"{\"route\":\"resume\",\"input\":\"\",\"effort\":\"normal\",\"subject\":\"\"}"}),
+        json!({"role":"system","content":format!("Context for resolving references only, not the current request. Today: {}. Attached project: {}. Saved unfinished objective: {}.\n{}\nRecent conversation:\n{}\nClassify only the user's next message.",time::OffsetDateTime::now_utc().date(),project_context,saved_goal.unwrap_or("none"),memory,context)}),
         json!({"role":"user","content":excerpt(question,1600)})
     ];
     let raw=next_action(client,&request.model,messages,&intake_budget,control,Some(agent_research::intake_schema()),|_|{}).await?;
     let mut need: agent_research::EvidenceNeed=serde_json::from_str(&raw).map_err(|error|format!("Could not assess evidence needs: {error}"))?;
     let lookups=network_action_schema(tools);
     if need.route=="web" && lookups["oneOf"].as_array().is_some_and(|choices|!choices.is_empty()) {
-        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. For a general web search, set the query to the resolved subject in 'Evidence needed', which already names the exact entity from the conversation; keep that proper name intact. For a location or measurement tool (such as weather), copy the place VERBATIM from the current user question, include the region/state/country when the user gave it (for example 'Durham, NC'), and never reuse a place mentioned earlier in the chat. Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
+        let messages=vec![json!({"role":"system","content":"Select the most direct enabled lookup for the current question. Use a specialized live-data tool when it provides the requested measurement; use general search for discovery. For a general web search, set the query to the resolved subject in 'Evidence needed', which already names the exact entity from the conversation; keep that proper name intact. For a location or measurement tool (such as weather), copy the place VERBATIM from the current user question, include the region/state/country when the user gave it (for example 'Durham, NC'), and never reuse a place mentioned earlier in the chat unless the current question refers back to it. When the question names several places, put the first in 'location' and EVERY place in 'locations'. Supply that tool's required arguments only. Do not perform research planning or repeat previous chat errors. Return one tool request."}),json!({"role":"user","content":format!("Question: {}\nEvidence needed: {}\nEnabled lookup schemas: {}",excerpt(question,1600),need.input,lookups)})];
         if let Ok(raw)=next_action(client,&request.model,messages,&intake_budget,control,Some(lookups),|_|{}).await {
             need.lookup=parse_model_action(&raw,tools).ok();
         }
@@ -757,8 +891,16 @@ pub(super) async fn run(
     if !memory_digest.trim().is_empty() {
         turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:format!("{memory_digest}\nThis recalled memory is background only; it is not proof. Verify with a tool before stating it as a current fact."),images:None,tool_calls:None});
     }
+    let topic_memory = render_topic_memory(&load_topic_memory(app, tab_id));
+    if !topic_memory.is_empty() {
+        turn_request.messages.insert(0,OllamaMessage{role:"system".into(),content:topic_memory.clone(),images:None,tool_calls:None});
+    }
+    let mut turn_route = String::new();
+    let mut turn_subject = String::new();
+    // (effort, subject) when this turn should run the parallel research pass before the step loop.
+    let mut fanout_plan: Option<(String, String)> = None;
+    let mut checklist_checks = 0usize;
     let mut feedback = String::new();
-    let mut checklist = String::new();
     let mut last_action_error = String::new();
     let mut direct_answer = false;
     // Set when the turn is inspecting an attached project that actually has an inspectable bridge
@@ -789,12 +931,14 @@ pub(super) async fn run(
     save_task(app, &task)?;
     if !resume_task && (attached.is_some() || tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search"))) {
         let _=window.emit(event_name,IrisEvent::Status("Checking whether this request needs current evidence...".into()));
-        match assess_evidence_need(&client,request,&budget,&control,&project_context,previous.as_ref().filter(|task|task.status!=TaskStatus::Completed).map(|task|task.goal.as_str()),&tools).await {
+        match assess_evidence_need(&client,request,&budget,&control,&project_context,previous.as_ref().filter(|task|task.status!=TaskStatus::Completed).map(|task|task.goal.as_str()),&tools,&topic_memory).await {
             Ok(need) => {
                 budget.apply_effort(&need.effort);
-                record_reasoning(window,event_name,&mut task,&format!("Effort assessed: {}.",need.effort));
+                turn_route = need.route.clone();
+                turn_subject = if need.subject.trim().is_empty() { need.input.clone() } else { need.subject.clone() };
+                record_reasoning(window,event_name,&mut task,&format!("Effort assessed: {}.{}",need.effort,if turn_subject.trim().is_empty() {String::new()} else {format!(" Subject: {}.",excerpt(&turn_subject,160))}));
                 if need.requirements.len() >= 2 {
-                    checklist = format!("\nRequirements checklist — satisfy EVERY item before finishing; do not stop after the first, and confirm each is covered in your answer:\n{}", need.requirements.iter().enumerate().map(|(index,item)| format!("{}. {}",index+1,item)).collect::<Vec<_>>().join("\n"));
+                    task.set_checklist(&need.requirements);
                     record_reasoning(window,event_name,&mut task,&format!("Checklist: {}.", need.requirements.join("; ")));
                 }
                 match {
@@ -807,6 +951,13 @@ pub(super) async fn run(
                     tools.retain(|tool| !matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("project_connections")|Some("list_project_tools")|Some("call_project_tool")|Some("project_files")|Some("ssh_action")|Some("clone_repository")));
                     research.set_subject(&need.input);
                     research_next=need.lookup.filter(|action|matches!(action,AgentAction::Tool{tool,..} if agent_research::handles(tool)));
+                    // Open-ended web questions get the parallel research pass; a specialized live-data
+                    // tool (weather) stays a single fast lookup.
+                    let specialized = matches!(&research_next, Some(AgentAction::Tool{tool,..}) if tool=="get_current_weather");
+                    if !specialized {
+                        let subject = if need.subject.trim().is_empty() { need.input.clone() } else { need.subject.clone() };
+                        fanout_plan = Some((need.effort.clone(), subject));
+                    }
                     if research_next.is_none() {repair_schema=Some(network_action_schema(&tools));}
                     feedback=format!("This request needs live evidence. Choose the most directly relevant enabled lookup and supply its required arguments. Suggested discovery query: {}. No source has been retrieved yet.",need.input);
                 }
@@ -820,13 +971,19 @@ pub(super) async fn run(
                     // A project-inspection turn must use the project's OWN tools, not the web. Dropping
                     // the web tools stops a confused small model from web-searching "what is an MCP bridge".
                     tools.retain(|tool| !matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("universal_web_search") | Some("read_web_page")));
-                    feedback="Inspect the linked project with its OWN tools. project_connections (being called now) reports what is connected and in what priority: prefer direct file access with project_files (list or read the real .tscn scene files and .gd scripts) whenever a project folder is available; use call_project_tool on an MCP bridge only for live-editor state a file read cannot give. Follow the guidance it returns, report only what the tools actually return, never invent names, and never web-search to learn what an 'MCP bridge' is.".into();
+                    feedback="Work on the linked project with its OWN tools. project_connections (being called now) returns the project's real file list (fileInventory), the scene open in the editor (editorState) and the full text of any file the request names (mentionedFiles). Answer questions from those. If the user asked for a CHANGE, make it now: call project_files with action replace, repo_id project, the file path, old_text copied exactly from mentionedFiles and the new_text — do not describe or simulate a change you have not made. Report only what the tools actually return, never invent names, and never web-search to learn what an 'MCP bridge' is.".into();
                     research_next=Some(AgentAction::Tool{tool:"project_connections".into(),arguments:json!({})});
                 }
                 "act" => {
                     feedback="This request asks for a local device, app, file or bridge action. If the matching tool is enabled, call it and report only its real observed result. If no such tool is enabled, tell the user plainly which capability to enable in Settings (Desktop Tools, or link an MCP bridge or repository to this project); never claim you are only a text-based model or unable to see the screen or control apps.".into();
                 }
-                "clarify" if !need.input.trim().is_empty() => research_next=Some(AgentAction::Finish{message:need.input}),
+                "clarify" => {
+                    // The intake sees only a short window of the chat; let the main model, which has the
+                    // whole conversation, decide whether the request is actually ambiguous.
+                    direct_answer=true;
+                    tools.clear();
+                    feedback=format!("This request might be ambiguous. First check the conversation and conversation memory: if they already make the meaning clear, answer directly. Only if it is genuinely unclear, ask ONE short clarifying question{}.",if need.input.trim().ends_with('?') {format!(" such as: {}",need.input.trim())} else {String::new()});
+                }
                 "resume" => {
                     if let Ok(saved)=resumed_task(previous.as_ref(),task.project_id.as_ref(),&request.model) {
                         task=saved;
@@ -850,7 +1007,26 @@ pub(super) async fn run(
         feedback=format!("Image observation #{id}; success={ok}: {}",excerpt(&value.to_string(),budget.observation_chars));
         save_task(app,&task)?;
     }
+    if !task.checklist.is_empty() && !direct_answer && !tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str)==Some("update_checklist")) {
+        tools.push(update_checklist_schema());
+    }
+    if let Some((effort, subject)) = fanout_plan.take() {
+        let _ = window.emit(event_name, IrisEvent::Status("Researching several sources in parallel...".into()));
+        match agent_fanout::research(&client, window, event_name, &control, &mut task, &budget, &effort, &subject, &topic_memory, &mut displayed).await {
+            Ok(answer) => {
+                if let Err(error) = task.finish(&answer) {
+                    record_reasoning(window,event_name,&mut task,&format!("Research answer was not accepted ({error}); continuing step by step."));
+                }
+            }
+            Err(error) => {
+                clear_provisional_answer(window, event_name, &mut displayed);
+                record_reasoning(window,event_name,&mut task,&format!("Parallel research could not finish ({}); continuing step by step.", excerpt(&error,240)));
+            }
+        }
+        save_task(app,&task)?;
+    }
     for _ in 0..budget.max_actions {
+        if task.status != TaskStatus::Running {break;}
         if task.total_actions.saturating_sub(action_start)>=budget.max_actions {break;}
         if control.cancelled.load(Ordering::SeqCst) {
             task.status = TaskStatus::Cancelled;
@@ -930,8 +1106,17 @@ pub(super) async fn run(
         }
         if research.ready() && task.completion_ready().is_ok() {
             if let Some(answer)=research.concise_answer() {
-                task.finish(&answer)?;
-                break;
+                if !task.open_checklist().is_empty() {
+                    let coverage = verify_checklist(&client, &task, &answer, &budget, &control).await.unwrap_or_default();
+                    for (id, covered) in coverage {
+                        if covered { if let Some(item) = task.checklist.iter_mut().find(|item| item.id == id) { item.status = "done".into(); } }
+                    }
+                }
+                if task.open_checklist().is_empty() {
+                    task.finish(&answer)?;
+                    break;
+                }
+                feedback = format!("The evidence so far covers only part of the request. Still needed: {}. Look up what is missing, then answer every item.", task.open_checklist().iter().map(|item| item.text.clone()).collect::<Vec<_>>().join("; "));
             }
         }
         if research.ready() && task.pending_writes.is_empty() && task.completion_ready().is_err() {
@@ -941,7 +1126,7 @@ pub(super) async fn run(
         task.total_actions += 1;
         emit_progress(window, event_name, &task, &budget);
         let _ = window.emit(event_name, IrisEvent::Status(format!("Agent action {} | {}", task.total_actions, task.current_step().map(|step| step.title.as_str()).unwrap_or("assessing request"))));
-        let context_feedback=format!("{}{}",if research.active() {format!("{feedback}\nResearch notebook: {}",research.notebook(budget.research.notebook_chars))} else {feedback.clone()}, checklist);
+        let context_feedback=format!("{}{}",if research.active() {format!("{feedback}\nResearch notebook: {}",research.notebook(budget.research.notebook_chars))} else {feedback.clone()}, if task.checklist.is_empty() {String::new()} else {format!("\n{}",task.render_checklist())});
         let messages = action_messages(&turn_request, &task, if direct_answer {None} else {previous.as_ref()}, &budget, &tools, &context_feedback, &previous_response);
         let can_stream = task.completion_ready().is_ok() && (!research.active() || research.ready());
         let generated = if let Some(action)=research_next.take() { Ok(serde_json::to_string(&action).map_err(|error|error.to_string())?) } else { next_action(&client, &task.model, messages, &budget, &control, repair_schema.take(), |delta| {
@@ -1040,6 +1225,21 @@ pub(super) async fn run(
                     Err("The research evidence has not yet resolved the original question. Review the subject, dates, source support and remaining gaps.".into())
                 } else if project_inspection && !project_bridge_down && !task.observations.iter().any(|observation| matches!(observation.tool.as_str(), "call_project_tool" | "project_files" | "ssh_action")) {
                     Err("You have not inspected the project yet, so you cannot know its scenes, nodes, or files. Do NOT invent names. The connected bridge's tools are listed in the project_connections result: call call_project_tool now with that exact connection_id, a listed tool_name, arguments, and effect:read (or project_files for a repo) and report ONLY what it returns.".into())
+                } else if !task.open_checklist().is_empty() && checklist_checks < 2 {
+                    checklist_checks += 1;
+                    let coverage = verify_checklist(&client, &task, &message, &budget, &control).await.unwrap_or_default();
+                    for (id, covered) in &coverage {
+                        if *covered { if let Some(item) = task.checklist.iter_mut().find(|item| item.id == *id) { item.status = "done".into(); } }
+                    }
+                    let missing = task.open_checklist().iter().map(|item| item.text.clone()).collect::<Vec<_>>();
+                    if missing.is_empty() || coverage.is_empty() {
+                        let summary = task.checklist.iter().map(|item| format!("{} {}", item.status, item.text)).collect::<Vec<_>>().join("; ");
+                        record_reasoning(window,event_name,&mut task,&format!("Checklist verified: {summary}."));
+                        task.finish(&research.cite(&agent_stream::visible_answer(&message))).map(|_| "Completed".into())
+                    } else {
+                        record_reasoning(window,event_name,&mut task,&format!("Checklist not yet covered: {}.", missing.join("; ")));
+                        Err(format!("Your answer does not yet cover: {}. Get what is missing (call a tool if needed), then give one complete answer that covers every checklist item.", missing.join("; ")))
+                    }
                 } else {
                     task.finish(&research.cite(&agent_stream::visible_answer(&message))).map(|_| "Completed".into())
                 }
@@ -1060,6 +1260,15 @@ pub(super) async fn run(
                     Err("Review is due. Record progress, gaps, and an adjustment before another tool call.".into())
                 } else if !tools.iter().any(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some(&tool)) {
                     Err(format!("Tool '{tool}' is not enabled. Choose from the current catalog."))
+                } else if tool == "update_checklist" {
+                    match task.apply_checklist_update(&arguments) {
+                        Ok(rendered) => {
+                            let summary = task.checklist.iter().map(|item| format!("{} {}", item.status, item.text)).collect::<Vec<_>>().join("; ");
+                            record_reasoning(window,event_name,&mut task,&format!("Checklist updated: {summary}."));
+                            Ok(format!("Checklist saved.\n{rendered}"))
+                        }
+                        Err(error) => Err(error),
+                    }
                 } else if agent_research::handles(&tool) && research.before_call(&tool,&budget.research).is_err() {
                     task.status=TaskStatus::Paused;
                     task.last_message=deliver_best_effort(&client,&task,&research,&budget,&control).await.unwrap_or_else(||research.partial_answer());
@@ -1113,7 +1322,31 @@ pub(super) async fn run(
                                 update_skill(app, &tool, result.ok, false)?;
                                 record_reasoning(window,event_name,&mut task,&format!("Evidence #{evidence}: {tool} {}.",if result.ok {"returned a result for assessment"} else {"did not return usable evidence"}));
                                 let _ = window.emit(event_name, IrisEvent::ToolResult { tool_name: tool.clone(), status: if result.ok { "ok" } else { "error" }.into() });
-                                Ok(format!("Evidence #{evidence}; success={}. {}", result.ok, tool_feedback(&tool, &result.value, budget.observation_chars)))
+                                // The harness verifies an approved file edit itself, so a small model does not
+                                // need a separate plan/read/checkpoint cycle before it may finish.
+                                let mut readback_note = String::new();
+                                if tool == "project_files" && result.ok && result.side_effect_attempted {
+                                    let repo = arguments.get("repo_id").and_then(Value::as_str).unwrap_or("project").to_string();
+                                    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let read_args = json!({"action":"read","repo_id":repo,"path":path,"start_line":1,"end_line":300});
+                                    if let Ok(readback) = agent_tools::execute(app, window, event_name, &control, &task, "project_files", &read_args, request.read_only).await {
+                                        let content = readback.value.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                                        let expected = arguments.get("new_text").or_else(|| arguments.get("content")).and_then(Value::as_str).unwrap_or("");
+                                        let confirmed = readback.ok && expected.lines().map(str::trim).filter(|line| !line.is_empty()).all(|line| content.contains(line));
+                                        let read_id = task.observe("project_files", readback.ok, true, false, &readback.value.to_string());
+                                        if let Some(observation) = task.observations.last_mut() { observation.scope = format!("repo:{repo}"); }
+                                        save_observation(app, &task, read_id, &readback.value)?;
+                                        if confirmed {
+                                            task.pending_writes.retain(|id| *id != evidence);
+                                            readback_note = format!(" The file was read back automatically (evidence #{read_id}) and the change is confirmed.");
+                                        } else {
+                                            readback_note = format!(" The automatic read-back (evidence #{read_id}) did not show the new text; check it before claiming success.");
+                                        }
+                                        let note = readback_note.trim().to_string();
+                                        record_reasoning(window,event_name,&mut task,&note);
+                                    }
+                                }
+                                Ok(format!("Evidence #{evidence}; success={}. {}{readback_note}", result.ok, tool_feedback(&tool, &result.value, budget.observation_chars)))
                             }
                             Err(err) => {
                                 // After a tool's arguments fail validation twice in a task, disable it so a
@@ -1170,7 +1403,24 @@ pub(super) async fn run(
     emit_progress(window, event_name, &task, &budget);
     let remaining = task.last_message.strip_prefix(&displayed).unwrap_or(&task.last_message);
     if !remaining.is_empty() { let _ = window.emit(event_name, IrisEvent::Delta(remaining.to_string())); }
+    remember_turn(app, tab_id, TopicMemory {
+        ts: now_ts() as i64,
+        route: if turn_route.is_empty() && resume_task { "resume".into() } else { turn_route },
+        subject: turn_subject,
+        request: excerpt(&task.goal, 200),
+        outcome: excerpt(&agent_stream::visible_answer(&task.last_message), 220),
+    });
     Ok(task.last_message)
+}
+
+fn update_checklist_schema() -> Value {
+    json!({"type":"function","function":{"name":"update_checklist","description":"Edit your requirements checklist as you learn more: check off finished items, add newly discovered requirements, reword or drop items. Use the item ids shown in the checklist.","parameters":{"type":"object","properties":{
+        "check":{"type":"array","items":{"type":"integer"}},
+        "uncheck":{"type":"array","items":{"type":"integer"}},
+        "add":{"type":"array","items":{"type":"string"}},
+        "edit":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"text":{"type":"string"}},"required":["id","text"]}},
+        "drop":{"type":"array","items":{"type":"integer"}}
+    },"additionalProperties":false}}})
 }
 
 fn available_tools(app: &tauri::AppHandle, request: &OllamaChatRequest) -> Vec<Value> {
@@ -1221,10 +1471,7 @@ async fn run_tool(
         "universal_web_search" => execute_research_search(args["query"].as_str().unwrap_or(""),args["depth"].as_str().unwrap_or("deep"),
             args["provider"].as_str().unwrap_or("auto"),args["recency"].as_str().unwrap_or("any"),
             args["max_results"].as_u64().unwrap_or(budget.research.suggested_sources.max(3) as u64) as usize).await,
-        "get_current_weather" => match weather_lookup(args["location"].as_str().unwrap_or("").to_string(),None).await {
-            Ok(result)=>serde_json::to_value(result).map_err(|error|error.to_string())?,
-            Err(error)=>serde_json::json!({"error":error}),
-        },
+        "get_current_weather" => weather_for_places(args).await,
         "read_agent_notes" => serde_json::to_value(task).map_err(|err| err.to_string())?,
         "read_agent_evidence" => read_evidence(app, task, args)?,
         "agent_proficiency" => skill_report(app),
@@ -1263,6 +1510,22 @@ async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_places_are_split_out_of_one_location_string() {
+        assert_eq!(weather_places(&json!({"location":"['Durham, NC', 'Honolulu, HI']"})), vec!["Durham, NC", "Honolulu, HI"]);
+        assert_eq!(weather_places(&json!({"location":"Durham, NC","locations":["Durham, NC","Honolulu, HI"]})), vec!["Durham, NC", "Honolulu, HI"]);
+        assert_eq!(weather_places(&json!({"location":"Oslo; Lisbon"})), vec!["Oslo", "Lisbon"]);
+        assert_eq!(weather_places(&json!({"location":"Trinidad and Tobago"})), vec!["Trinidad and Tobago"]);
+        assert!(weather_places(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn conversation_memory_renders_subjects_for_reference_resolution() {
+        assert!(render_topic_memory(&[]).is_empty());
+        let rendered = render_topic_memory(&[TopicMemory{ts:1,route:"web".into(),subject:"current weather in Durham, NC".into(),request:"weather in durham?".into(),outcome:"58 F, clear".into()}]);
+        assert!(rendered.contains("[web] current weather in Durham, NC -> 58 F, clear"));
+    }
 
     #[test]
     fn skill_review_tightening_self_heals_and_never_hard_gates() {
@@ -1367,9 +1630,9 @@ mod tests {
     fn intake_requires_a_valid_lookup_and_pause_messages_hide_the_catalog() {
         let schema=agent_research::intake_schema();
         let validator=jsonschema::validator_for(&schema).unwrap();
-        assert!(validator.is_valid(&json!({"route":"answer","input":"","effort":"trivial"})));
-        assert!(validator.is_valid(&json!({"route":"web","input":"current conditions","effort":"normal"})));
-        assert!(!validator.is_valid(&json!({"route":"answer","input":""})));
+        assert!(validator.is_valid(&json!({"route":"answer","input":"","effort":"trivial","subject":""})));
+        assert!(validator.is_valid(&json!({"route":"web","input":"current conditions","effort":"normal","subject":"current weather in Oslo","requirements":["Oslo","Lisbon"]})));
+        assert!(!validator.is_valid(&json!({"route":"answer","input":"","effort":"trivial"})));
         let lookup_schema=network_action_schema(&build_default_tools());
         let lookup_validator=jsonschema::validator_for(&lookup_schema).unwrap();
         assert!(lookup_validator.is_valid(&json!({"action":"tool","tool":"get_current_weather","arguments":{"location":"Durham, NC"}})));
@@ -1401,7 +1664,7 @@ mod tests {
                 OllamaMessage{role:"assistant".into(),content:"Research paused after repeated invalid actions. Unfinished steps remain; progress is saved.".into(),images:None,tool_calls:None},
                 OllamaMessage{role:"user".into(),content:prompt.into(),images:None,tool_calls:None},
             ],stream:true,keep_alive:None,tools:Some(tools.clone()),network_allowed:true,read_only:false};
-            let need=assess_evidence_need(&client,&request,&budget,&control,"none",Some("Research a game"),&tools).await.unwrap();
+            let need=assess_evidence_need(&client,&request,&budget,&control,"none",Some("Research a game"),&tools,"").await.unwrap();
             println!("{prompt}: {} ({:?})",need.route,started.elapsed());
             assert_eq!(need.route,expected);
             let task=AgentTask::new("live_simple".into(),999,None,prompt.into(),model.clone());
@@ -1455,7 +1718,7 @@ mod tests {
             ("Tell me about Lebanon. I mean one of the places with that name, but haven't said which.","none","clarify"),
         ] {
             let request=OllamaChatRequest{model:model.clone(),messages:vec![OllamaMessage{role:"user".into(),content:prompt.into(),images:None,tool_calls:None}],stream:true,keep_alive:None,tools:None,network_allowed:true,read_only:false};
-            let result=assess_evidence_need(&client,&request,&budget,&control,project,None,&build_default_tools()).await.unwrap();
+            let result=assess_evidence_need(&client,&request,&budget,&control,project,None,&build_default_tools(),"").await.unwrap();
             println!("{prompt}: {}",result.route);
             assert_eq!(result.route,expected);
         }

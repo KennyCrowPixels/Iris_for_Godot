@@ -1292,13 +1292,18 @@ fn build_default_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "get_current_weather",
-        "description": "Get timestamped current temperature and conditions for a location, with a separately labeled daily forecast. Never use the forecast high as the current temperature.",
+        "description": "Get timestamped current temperature and conditions for one or more places, with a separately labeled daily forecast. When the user asks about several places, list every one in 'locations' so each is reported. Never use the forecast high as the current temperature.",
         "parameters": {
           "type": "object",
           "properties": {
             "location": {
               "type": "string",
               "description": "City and optionally state or country, e.g. 'Durham, NC' or 'London, UK'"
+            },
+            "locations": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Additional places when the user asked about several, one place per item, e.g. ['Durham, NC', 'Honolulu, HI']"
             }
           },
           "required": ["location"]
