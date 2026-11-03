@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
 import { Activity, ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, Copy, GripVertical, ListChecks, Mic, PanelRightClose, Pause, Pencil, Play, Plus, RefreshCw, Square, Trash2, VolumeX, X } from "lucide-react";
@@ -3174,6 +3175,9 @@ function App() {
   const [customThemeColor, setCustomThemeColor] = useState(() => readStoredThemeColor());
   const [colorMode, setColorMode] = useState<"dark" | "light">(() => readStoredColorMode());
   const [uiScale, setUiScale] = useState<number>(() => readStoredUiScale());
+  const [pinnedOnTop, setPinnedOnTop] = useState<boolean>(() => {
+    try { return localStorage.getItem("iris.window.pinned") === "1"; } catch { return false; }
+  });
   const [networkEnabled, setNetworkEnabled] = useState(false);
   const [universalDatawebEnabled, setUniversalDatawebEnabled] = useState(true);
   const [networkDraftEnabled, setNetworkDraftEnabled] = useState(false);
@@ -3441,6 +3445,60 @@ function App() {
     document.documentElement.style.colorScheme = isLightMode ? "light" : "dark";
   }, [themePreset, customThemeColor, isLightMode]);
   useEffect(() => { applyUiScale(uiScale); }, [uiScale]);
+
+  // Compact "always on top" mode: remember the normal bounds, shrink Iris into the corner of the
+  // current screen's work area above other windows, and restore the bounds when turned off.
+  async function applyPinnedOnTop(next: boolean, remember = true) {
+    if (!(window as any).__TAURI__) {
+      showRuntimeToast("Keep-on-top is available in the desktop app.");
+      return;
+    }
+    const appWindow = getCurrentWindow();
+    try {
+      if (next) {
+        const maximized = await appWindow.isMaximized();
+        if (remember) {
+          const position = await appWindow.outerPosition();
+          const size = await appWindow.outerSize();
+          localStorage.setItem("iris.window.restoreBounds", JSON.stringify({ x: position.x, y: position.y, width: size.width, height: size.height, maximized }));
+        }
+        if (maximized) await appWindow.unmaximize();
+        const monitor = await currentMonitor();
+        const scale = monitor?.scaleFactor || 1;
+        const area = monitor?.workArea ?? (monitor ? { position: monitor.position, size: monitor.size } : null);
+        const areaX = (area?.position.x ?? 0) / scale;
+        const areaY = (area?.position.y ?? 0) / scale;
+        const areaWidth = (area?.size.width ?? 1920 * scale) / scale;
+        const areaHeight = (area?.size.height ?? 1040 * scale) / scale;
+        const width = 640;
+        const height = Math.round(Math.min(760, Math.max(520, areaHeight * 0.62)));
+        await appWindow.setSize(new LogicalSize(width, height));
+        await appWindow.setPosition(new LogicalPosition(Math.round(areaX + areaWidth - width - 16), Math.round(areaY + areaHeight - height - 16)));
+        await appWindow.setAlwaysOnTop(true);
+      } else {
+        await appWindow.setAlwaysOnTop(false);
+        const saved = JSON.parse(localStorage.getItem("iris.window.restoreBounds") || "null");
+        if (saved && saved.width > 0 && saved.height > 0) {
+          await appWindow.setSize(new PhysicalSize(saved.width, saved.height));
+          await appWindow.setPosition(new PhysicalPosition(saved.x, saved.y));
+          if (saved.maximized) await appWindow.maximize();
+        }
+      }
+      localStorage.setItem("iris.window.pinned", next ? "1" : "0");
+      setPinnedOnTop(next);
+    } catch (error) {
+      showRuntimeToast(`Couldn't change the window mode: ${String(error)}`);
+    }
+  }
+
+  useEffect(() => {
+    if (!pinnedOnTop) return;
+    let cancelled = false;
+    void waitForTauri().then(() => { if (!cancelled) void applyPinnedOnTop(true); }).catch(() => {});
+    return () => { cancelled = true; };
+    // Re-apply the saved mode once at startup only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const assistantLabel = assistantName.trim() || "Iris";
   const activeProjectId = tabProjectMap[activeTab] ?? null;
   const chatMessages = currentTab?.messages || [];
@@ -12137,6 +12195,20 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 </div>
                 <p style={{ marginTop: 6, marginBottom: 0, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
                   Scales all text and the whole interface. The panels expand to use the extra room.
+                </p>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: "block", marginBottom: 6, color: "var(--app-text)" }}>Keep Iris on top</label>
+                <button
+                  className={`setup-btn${pinnedOnTop ? " primary" : ""}`}
+                  title="Shrink Iris into the corner of the screen and keep it above every other window"
+                  onClick={() => { void applyPinnedOnTop(!pinnedOnTop); }}
+                >
+                  Compact &amp; on top: {pinnedOnTop ? "ON" : "OFF"}
+                </button>
+                <p style={{ marginTop: 6, marginBottom: 0, fontSize: 11, color: isLightMode ? "#526272" : "#888" }}>
+                  Makes Iris a small window in the bottom-right corner that stays above everything else, so you can chat while working in other apps. Turning it off restores the previous size and position.
                 </p>
               </div>
 
