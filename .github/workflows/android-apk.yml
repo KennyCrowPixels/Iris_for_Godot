@@ -50,7 +50,8 @@ jobs:
           grep -q 'usesCleartextTraffic="true"' "$MANIFEST"
       - name: Configure Gradle for the CI runner
         working-directory: iris-android-client/android
-        # Expo SDK 52's Compose compiler (1.5.15) requires Kotlin 1.9.25; the template defaults to 1.9.24.
+        # The Kotlin Gradle plugin version comes from React Native's version catalog (RN 0.76.9 -> 1.9.25,
+        # which Expo SDK 52's Compose compiler 1.5.15 requires); this property keeps the stdlib aligned.
         run: |
           echo "android.kotlinVersion=1.9.25" >> gradle.properties
           echo "org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
