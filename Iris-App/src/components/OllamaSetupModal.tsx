@@ -10,7 +10,17 @@ type SetupPhase =
   | "awaiting-restart-ollama"
   | "need-models"
   | "pulling-models"
+  | "upgrade-available"
+  | "upgrading-model"
   | "done";
+
+interface ModelUpgrade {
+  name: string;
+  installed: string | null;
+  target: string;
+}
+
+const UPGRADE_DISMISSED_KEY = "iris.modelUpgrade.dismissed";
 
 interface ModelProgressPayload {
   phase: "pulling" | "creating" | "done";
@@ -47,6 +57,7 @@ export default function OllamaSetupModal({ onComplete }: Props) {
   const [dlProgress, setDlProgress] = useState<DownloadProgressPayload | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
+  const [upgrade, setUpgrade] = useState<ModelUpgrade | null>(null);
   const unlistenRefs = useRef<(() => void)[]>([]);
 
   useEffect(() => {
@@ -99,6 +110,13 @@ export default function OllamaSetupModal({ onComplete }: Props) {
       if (missing.length > 0) setPhase("need-models");
       else {
         await invoke("set_setup_flags", { args: { modelsVerified: true } });
+        const upgrades = await invoke<ModelUpgrade[]>("check_model_upgrades").catch(() => []);
+        const pending = upgrades.find((item) => localStorage.getItem(UPGRADE_DISMISSED_KEY) !== `${item.name}=${item.target}`);
+        if (pending) {
+          setUpgrade(pending);
+          setPhase("upgrade-available");
+          return;
+        }
         onComplete("ready");
       }
     } catch (e) {
@@ -135,6 +153,53 @@ export default function OllamaSetupModal({ onComplete }: Props) {
 
   function handleOpenModelfiles() {
     invoke("open_modelfiles_folder").catch(console.error);
+  }
+
+  async function handleUpgradeModel() {
+    if (!upgrade) return;
+    setPhase("upgrading-model");
+    setModelError(null);
+    setModelProgress(null);
+    try {
+      await invoke("upgrade_model", { name: upgrade.name });
+      onComplete("ready");
+    } catch (e) {
+      setModelError(String(e));
+      setPhase("upgrade-available");
+    }
+  }
+
+  function handleSkipUpgrade() {
+    if (upgrade) localStorage.setItem(UPGRADE_DISMISSED_KEY, `${upgrade.name}=${upgrade.target}`);
+    onComplete("ready");
+  }
+
+  // ── Reasoning model smaller than intended ─────────────────────────────────
+  if (phase === "upgrade-available" && upgrade) {
+    return (
+      <div className="setup-overlay">
+        <div className="setup-modal">
+          <h2>Upgrade Iris's Reasoning Model</h2>
+          <p>
+            Iris is running a smaller model ({upgrade.installed || "unknown size"}) than intended
+            (<strong>{upgrade.target}</strong>). The larger model is much better at using tools,
+            editing Godot projects and following multi-step requests.
+          </p>
+          <p className="setup-note">
+            One-time download of about 4.7 GB. Your chats and settings are kept.
+          </p>
+          {modelError && <p className="setup-error">{modelError}</p>}
+          <div className="setup-buttons">
+            <button className="setup-btn primary" onClick={handleUpgradeModel}>
+              Upgrade Now
+            </button>
+            <button className="setup-btn" onClick={handleSkipUpgrade}>
+              Not Now
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   // ── Checking ─────────────────────────────────────────────────────────────
@@ -275,7 +340,7 @@ export default function OllamaSetupModal({ onComplete }: Props) {
   }
 
   // ── Pulling / creating models ─────────────────────────────────────────────
-  if (phase === "pulling-models") {
+  if (phase === "pulling-models" || phase === "upgrading-model") {
     const step = modelProgress?.step ?? 0;
     const total = modelProgress?.total ?? 1;
     const bytesDone = modelProgress?.completed ?? 0;

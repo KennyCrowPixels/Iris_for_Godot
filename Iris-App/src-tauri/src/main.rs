@@ -55,6 +55,8 @@ fn main() {
             commands::clear_cognitive_doc_versions,
             commands::apply_model_profile,
             commands::pull_and_create_models,
+            commands::check_model_upgrades,
+            commands::upgrade_model,
             commands::restart_app,
             commands::open_modelfiles_folder,
             commands::open_user_persona_prompt,

@@ -7898,8 +7898,10 @@ fn base_expects_larger_than_installed(base: &str, installed: Option<&str>) -> bo
 }
 
 #[tauri::command]
-pub async fn ensure_model(name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn ensure_model(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    let probe = name.clone();
+    let installed = tauri::async_runtime::spawn_blocking(move || {
+    let name = probe;
     ensure_ollama_running_once();
 
         let client = reqwest::blocking::Client::builder()
@@ -7921,100 +7923,24 @@ pub async fn ensure_model(name: String) -> Result<(), String> {
             .json(&serde_json::json!({ "name": name }))
             .send();
 
-        let (need_pull, installed_param_size) = match show {
-            Ok(resp) => {
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    (true, None)
-                } else {
-                    let size = resp.json::<serde_json::Value>().ok()
-                        .and_then(|body| body.get("details")
-                            .and_then(|details| details.get("parameter_size"))
-                            .and_then(|value| value.as_str())
-                            .map(|value| value.to_string()));
-                    (false, size)
-                }
-            }
-            Err(_) => {
-                // if Ollama is down, surface that
-                return Err("Cannot reach Ollama at 127.0.0.1:11434".into());
-            }
-        };
-
-        // Rebuild an existing custom model when the installed weights are clearly smaller than the
-        // modelfile base now specifies (e.g. a frozen 3B organizer after the 7B upgrade). ollama
-        // create overwrites the existing tag, so no explicit removal is needed.
-        let needs_rebuild = if need_pull {
-            false
-        } else {
-            model_definitions(None).iter()
-                .find(|(tag, _, _)| *tag == name)
-                .map(|(_, base, _)| base_expects_larger_than_installed(base, installed_param_size.as_deref()))
-                .unwrap_or(false)
-        };
-
-        if need_pull || needs_rebuild {
-          // Custom Iris tags must be created from modelfiles, not pulled directly.
-          let definitions = model_definitions(None);
-          if let Some((custom_name, base_model, modelfile_file)) =
-            definitions.iter().find(|(tag, _, _)| *tag == name)
-          {
-            let mut pulled = false;
-            let mut pulled_base = base_model.clone();
-            let mut pull_errors: Vec<String> = Vec::new();
-            for candidate in pull_candidates(base_model) {
-              let pull = client
-                .post("http://127.0.0.1:11434/api/pull")
-                .json(&serde_json::json!({ "name": candidate, "stream": false }))
-                .send()
-                .map_err(|e| e.to_string())?;
-              if pull.status().is_success() {
-                pulled = true;
-                pulled_base = candidate;
-                break;
-              }
-              let status = pull.status();
-              let body = pull.text().unwrap_or_else(|_| "<no body>".to_string());
-              pull_errors.push(format!("{} -> {} {}", base_model, status, body));
-            }
-            if !pulled {
-              return Err(format!("Base model pull failed: {}", pull_errors.join(" | ")));
-            }
-
-            let mf_path = modelfile_path(None, modelfile_file)?;
-            let tmp_mf = make_temp_modelfile_with_from(&mf_path, &pulled_base)?;
-
-            let out = Command::new(resolve_ollama_executable())
-              .arg("create")
-              .arg(custom_name)
-              .arg("-f")
-              .arg(&tmp_mf)
-              .output()
-              .map_err(|e| format!("Failed to run ollama create: {}", e))?;
-            let _ = fs::remove_file(&tmp_mf);
-            if !out.status.success() {
-              let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-              let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-              return Err(format!(
-                "Model create failed ({}): exit {} | stdout: {} | stderr: {}",
-                custom_name,
-                out.status,
-                stdout,
-                stderr
-              ));
-            }
-          } else {
-            // Non-custom models can be pulled directly.
-            let pull = client
-              .post("http://127.0.0.1:11434/api/pull")
-              .json(&serde_json::json!({ "name": name, "stream": false }))
-              .send()
-              .map_err(|e| e.to_string())?;
-
-            if !pull.status().is_success() {
-              return Err(format!("Model pull failed: {}", pull.status()));
-            }
-            }
+        match show {
+            Ok(resp) => Ok(resp.status() != reqwest::StatusCode::NOT_FOUND),
+            Err(_) => Err("Cannot reach Ollama at 127.0.0.1:11434".to_string()),
         }
+    }).await.map_err(|e| e.to_string())??;
+    if installed { return Ok(()); }
+    // A missing Iris tag is built from its modelfile with a streamed, long-timeout pull. An
+    // undersized existing model is not rebuilt here (a multi-GB download mid-chat would stall the
+    // turn); the startup check offers that upgrade with visible progress instead.
+    if let Some((custom_name, base, modelfile_file)) = model_definitions(Some(&app)).into_iter().find(|(tag, _, _)| *tag == name) {
+        return pull_and_create_one(&app, &custom_name, &base, &modelfile_file, 1, 2).await;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(7200)).build().map_err(|e| e.to_string())?;
+        let pull = client.post("http://127.0.0.1:11434/api/pull")
+            .json(&serde_json::json!({ "name": name, "stream": false }))
+            .send().map_err(|e| e.to_string())?;
+        if !pull.status().is_success() { return Err(format!("Model pull failed: {}", pull.status())); }
         Ok(())
     }).await.map_err(|e| e.to_string())?
 }
@@ -9471,11 +9397,55 @@ pub async fn pull_and_create_models(app: tauri::AppHandle) -> Result<(), String>
 
     let definitions = model_definitions(Some(&app));
     let total_steps = definitions.len() * 2;
-    let mut step = 0usize;
 
-    for (custom_name, base_model, modelfile_file) in definitions {
-        // --- Pull base model ---
-        step += 1;
+    for (index, (custom_name, base_model, modelfile_file)) in definitions.into_iter().enumerate() {
+        pull_and_create_one(&app, &custom_name, &base_model, &modelfile_file, index * 2 + 1, total_steps).await?;
+    }
+
+    let _ = app.emit("ollama-setup-progress", serde_json::json!({
+        "phase": "done",
+        "step": total_steps,
+        "total": total_steps,
+    }));
+
+    Ok(())
+}
+
+/// The organizer drives every agent decision, so an install whose organizer is clearly smaller
+/// than its modelfile specifies (an older setup froze a 3B; a doomed in-chat upgrade never
+/// finished) is reported for a one-click upgrade instead of silently running the weaker model.
+#[tauri::command]
+pub async fn check_model_upgrades(app: tauri::AppHandle) -> Result<Vec<Value>, String> {
+    let definitions = model_definitions(Some(&app));
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().map_err(|e| e.to_string())?;
+    let mut upgrades = Vec::new();
+    for (custom_name, base, _) in definitions.iter().filter(|(name, _, _)| name == "iris-organizer:latest") {
+        let Ok(response) = client.post("http://127.0.0.1:11434/api/show").json(&serde_json::json!({"name": custom_name})).send().await else { continue; };
+        if !response.status().is_success() { continue; }
+        let installed = response.json::<Value>().await.ok()
+            .and_then(|body| body.pointer("/details/parameter_size").and_then(Value::as_str).map(str::to_string));
+        if base_expects_larger_than_installed(base, installed.as_deref()) {
+            upgrades.push(serde_json::json!({"name": custom_name, "installed": installed, "target": base}));
+        }
+    }
+    Ok(upgrades)
+}
+
+#[tauri::command]
+pub async fn upgrade_model(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    ensure_ollama_running_once();
+    let (custom_name, base, modelfile_file) = model_definitions(Some(&app)).into_iter()
+        .find(|(tag, _, _)| *tag == name)
+        .ok_or_else(|| format!("{name} is not an Iris model"))?;
+    pull_and_create_one(&app, &custom_name, &base, &modelfile_file, 1, 2).await
+}
+
+/// Pull a custom model's base with streamed progress (a multi-GB download needs a long timeout and
+/// a streamed response; a short non-streamed request can never finish), then build the custom tag
+/// from its modelfile. `step` is this model's pull step; the create step is `step + 1`.
+async fn pull_and_create_one(
+    app: &tauri::AppHandle, custom_name: &str, base_model: &str, modelfile_file: &str, step: usize, total_steps: usize,
+) -> Result<(), String> {
         let _ = app.emit("ollama-setup-progress", serde_json::json!({
             "phase": "pulling",
             "model": base_model,
@@ -9547,16 +9517,15 @@ pub async fn pull_and_create_models(app: tauri::AppHandle) -> Result<(), String>
         .map_err(|e| e.to_string())??;
 
         // --- Create custom model from modelfile ---
-        step += 1;
         let _ = app.emit("ollama-setup-progress", serde_json::json!({
             "phase": "creating",
             "model": custom_name,
-            "step": step,
+            "step": step + 1,
             "total": total_steps,
         }));
 
         let name = custom_name.to_string();
-        let mf_path = modelfile_path(Some(&app), &modelfile_file)?;
+        let mf_path = modelfile_path(Some(app), modelfile_file)?;
         let tmp_mf = make_temp_modelfile_with_from(&mf_path, &resolved_base)?;
         tauri::async_runtime::spawn_blocking(move || {
             let out = Command::new(resolve_ollama_executable())
@@ -9583,14 +9552,6 @@ pub async fn pull_and_create_models(app: tauri::AppHandle) -> Result<(), String>
         })
         .await
         .map_err(|e| e.to_string())??;
-    }
-
-    let _ = app.emit("ollama-setup-progress", serde_json::json!({
-        "phase": "done",
-        "step": total_steps,
-        "total": total_steps,
-    }));
-
     Ok(())
 }
 

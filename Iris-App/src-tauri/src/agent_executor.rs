@@ -576,6 +576,37 @@ async fn next_action(
     chat_once(client, model, messages, budget, control, schema, temperature, on_delta).await
 }
 
+/// How long Ollama keeps the agent model loaded after a call. A cold load costs seconds to a
+/// minute, so a short idle period between chat turns should not evict it.
+const MODEL_KEEP_ALIVE: &str = "30m";
+
+/// True when Ollama already holds this model with the same context size, so the next call starts
+/// immediately (a different num_ctx makes Ollama reload the weights). Unknown state counts as
+/// resident so a failed probe never adds a spurious load step.
+async fn model_resident(client: &reqwest::Client, model: &str, context_tokens: usize) -> bool {
+    let Ok(response) = client.get(format!("{OLLAMA_BASE}/api/ps")).timeout(Duration::from_secs(3)).send().await else { return true; };
+    let Ok(value) = response.json::<Value>().await else { return true; };
+    let base = |name: &str| name.trim_end_matches(":latest").to_string();
+    value["models"].as_array().is_some_and(|models| models.iter().any(|entry| {
+        let name = entry["name"].as_str().or_else(|| entry["model"].as_str()).unwrap_or("");
+        base(name) == base(model) && entry["context_length"].as_u64().map_or(true, |ctx| ctx as usize == context_tokens)
+    }))
+}
+
+/// Load the model with the exact options later calls use, so the first real step does not pay for it.
+async fn warm_model(client: &reqwest::Client, model: &str, budget: &ModelBudget, control: &RunControl) -> Result<(), String> {
+    let _permit = tokio::select! {
+        _ = control.cancelled() => return Err("Cancelled".into()),
+        permit = INFERENCE.get_or_init(|| Semaphore::new(1)).acquire() => permit.map_err(|err| err.to_string())?,
+    };
+    let body = json!({"model": model, "prompt": "", "keep_alive": MODEL_KEEP_ALIVE, "options": {"num_ctx": budget.context_tokens}});
+    tokio::select! {
+        _ = control.cancelled() => Err("Cancelled".into()),
+        response = client.post(format!("{OLLAMA_BASE}/api/generate")).json(&body).send() =>
+            response.and_then(|response| response.error_for_status()).map(|_| ()).map_err(|err| format!("Model load failed: {err}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn chat_once(
     client: &reqwest::Client, model: &str, messages: Vec<Value>, budget: &ModelBudget, control: &RunControl,
@@ -586,7 +617,7 @@ async fn chat_once(
         permit = INFERENCE.get_or_init(|| Semaphore::new(1)).acquire() => permit.map_err(|err| err.to_string())?,
     };
     let mut request = serde_json::json!({
-        "model": model, "messages": messages, "stream": true, "think": false, "keep_alive": "5m",
+        "model": model, "messages": messages, "stream": true, "think": false, "keep_alive": MODEL_KEEP_ALIVE,
         "options": {"num_ctx": budget.context_tokens, "num_predict": budget.output_tokens, "temperature": temperature, "repeat_penalty": 1.1}
     });
     if let Some(schema) = schema { request["format"] = schema; }
@@ -927,6 +958,17 @@ pub(super) async fn run(
     let mut repeated_calls: HashMap<String, usize> = HashMap::new();
     let mut schema_failures: HashMap<String, usize> = HashMap::new();
     task.reasoning_log.clear();
+    // A cold model can take a while to load; make that its own visible, timed step instead of
+    // leaving the log on "Assessing the request" with no explanation.
+    if !model_resident(&client,&task.model,budget.context_tokens).await {
+        let name=task.model.trim_end_matches(":latest").to_string();
+        record_reasoning(window,event_name,&mut task,&format!("Loading {name} into memory (it was not loaded; the first request after a restart or a long idle period takes longer)."));
+        let _=window.emit(event_name,IrisEvent::Status(format!("Loading {name} into memory...")));
+        if let Err(error)=warm_model(&client,&task.model,&budget,&control).await {
+            if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
+            record_reasoning(window,event_name,&mut task,&format!("Model preload did not finish ({}); continuing.",excerpt(&error,200)));
+        }
+    }
     record_reasoning(window,event_name,&mut task,if resume_task {"Resuming the saved objective and evidence; unfinished acceptance criteria remain enforced."} else {"Assessing the current request independently of earlier unfinished work."});
     save_task(app, &task)?;
     if !resume_task && (attached.is_some() || tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("universal_web_search"))) {

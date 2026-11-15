@@ -1879,6 +1879,7 @@ input[type="checkbox"], input[type="range"] { accent-color: var(--app-accent, #6
 .agent-activity { border-top: 1px solid var(--app-border); padding: 4px 20px; font-size: 11px; color: var(--app-muted); }
 .agent-activity summary { cursor: pointer; }
 .agent-activity ol { max-height: 120px; overflow: auto; margin: 8px 0; padding-left: 18px; }
+.agent-step-duration { margin-left: 8px; padding: 0 5px; border-radius: 6px; background: var(--app-border); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .server-heading, .server-service-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .server-heading h3 { display: flex; align-items: center; gap: 9px; margin: 0; }
 .server-section { padding: 22px 0; border-bottom: 1px solid var(--app-border); }

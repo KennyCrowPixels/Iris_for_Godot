@@ -276,8 +276,16 @@ impl AgentTask {
         Ok(self.render_checklist())
     }
 
+    /// Each entry's `durationMs` is the time that step took: it is filled in when the next step
+    /// begins, so the final entry of a turn has none.
     pub fn record_reasoning(&mut self, text: &str) {
-        self.reasoning_log.push(serde_json::json!({"ts":time::OffsetDateTime::now_utc().unix_timestamp()*1000,"text":excerpt(text,1000)}));
+        let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        if let Some(previous) = self.reasoning_log.last_mut() {
+            if let Some(started) = previous["ts"].as_i64() {
+                previous["durationMs"] = serde_json::json!((now - started).max(0));
+            }
+        }
+        self.reasoning_log.push(serde_json::json!({"ts":now,"text":excerpt(text,1000)}));
         let overflow=self.reasoning_log.len().saturating_sub(80);
         self.reasoning_log.drain(..overflow);
     }
@@ -448,6 +456,18 @@ mod tests {
         let mut legacy=serde_json::to_value(&task).unwrap();
         legacy.as_object_mut().unwrap().remove("reasoningLog");
         assert!(serde_json::from_value::<AgentTask>(legacy).unwrap().reasoning_log.is_empty());
+    }
+
+    #[test]
+    fn each_reasoning_step_records_its_own_duration_when_the_next_begins() {
+        let mut task=AgentTask::new("t".into(),1,None,"goal".into(),"m".into());
+        task.record_reasoning("Loading the model");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        task.record_reasoning("Assessing the request");
+        let first=&task.reasoning_log[0];
+        assert!(first["durationMs"].as_i64().unwrap()>=25, "{first}");
+        assert!(task.reasoning_log[1].get("durationMs").is_none(), "the in-progress step has no duration yet");
+        assert!(task.reasoning_log[1]["ts"].as_i64().unwrap()%1000!=0 || first["ts"].as_i64().unwrap()%1000!=0, "timestamps carry milliseconds");
     }
 
     #[test]

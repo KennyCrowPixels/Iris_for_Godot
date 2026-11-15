@@ -52,6 +52,9 @@ type ModelStatus = "checking" | "ready" | "loading" | "error";
 type WorkLogEntry = {
   ts: number;
   text: string;
+  // How long this step took (time until the next step began). Older logs lack it; it is then
+  // derived from consecutive timestamps.
+  durationMs?: number;
 };
 
 type IrisActionTrace = {
@@ -666,6 +669,32 @@ function formatThinkingDuration(ms?: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = Math.round(totalSeconds % 60);
   return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+// Each reasoning step's own duration: the stored value, else the time until the next step began.
+// The last step of a log has none (it is either the closing note or still running).
+function workLogDurations(entries: WorkLogEntry[]): Array<number | undefined> {
+  return entries.map((entry, index) => {
+    if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs)) return entry.durationMs;
+    const next = entries[index + 1];
+    return next && Number.isFinite(next.ts) && Number.isFinite(entry.ts) ? Math.max(0, next.ts - entry.ts) : undefined;
+  });
+}
+
+function formatStepDuration(ms?: number): string {
+  if (ms === undefined || !Number.isFinite(ms)) return "";
+  if (ms < 100) return "<0.1s";
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return formatThinkingDuration(ms);
+}
+
+// "5:55:44 PM |  27.0s | Assessing the request" lines for the log viewer and clipboard copies.
+function formatWorkLogLines(entries: WorkLogEntry[] | undefined): string {
+  if (!entries?.length) return "(empty)";
+  const durations = workLogDurations(entries);
+  return entries
+    .map((entry, index) => `${new Date(entry.ts).toLocaleTimeString()} | ${formatStepDuration(durations[index]).padStart(6)} | ${entry.text}`)
+    .join("\n");
 }
 
 function normalizeMessages(raw: any[] | undefined): Message[] {
@@ -5816,8 +5845,8 @@ function App() {
         `Route: ${log.routeSummary || "(n/a)"}`,
         `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}${formatThinkingDuration(log.elapsedMs) ? ` | answered in ${formatThinkingDuration(log.elapsedMs)}` : ""}`,
         "",
-        "Reasoning summaries:",
-        log.workLog?.length ? log.workLog.map((e) => `${new Date(e.ts).toLocaleTimeString()} | ${e.text}`).join("\n") : "(empty)",
+        "Reasoning summaries (time | step duration | step):",
+        formatWorkLogLines(log.workLog),
         "",
         "Action trace:",
         log.actionTrace?.length ? log.actionTrace.map((e) => `${new Date(e.ts * 1000).toLocaleTimeString()} | ${e.action} | ${e.reason} | ${e.outcome}`).join("\n") : "(empty)",
@@ -11543,8 +11572,8 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                           `Route: ${log.routeSummary || "(n/a)"}`,
                           `Runtime: ${log.runtimePhase || "idle"}${log.responseModel ? ` | ${log.responseModel}` : ""}${formatThinkingDuration(log.elapsedMs) ? ` | answered in ${formatThinkingDuration(log.elapsedMs)}` : ""}`,
                           "",
-                          "Reasoning summaries:",
-                          log.workLog.length ? log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n") : "(empty)",
+                          "Reasoning summaries (time | step duration | step):",
+                          formatWorkLogLines(log.workLog),
                           "",
                           "Action trace:",
                           log.actionTrace.length ? log.actionTrace.map((entry) => `${new Date(entry.ts * 1000).toLocaleTimeString()} | ${entry.action} | ${entry.reason} | ${entry.outcome}`).join("\n") : "(empty)",
@@ -11575,11 +11604,9 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
                 <div><strong>Runtime:</strong> {messageLogViewer.log.runtimePhase || "idle"}{messageLogViewer.log.responseModel ? ` | ${messageLogViewer.log.responseModel}` : ""}{formatThinkingDuration(messageLogViewer.log.elapsedMs) ? ` | answered in ${formatThinkingDuration(messageLogViewer.log.elapsedMs)}` : ""}</div>
                 <div><strong>Phase hints:</strong> {messageLogViewer.log.plannerPhase || "(n/a)"}{messageLogViewer.log.plannerResumeHint ? ` | ${messageLogViewer.log.plannerResumeHint}` : ""}{messageLogViewer.log.checkpointCount ? ` | checkpoints: ${messageLogViewer.log.checkpointCount}` : ""}</div>
                 <div>
-                  <strong>Reasoning summaries</strong>
+                  <strong>Reasoning summaries</strong> <span style={{ opacity: 0.7 }}>(time | step duration | step)</span>
                   <div style={{ marginTop: 6, whiteSpace: "pre-wrap", fontFamily: "Consolas, monospace", fontSize: 11, opacity: 0.95 }}>
-                    {messageLogViewer.log.workLog.length
-                      ? messageLogViewer.log.workLog.map((entry) => `${new Date(entry.ts).toLocaleTimeString()} | ${entry.text}`).join("\n")
-                      : "(empty)"}
+                    {formatWorkLogLines(messageLogViewer.log.workLog)}
                   </div>
                 </div>
                 <div>
@@ -14647,7 +14674,14 @@ Update the notes into <=6 bullets, preserving names, files, decisions, remembere
             ) : null}
             </>}
           </div>
-          {!!activity.length && <details className="agent-activity"><summary>Reasoning log</summary><ol>{activity.map((entry, index) => <li key={`${entry.ts}_${index}`}>{entry.text}</li>)}</ol></details>}
+          {!!activity.length && (() => {
+            const durations = workLogDurations(activity);
+            return <details className="agent-activity"><summary>Reasoning log</summary><ol>{activity.map((entry, index) => {
+              const current = running && index === activity.length - 1;
+              const took = current ? `${formatStepDuration(Math.max(0, runtimeNow - entry.ts))}…` : formatStepDuration(durations[index]);
+              return <li key={`${entry.ts}_${index}`}>{entry.text}{took && <span className="agent-step-duration" title={current ? "Time on this step so far" : "Time this step took"}>{took}</span>}</li>;
+            })}</ol></details>;
+          })()}
           </div>;
         })()}
         {hwToast && (
